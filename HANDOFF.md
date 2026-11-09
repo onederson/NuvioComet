@@ -89,6 +89,7 @@ Mudanças de 09/11:
 - **Pré-carregar fontes do próximo episódio:** LIGADO.
 - **Você ainda está assistindo?:** confirmado DESLIGADO.
 - **Preferir mesma fonte:** confirmado LIGADO.
+- **TMDB na "Tela inicial moderna":** LIGADO, a pedido do usuário. "Arte" continua DESLIGADA, para manter as nossas capas.
 
 ---
 
@@ -112,8 +113,7 @@ Mudanças de 09/11:
 
 | # | O quê | De quem |
 |---|---|---|
-| 1 | Criar o app do Trakt e mandar `/trakt` (Seção 3) | usuário (2 min) + Claude grava as chaves |
-| 2 | Confirmar se quer o enriquecimento TMDB também na "Tela inicial moderna" (hoje DESLIGADO na TV; o registro antigo dizia LIGADO). Ligado, o Nuvio troca as nossas descrições na tela inicial (notas, "onde você parou") pelas do TMDB | usuário |
+| 1 | Criar o app do Trakt e mandar `/trakt` (Seção 3). O login do Trakt feito na TV fica dentro do app e o A71 não consegue usar; o Comet precisa de chave própria | usuário (2 min) + Claude grava as chaves |
 | 3 | **Banco travado logo após reiniciar:** com muitos pedidos ao mesmo tempo no 1º minuto, o SQLite dá `database is locked` e algumas listas levam 60 s. Some depois do aquecimento. Melhoria: `busy_timeout` maior e menos gravações concorrentes na partida | Claude |
 | 4 | **A 1ª busca de um episódio leva 8 a 17 s** (o Prowlarr pesa 5 a 16 s). Proposta: responder com as fontes rápidas e completar o resto em 2º plano. Ligado a isto: o autoplay "Assistir" do Nuvio espera 3 s; numa 1ª busca lenta ele pode cair na lista | Claude |
 | 5 | Pacotes de temporada de séries homônimas sem ano no nome ainda passam (Doctor Who 1963 × 2005) | Claude |

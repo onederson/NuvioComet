@@ -287,7 +287,7 @@ Obs.: o app mostra os addons 2 e 3 com a chave desligada ("Desativar" ao lado da
 
 ### TMDB
 - Ativar enriquecimento TMDB: LIGADO
-- Ativar na Tela inicial moderna: DESLIGADO
+- Ativar na Tela inicial moderna: LIGADO (ligado em 09/11 a pedido do usuário)
 - Aprimorar Continuar Assistindo: LIGADO
 - Idioma: Português (Brasil)
 - Arte (logos e planos de fundo): DESLIGADO
