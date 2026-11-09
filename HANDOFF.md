@@ -13,7 +13,7 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 ### Segurança e restrições
 - **Nunca imprima nem versione** segredos: `config/.env`, `config/duckdns.token`, chaves do RD, do TorBox e do Trakt, a API key do Prowlarr, os tokens dos links e a senha do backup.
   - O repositório `onederson/NuvioComet` é **público**.
-  - Para gravar uma chave no `.env` do A71 sem imprimir o valor, use `scripts/env_set.sh`.
+  - Para gravar uma chave no `.env` do A71 sem imprimir o valor, use `scripts/env_set.sh`. Envie esse script em LF: com CRLF ele falha com "unmatched 'if'".
 - **DuckDNS:** só o domínio `a71comet.duckdns.org`. A conta tem outro domínio; não mexa nele.
 - **E-mail do git** (config local deste repo): `wandersonks02@gmail.com`.
 - **AdGuard Home (Fase 1):** não mexa. Única exceção: o watchdog ajusta o `oom_score_adj` dele.
@@ -75,11 +75,8 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 - **Biblioteca pessoal = Stremio + Trakt** (`comet/services/trakt.py`, novo em 09/11).
   - O Nuvio usa o Trakt como "Fonte para Biblioteca". O Comet lê do Trakt a lista de desejos, o histórico e o progresso pausado, e junta com a conta antiga do Stremio (`stremio_library.get_stremio_library`).
   - Minha lista, Novos episódios, Recomendados, Chegou dublado, Minha TV, gosto, madrugada e aquecimento passam a seguir o Nuvio.
-  - **Para ligar (falta o usuário):**
-    1. Criar um app em https://trakt.tv/oauth/applications (Redirect URI `urn:ietf:wg:oauth:2.0:oob`).
-    2. Gravar `TRAKT_CLIENT_ID` e `TRAKT_CLIENT_SECRET` no `.env` com `env_set.sh`.
-    3. Reiniciar o Comet.
-    4. Mandar `/trakt` no Telegram e digitar o código em trakt.tv/activate.
+  - **App do Trakt criado (09/11):** é um app PKCE, que **não tem Client Secret**. O `trakt.py` só manda `client_secret` se ele existir no `.env`. O `TRAKT_CLIENT_ID` já está gravado no `.env` do A71.
+  - **Falta o usuário:** mandar `/trakt` no Telegram e digitar o código em trakt.tv/activate.
   - O token fica em `/opt/comet/data/trakt_token.json` e é renovado sozinho. Teste: `unit_trakt`.
 
 ### Ajustes da TV
@@ -113,7 +110,7 @@ Mudanças de 09/11:
 
 | # | O quê | De quem |
 |---|---|---|
-| 1 | Criar o app do Trakt e mandar `/trakt` (Seção 3). O login do Trakt feito na TV fica dentro do app e o A71 não consegue usar; o Comet precisa de chave própria | usuário (2 min) + Claude grava as chaves |
+| 1 | Mandar `/trakt` no Telegram e digitar o código em trakt.tv/activate (Seção 3). O app e o `TRAKT_CLIENT_ID` já estão prontos | usuário (1 min) |
 | 3 | **Banco travado logo após reiniciar:** com muitos pedidos ao mesmo tempo no 1º minuto, o SQLite dá `database is locked` e algumas listas levam 60 s. Some depois do aquecimento. Melhoria: `busy_timeout` maior e menos gravações concorrentes na partida | Claude |
 | 4 | **A 1ª busca de um episódio leva 8 a 17 s** (o Prowlarr pesa 5 a 16 s). Proposta: responder com as fontes rápidas e completar o resto em 2º plano. Ligado a isto: o autoplay "Assistir" do Nuvio espera 3 s; numa 1ª busca lenta ele pode cair na lista | Claude |
 | 5 | Pacotes de temporada de séries homônimas sem ano no nome ainda passam (Doctor Who 1963 × 2005) | Claude |

@@ -31286,10 +31286,10 @@ index 0000000..61eec2d
 +    await _call(session, "sendMessage", {"chat_id": chat, "text": reply[:4000], "disable_web_page_preview": True})
 diff --git a/comet/services/trakt.py b/comet/services/trakt.py
 new file mode 100644
-index 0000000..cd7aa65
+index 0000000..8f1de3d
 --- /dev/null
 +++ b/comet/services/trakt.py
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,355 @@
 +"""Trakt como biblioteca (o Nuvio guarda lá a lista e o histórico).
 +
 +O Nuvio usa o Trakt como "Fonte para Biblioteca" e manda para lá o que você assiste. Este módulo
@@ -31299,8 +31299,9 @@ index 0000000..cd7aa65
 +nesses módulos (ver `stremio_library.get_stremio_library`).
 +
 +Conexão (uma vez): crie um app em https://trakt.tv/oauth/applications (redirect
-+`urn:ietf:wg:oauth:2.0:oob`), ponha TRAKT_CLIENT_ID e TRAKT_CLIENT_SECRET no .env e mande /trakt
-+no Telegram. O bot responde com um código para digitar em trakt.tv/activate.
++`urn:ietf:wg:oauth:2.0:oob`), ponha TRAKT_CLIENT_ID no .env e mande /trakt no Telegram. O bot
++responde com um código para digitar em trakt.tv/activate. Apps novos do Trakt (PKCE) não têm
++secret; TRAKT_CLIENT_SECRET só é enviado se existir (apps antigos).
 +"""
 +from __future__ import annotations
 +
@@ -31333,6 +31334,15 @@ index 0000000..cd7aa65
 +def _client() -> tuple[str, str]:
 +    return (str(getattr(settings, "TRAKT_CLIENT_ID", "") or ""),
 +            str(getattr(settings, "TRAKT_CLIENT_SECRET", "") or ""))
++
++
++def _with_client(body: dict) -> dict:
++    """Junta client_id e, só se houver (apps antigos), client_secret. App PKCE não tem secret."""
++    cid, secret = _client()
++    body = {**body, "client_id": cid}
++    if secret:
++        body["client_secret"] = secret
++    return body
 +
 +
 +def _load_token() -> dict:
@@ -31511,11 +31521,10 @@ index 0000000..cd7aa65
 +    exp = float(tok.get("created_at") or 0) + float(tok.get("expires_in") or 0)
 +    if exp and time.time() < exp - 3600:
 +        return tok["access_token"]
-+    cid, secret = _client()
-+    if not (cid and secret and tok.get("refresh_token")):
++    if not (_client()[0] and tok.get("refresh_token")):
 +        return tok["access_token"]
-+    body = {"refresh_token": tok["refresh_token"], "client_id": cid, "client_secret": secret,
-+            "redirect_uri": OOB, "grant_type": "refresh_token"}
++    body = _with_client({"refresh_token": tok["refresh_token"], "redirect_uri": OOB,
++                         "grant_type": "refresh_token"})
 +    async with session.post(f"{API}/oauth/token", json=body, headers=_headers()) as r:
 +        if r.status != 200:
 +            logger.warning(f"Trakt: renovação do acesso falhou (HTTP {r.status})")
@@ -31571,10 +31580,9 @@ index 0000000..cd7aa65
 +
 +async def _poll_device(code: dict) -> None:
 +    from comet.services.telegram_bot import send_telegram
-+    cid, secret = _client()
 +    interval = max(5, int(code.get("interval") or 5))
 +    deadline = time.time() + int(code.get("expires_in") or 600)
-+    body = {"code": code["device_code"], "client_id": cid, "client_secret": secret}
++    body = _with_client({"code": code["device_code"]})
 +    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
 +        while time.time() < deadline:
 +            await asyncio.sleep(interval)
@@ -31602,10 +31610,10 @@ index 0000000..cd7aa65
 +    if not m:
 +        return None
 +    arg = m.group(1).strip().lower()
-+    cid, secret = _client()
-+    if not (cid and secret):
++    cid = _client()[0]
++    if not cid:
 +        return ("🎬 Trakt ainda sem chave de app. Crie um app em https://trakt.tv/oauth/applications "
-+                f"(Redirect URI: {OOB}) e ponha TRAKT_CLIENT_ID e TRAKT_CLIENT_SECRET no .env.")
++                f"(Redirect URI: {OOB}) e ponha TRAKT_CLIENT_ID no .env.")
 +    if arg in ("status", "estado") or (is_connected() and arg != "reconectar"):
 +        items = await library_items(force=True)
 +        saved = sum(1 for i in items if not i.get("removed"))
