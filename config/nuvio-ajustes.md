@@ -197,14 +197,14 @@ Obs.: o app mostra os addons 2 e 3 com a chave desligada ("Desativar" ao lado da
 - Addons permitidos: Todos os addons instalados
 - Plugins permitidos: Todos os plugins ativos
 - Tempo limite de seleção: 3s
-- Pré-carregar fontes do próximo episódio: DESLIGADO
+- Pré-carregar fontes do próximo episódio: LIGADO (ligado em 09/11, à tarde)
 - Reutilizar último link: DESLIGADO
 
 ### A seguir
 - Autorreproduzir próximo episódio: LIGADO
 - Início do próximo episódio: Porcentagem
 - Limite por porcentagem: 99%
-- Você ainda está assistindo? (aviso após episódios seguidos): valor não lido (linha de opção)
+- Você ainda está assistindo? (aviso após episódios seguidos): DESLIGADO
 - Preferir mesma fonte (Próximo episódio): LIGADO
 - Reutilizar preferências de maratona: DESLIGADO
 - Sugestões pós-reprodução: LIGADO

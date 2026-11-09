@@ -360,12 +360,16 @@ def t_unit_nuvio_4k_natal() -> tuple[str, str]:
         return best["_info"]["resolution"] if best else None
 
     pt = [cand("1080p", 1, 3, h="a"), cand("2160p", None, 20, h="b"), cand("2160p", 1, 70, h="c")]
-    assert pick(pt, prefer_4k=True) == "2160p", "Nuvio: 4K PT primeiro"
-    assert pick(pt) == "1080p", "Stremio segue com 1080p primeiro"
+    assert pick(pt) == "2160p", "Nuvio: 4K PT primeiro"
     sem_4k_pt = [cand("1080p", None, 3, h="a"), cand("2160p", 0, 20, is_pt=False, h="b")]
-    assert pick(sem_4k_pt, prefer_4k=True) == "1080p", "sem 4K PT: 1080p PT"
+    assert pick(sem_4k_pt) == "1080p", "sem 4K PT: 1080p PT"
     so_original = [cand("1080p", 0, 3, is_pt=False, h="a"), cand("2160p", 0, 20, is_pt=False, h="b")]
-    assert pick(so_original, prefer_4k=True) == "2160p", "sem PT: melhor original"
+    assert pick(so_original) == "2160p", "sem PT: melhor original"
+    # SD dublado não vira ▶ Assistir quando há algo pronto em HD (costuma ser outra versão da obra)
+    sd_pt = [cand("480p", 1, 1, h="a"), cand("1080p", 0, 3, is_pt=False, h="b")]
+    assert pick(sd_pt) == "1080p", "SD dublado perdeu para HD pronto"
+    so_sd = [cand("480p", 1, 1, h="a")]
+    assert pick(so_sd) == "480p", "sem HD: SD dublado ainda serve"
 
     def hot(d):
         return [c["id"] for c in seasonal_catalogs(_dt.date.fromisoformat(d))[0]]
@@ -1554,9 +1558,6 @@ def t_geracional(token: str) -> tuple[str, str]:
         if not op or "fillers" not in (op.get("description") or ""):
             return "FAIL", "One Piece só a história sem meta"
         notes.append(f"OP canon {len(op['videos'])} eps")
-        hero = client.get(f"/art/hero/movie/tt0111161.jpg")
-        if hero.status_code != 200 or not hero.headers.get("content-type", "").startswith("image/"):
-            return "FAIL", f"pôster editorial status {hero.status_code}"
         tv = client.get(f"/{token}/catalog/tv/comet_livehome.json").json().get("metas", [])
         if not tv or "/art/tv/" not in tv[0].get("poster", ""):
             return "FAIL", "capa de canal sem guia de TV"
@@ -1624,8 +1625,35 @@ def t_extras(token: str) -> tuple[str, str]:
     return "PASS", f"4 fileiras no manifesto · Minha TV: {st[0].get('title', '')[:50]} · futebol hoje: {len(fut)} · 7443 fechada p/ admin/robôs"
 
 
+def t_unit_trakt() -> tuple[str, str]:
+    from comet.services.trakt import to_library, merge
+    show = {"title": "The Office", "year": 2005, "ids": {"imdb": "tt0386676"}}
+    movie = {"title": "Duna", "year": 2021, "ids": {"imdb": "tt1160419"}}
+    wl = [{"type": "movie", "listed_at": "2026-11-01T10:00:00.000Z", "movie": movie},
+          {"type": "show", "listed_at": "2026-11-02T10:00:00.000Z", "show": {"title": "Sem IMDb", "ids": {}}}]
+    ws = [{"last_watched_at": "2026-11-08T22:00:00.000Z", "plays": 3, "show": show,
+           "seasons": [{"number": 2, "episodes": [{"number": 2, "plays": 1, "last_watched_at": "2026-11-08T21:00:00.000Z"},
+                                                  {"number": 3, "plays": 1, "last_watched_at": "2026-11-08T22:00:00.000Z"}]},
+                       {"number": 0, "episodes": [{"number": 1, "plays": 1, "last_watched_at": "2026-11-09T00:00:00.000Z"}]}]}]
+    pb = [{"type": "episode", "progress": 40.0, "paused_at": "2026-11-09T01:00:00.000Z", "show": show,
+           "episode": {"season": 2, "number": 4}}]
+    items = {i["_id"]: i for i in to_library(wl, [], ws, pb)}
+    assert set(items) == {"tt1160419", "tt0386676"}, "item sem IMDb tem que sumir"
+    assert items["tt1160419"]["removed"] is False and items["tt1160419"]["type"] == "movie", "lista de desejos = salvo"
+    off = items["tt0386676"]
+    assert off["removed"] is True and off["type"] == "series", "histórico não entra na Minha lista"
+    st = off["state"]
+    assert st["video_id"] == "tt0386676:2:4" and st["timeOffset"] == 40000 and st["duration"] == 100000, st
+    stremio = [{"_id": "tt0386676", "removed": False, "temp": False, "state": {"lastWatched": "2026-10-01T00:00:00.000Z", "video_id": "tt0386676:1:1"}},
+               {"_id": "tt0000001", "removed": True, "state": {}}]
+    m = {i["_id"]: i for i in merge(stremio, list(items.values()))}
+    assert len(m) == 3 and m["tt0386676"]["removed"] is False, "salvo no Stremio continua salvo"
+    assert m["tt0386676"]["state"]["video_id"] == "tt0386676:2:4", "vale o histórico mais novo"
+    return "PASS", "lista, histórico (último episódio), progresso e junção com o Stremio OK"
+
+
 def t_nuvio(token: str, nuvio_token: str) -> tuple[str, str]:
-    """Link do Nuvio: mesmas fileiras do pessoal, fundo sem texto e sem repasse fix=1."""
+    """Link do Nuvio: mesmas fileiras do pessoal, fundo original (sem texto) e sem repasse fix=1."""
     if not nuvio_token:
         return "WARN", "NUVIO_LINK_TOKEN não configurado"
     with get_client(timeout=60.0) as client:
@@ -1634,11 +1662,8 @@ def t_nuvio(token: str, nuvio_token: str) -> tuple[str, str]:
         if [c.get("id") for c in a.get("catalogs", [])] != [c.get("id") for c in b.get("catalogs", [])]:
             return "FAIL", "fileiras diferentes do link pessoal"
         bg_n = ((client.get(f"/{nuvio_token}/meta/movie/tt0816692.json").json().get("meta") or {}).get("background") or "")
-        bg_p = ((client.get(f"/{token}/meta/movie/tt0816692.json").json().get("meta") or {}).get("background") or "")
-        if "/art/hero" in bg_n:
-            return "FAIL", "Nuvio recebeu a arte com texto no fundo"
-        if "/art/hero" not in bg_p:
-            return "FAIL", "link pessoal perdeu a arte do fundo"
+        if not bg_n or "/art/hero" in bg_n:
+            return "FAIL", f"fundo do título errado: {bg_n[:60]!r}"
         st = client.get(f"/{nuvio_token}/stream/series/tt0944947:1:1.json").json().get("streams") or []
         saga = client.get(f"/{nuvio_token}/catalog/movie/comet_saga.json").json().get("metas") or []
         reacher = client.get(f"/{nuvio_token}/stream/series/tt9288030:1:1.json").json().get("streams") or []
@@ -1716,6 +1741,7 @@ def main():
         ("unit_predownload_pick", t_unit_predownload_pick),
         ("unit_episodios_ptbr", t_unit_episodios_ptbr),
         ("unit_nuvio_4k_natal", t_unit_nuvio_4k_natal),
+        ("unit_trakt", t_unit_trakt),
         ("unit_fileiras_homonimos", t_unit_fileiras_homonimos),
         ("unit_pt_text", t_unit_pt_text),
         ("unit_novidades_1108", t_unit_novidades_1108),
