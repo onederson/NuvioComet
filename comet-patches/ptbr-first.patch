@@ -1,5 +1,5 @@
 diff --git a/comet/api/app.py b/comet/api/app.py
-index f7832d1..3d5aa44 100644
+index f7832d1..b77df1c 100644
 --- a/comet/api/app.py
 +++ b/comet/api/app.py
 @@ -10,7 +10,9 @@ from starlette.requests import Request
@@ -109,7 +109,7 @@ index f7832d1..3d5aa44 100644
          # Start indexer manager
          indexer_manager_task = asyncio.create_task(indexer_manager.run())
          cleanup.push_async_callback(indexer_manager.close)
-@@ -253,6 +329,16 @@ app.add_middleware(
+@@ -253,6 +329,18 @@ app.add_middleware(
  
  app.include_router(base.router)
  app.include_router(config.router)
@@ -123,10 +123,12 @@ index f7832d1..3d5aa44 100644
 +    app.include_router(_xr)
 +from comet.api.endpoints.live_routes import router as live_routes_router
 +app.include_router(live_routes_router)
++from comet.services.streamings import router as _streamings_router  # coleção do Nuvio + artes
++app.include_router(_streamings_router)
  app.include_router(admin.router)
  app.include_router(cometnet.router)
  app.include_router(cometnet_ui.router)
-@@ -270,6 +356,10 @@ stremio_routers = (
+@@ -270,6 +358,10 @@ stremio_routers = (
      streams_router.streams,
      torznab.router,
      chilllink.router,
@@ -9025,10 +9027,10 @@ index 0000000..1202f91
 +    }
 diff --git a/comet/services/catalog_manifest.py b/comet/services/catalog_manifest.py
 new file mode 100644
-index 0000000..da7ec7b
+index 0000000..f453a56
 --- /dev/null
 +++ b/comet/services/catalog_manifest.py
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,776 @@
 +"""Montagem do manifesto (lista de fileiras) do Comet. Separado de catalogs.py (que só responde as fileiras)."""
 +from comet.services.catalogs import (  # noqa: F401
 +    MOVIE_GENRE_OPTIONS,
@@ -9796,13 +9798,21 @@ index 0000000..da7ec7b
 +    if grouped and not kids:
 +        from comet.services import row_groups as _row_groups
 +        catalogs = _row_groups.consolidate(catalogs)
++    if not kids:
++        # Streamings no estilo Disney+: a coleção do Nuvio substitui estas fileiras na tela
++        # inicial (continuam no Explorar), e as abas de cada serviço entram fora da tela inicial.
++        from comet.services import streamings as _svc
++        for c in catalogs:
++            if c.get("id") in ("comet_streams", "comet_origs"):
++                c["showInHome"] = False
++        catalogs.extend(_svc.manifest_catalogs())
 +    return catalogs
 diff --git a/comet/services/catalogs.py b/comet/services/catalogs.py
 new file mode 100644
-index 0000000..27a894c
+index 0000000..e07db0f
 --- /dev/null
 +++ b/comet/services/catalogs.py
-@@ -0,0 +1,4170 @@
+@@ -0,0 +1,4178 @@
 +import asyncio
 +import datetime
 +import json
@@ -10091,6 +10101,10 @@ index 0000000..27a894c
 +    tmdb_type = "movie" if media_type == "movie" else "tv"
 +    today = datetime.date.today()
 +    today_str = today.isoformat()
++
++    if catalog_id.startswith("svx_"):  # abas dos streamings (comet/services/streamings.py)
++        from comet.services.streamings import tmdb_query as _svc_query
++        return _svc_query(catalog_id, media_type, language, region, page, today)
 +
 +    if catalog_id == "comet_kids_anim":
 +        if media_type != "movie":
@@ -12790,6 +12804,10 @@ index 0000000..27a894c
 +    if not base_url:
 +        # chamadas internas (warmup) nao tem request: sem isso o cache guarda posters relativos
 +        base_url = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++
++    if catalog_id.startswith("comet_sv_"):  # abas dos streamings (coleção do Nuvio)
++        from comet.services.streamings import get_catalog as _svc_catalog
++        return await _svc_catalog(media_type, catalog_id, extra, base_url, kids=kids)
 +
 +    if catalog_id == "comet_previewtest":
 +        if media_type != "movie" or kids or not getattr(settings, "PREVIEW_TEST_ROW", True):
@@ -28389,6 +28407,818 @@ index 0000000..efec780
 +        "signals": signals,
 +        "summary": ", ".join(signals),
 +    }
+diff --git a/comet/services/streamings.py b/comet/services/streamings.py
+new file mode 100644
+index 0000000..c6ee24f
+--- /dev/null
++++ b/comet/services/streamings.py
+@@ -0,0 +1,806 @@
++"""Streamings no estilo Disney+: uma coleção do Nuvio com uma pasta por serviço.
++
++Na tela inicial do Nuvio aparece, fixada no topo, a fileira "Streamings" com um bloco por serviço
++(Netflix, Prime Video, Disney+...). Com foco num bloco, o destaque gigante do topo vira o fundo,
++o logo e o vídeo daquele serviço. Ao abrir, a página do serviço tem abas: Top 10, Originais, Em alta,
++Novidades e Aclamados. Tudo é servido pelo Comet:
++
++- catálogos `comet_sv_<aba>` (um por aba e tipo, o serviço vai no `genre`), fora da tela inicial
++  (`showInHome: false`), que leem o TMDB por serviço no Brasil;
++- a coleção pronta em `/<link>/nuvio/colecoes.json` (o Nuvio importa por link);
++- as artes em `/art/svc/...`: bloco, brilho animado no foco, fundo do destaque, logo e vídeo.
++"""
++from __future__ import annotations
++
++import asyncio
++import datetime
++import io
++import math
++import os
++import random
++import re
++import subprocess
++import time
++from typing import Any
++
++from fastapi import APIRouter, HTTPException, Response
++from fastapi.responses import FileResponse, JSONResponse
++
++from comet.core.logger import log_swallowed, logger
++from comet.core.models import settings
++
++# ───────────────────────── serviços ─────────────────────────
++# key, nome, provider (TMDB watch provider BR), redes dos originais, cores (escura, viva), logo TMDB
++SERVICES: list[dict[str, Any]] = [
++    {"key": "netflix", "name": "Netflix", "provider": 8, "networks": "213",
++     "c1": (20, 0, 2), "c2": (229, 9, 20), "logo": "/wwemzKWzjKYJFfCeiB57q3r4Bcm.png", "white": False},
++    {"key": "prime", "name": "Prime Video", "provider": 119, "networks": "1024",
++     "c1": (0, 14, 30), "c2": (0, 168, 225), "logo": "/w7HfLNm9CWwRmAMU58udl2L7We7.png", "white": True},
++    {"key": "disney", "name": "Disney+", "provider": 337, "networks": "2739",
++     "c1": (4, 10, 38), "c2": (17, 60, 207), "logo": "/1edZOYAfoyZyZ3rklNSiUpXX30Q.png", "white": True},
++    {"key": "max", "name": "HBO Max", "provider": 1899, "networks": "3186|49",
++     "c1": (8, 2, 30), "c2": (88, 34, 180), "logo": "/nmU0UMDJB3dRRQSTUqawzF2Od1a.png", "white": True},
++    {"key": "apple", "name": "Apple TV+", "provider": 350, "networks": "2552",
++     "c1": (8, 8, 10), "c2": (150, 150, 160), "logo": "/bngHRFi794mnMq34gfVcm9nDxN1.png", "white": True},
++    {"key": "paramount", "name": "Paramount+", "provider": 531, "networks": "4330",
++     "c1": (0, 10, 40), "c2": (0, 100, 255), "logo": "/fi83B1oztoS47xxcemFdPMhIzK.png", "white": True},
++    {"key": "globoplay", "name": "Globoplay", "provider": 307, "networks": "3290",
++     "c1": (30, 4, 4), "c2": (242, 56, 14), "logo": "/kPSphunwE18PB4XIAwiuTVt6ERI.png", "white": True},
++    {"key": "crunchyroll", "name": "Crunchyroll", "provider": 283, "networks": "1112",
++     "c1": (30, 10, 0), "c2": (244, 117, 33), "logo": "/qqyXcZlJQKlRmAD1TCKV7mGLQlt.png", "white": True},
++    {"key": "mubi", "name": "MUBI", "provider": 11, "networks": None,
++     "c1": (2, 6, 24), "c2": (0, 20, 137), "logo": "/16gclYCHdh6QFQyBRNOo3DuaqDT.png", "white": True},
++    {"key": "pluto", "name": "Pluto TV", "provider": 300, "networks": None,
++     "c1": (16, 14, 40), "c2": (250, 220, 0), "logo": None, "white": True},
++]
++BY_KEY = {s["key"]: s for s in SERVICES}
++BY_NAME = {s["name"].lower(): s for s in SERVICES}
++
++# aba -> (tipo, nome no manifesto). A ordem é a das abas na página do serviço.
++TABS: list[tuple[str, str, str]] = [
++    ("top10s", "series", "🏆 Top 10 séries"),
++    ("top10m", "movie", "🏆 Top 10 filmes"),
++    ("orig", "series", "✨ Originais"),
++    ("hots", "series", "🔥 Séries em alta"),
++    ("hotm", "movie", "🍿 Filmes em alta"),
++    ("newm", "movie", "🆕 Novidades"),
++    ("bests", "series", "💎 Séries aclamadas"),
++    ("bestm", "movie", "💎 Filmes aclamados"),
++]
++_TAB_TYPE = {t[0]: t[1] for t in TABS}
++CATALOG_PREFIX = "comet_sv_"
++COLLECTION_ID = "comet_streamings"
++FORYOU_ID = "foryou"
++
++DATA_DIR = "/opt/comet/data/svc_art"
++_ART_VERSION = "4"  # muda a URL das artes quando o desenho muda (o Nuvio guarda em cache)
++
++
++def manifest_catalogs() -> list[dict]:
++    names = [s["name"] for s in SERVICES]
++    orig_names = [s["name"] for s in SERVICES if s.get("networks")]
++    out = []
++    for tab, ctype, name in TABS:
++        opts = orig_names if tab == "orig" else names
++        extra = [{"name": "genre", "isRequired": False, "options": opts}]
++        if not tab.startswith("top10"):
++            extra.append({"name": "skip", "isRequired": False})
++        out.append({"type": ctype, "id": CATALOG_PREFIX + tab, "name": name, "extra": extra,
++                    "showInHome": False})
++    return out
++
++
++def _service_from_genre(genre: str | None) -> dict | None:
++    if not genre:
++        return None
++    return BY_NAME.get(genre.strip().lower()) or BY_KEY.get(genre.strip().lower())
++
++
++def tmdb_query(catalog_id: str, media_type: str, language: str, region: str, page: int,
++               today: datetime.date) -> tuple[str, dict] | None:
++    """Consulta do TMDB para o id interno `svx_<serviço>_<aba>` (usado por catalogs._fetch_catalog_items)."""
++    m = re.fullmatch(r"svx_([a-z0-9]+)_([a-z0-9]+)", catalog_id or "")
++    if not m:
++        return None
++    svc, tab = BY_KEY.get(m.group(1)), m.group(2)
++    if not svc or _TAB_TYPE.get(tab) != media_type:
++        return None
++    tv = media_type == "series"
++    kind = "tv" if tv else "movie"
++    p: dict[str, Any] = {"language": language, "page": page, "watch_region": region,
++                         "with_watch_providers": svc["provider"]}
++    if tv:
++        p["without_genres"] = "10763,10764,10766,10767"  # sem jornal, reality, novela e talk show
++    date_key = "first_air_date" if tv else "primary_release_date"
++    if tab.startswith("top10"):
++        p["sort_by"] = "popularity.desc"
++        p["vote_count.gte"] = 15
++        if tv:
++            p["air_date.gte"] = (today - datetime.timedelta(days=150)).isoformat()
++        else:
++            p[f"{date_key}.gte"] = (today - datetime.timedelta(days=3 * 365)).isoformat()
++    elif tab == "orig":
++        if not svc.get("networks"):
++            return None
++        p.pop("watch_region"), p.pop("with_watch_providers")
++        p["with_networks"] = svc["networks"]
++        p["sort_by"] = "popularity.desc"
++        p["vote_count.gte"] = 30
++    elif tab.startswith("hot"):
++        p["sort_by"] = "popularity.desc"
++        p["vote_count.gte"] = 50
++        if tv:
++            p["air_date.gte"] = (today - datetime.timedelta(days=2 * 365)).isoformat()
++        else:
++            p[f"{date_key}.gte"] = (today - datetime.timedelta(days=5 * 365)).isoformat()
++    elif tab == "newm":
++        p["sort_by"] = "popularity.desc"
++        p["vote_count.gte"] = 5
++        p[f"{date_key}.gte"] = (today - datetime.timedelta(days=240)).isoformat()
++        p[f"{date_key}.lte"] = today.isoformat()
++    elif tab.startswith("best"):
++        p["sort_by"] = "vote_average.desc"
++        p["vote_count.gte"] = 300 if tv else 1500
++    else:
++        return None
++    if svc["key"] in ("mubi", "pluto"):  # catálogos pequenos: não exigir tantos votos
++        p["vote_count.gte"] = min(int(p.get("vote_count.gte", 0)), 20)
++    return f"discover/{kind}", p
++
++
++_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
++_CACHE_TTL = 3 * 3600
++_POSTER_RE = re.compile(r"/([A-Za-z0-9_-]{10,}\.(?:jpg|jpeg|png|webp))")
++
++
++async def get_catalog(media_type: str, catalog_id: str, extra: dict | None, base_url: str,
++                      kids: bool = False) -> list[dict]:
++    start_warm()
++    tab = catalog_id[len(CATALOG_PREFIX):]
++    # sem serviço escolhido (Explorar, testes): o primeiro da lista
++    svc = _service_from_genre((extra or {}).get("genre")) or SERVICES[0]
++    if kids or _TAB_TYPE.get(tab) != media_type:
++        return []
++    try:
++        skip = int((extra or {}).get("skip") or 0)
++    except (TypeError, ValueError):
++        skip = 0
++    if tab.startswith("top10") and skip:
++        return []
++    key = (svc["key"], tab, media_type, skip, base_url)
++    hit = _CACHE.get(key)
++    if hit and time.time() - hit[0] < _CACHE_TTL:
++        return hit[1]
++    from comet.services import catalogs as _cat
++    metas = await _cat._fetch_catalog_items(media_type, f"svx_{svc['key']}_{tab}", None, skip,
++                                            base_url=base_url)
++    if tab.startswith("top10"):
++        from urllib.parse import quote
++        metas = [dict(m) for m in metas[:10]]
++        for idx, meta in enumerate(metas, start=1):
++            src = meta.get("poster") or ""
++            if src.startswith(base_url):
++                src = src[len(base_url):]
++            if not src.startswith("/art/land/"):
++                bg = meta.get("background") or ""
++                mm = re.search(r"/t/p/\w+/([A-Za-z0-9_-]+\.(?:jpg|png))", bg)
++                src = f"/art/land/{mm.group(1)}" if mm else ""
++            mb = re.match(r"/art/land/([A-Za-z0-9_-]+\.(?:jpg|png))", src)
++            src = f"/art/land/{mb.group(1)}" if mb else ""  # só o fundo: logo e selo cortariam
++            if src:
++                art = f"{base_url}/art/svc/rank/{svc['key']}-{idx}.jpg?v={_ART_VERSION}&s={quote(src, safe='')}"
++                meta["poster"] = art
++                meta["landscapePoster"] = art
++                meta["background"] = art  # o card horizontal do Nuvio usa background primeiro
++                meta["posterShape"] = "landscape"
++    if metas:
++        _CACHE[key] = (time.time(), metas)
++        if len(_CACHE) > 400:
++            for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[:100]:
++                _CACHE.pop(k, None)
++    return metas
++
++
++# ───────────────────────── coleção do Nuvio ─────────────────────────
++
++def _art(base: str, kind: str, key: str, ext: str) -> str:
++    # URL fixa: o servidor troca o conteúdo do dia (fundo e vídeo seguem o que está em alta)
++    return f"{base}/art/svc/{kind}/{key}.{ext}?v={_ART_VERSION}"
++
++
++def build_collections(base: str) -> list[dict]:
++    addon_id = getattr(settings, "ADDON_ID", "stremio.comet.a71")
++    folders = []
++    # "Para Você": as fileiras pessoais, primeiro bloco (como no Disney+)
++    folders.append({
++        "id": FORYOU_ID, "title": "Para Você",
++        "coverImageUrl": _art(base, "tile", FORYOU_ID, "jpg"),
++        "focusGifUrl": _art(base, "focus", FORYOU_ID, "gif"), "focusGifEnabled": True,
++        "tileShape": "LANDSCAPE", "hideTitle": True,
++        "heroBackdropUrl": _art(base, "hero", FORYOU_ID, "jpg"),
++        "heroVideoUrl": _art(base, "video", FORYOU_ID, "mp4"),
++        "titleLogoUrl": _art(base, "logo", FORYOU_ID, "png"),
++        "sources": [
++            {"provider": "addon", "addonId": addon_id, "type": "movie", "catalogId": "comet_foryou"},
++            {"provider": "addon", "addonId": addon_id, "type": "series", "catalogId": "comet_foryou"},
++            {"provider": "addon", "addonId": addon_id, "type": "series", "catalogId": "comet_newep"},
++            {"provider": "addon", "addonId": addon_id, "type": "series", "catalogId": "comet_mylist"},
++            {"provider": "addon", "addonId": addon_id, "type": "movie", "catalogId": "comet_mylist"},
++            {"provider": "addon", "addonId": addon_id, "type": "series", "catalogId": "comet_dubready"},
++        ],
++    })
++    for s in SERVICES:
++        sources = []
++        for tab, ctype, _name in TABS:
++            if tab == "orig" and not s.get("networks"):
++                continue
++            sources.append({"provider": "addon", "addonId": addon_id, "type": ctype,
++                            "catalogId": CATALOG_PREFIX + tab, "genre": s["name"]})
++        folders.append({
++            "id": s["key"], "title": s["name"],
++            "coverImageUrl": _art(base, "tile", s["key"], "jpg"),
++            "focusGifUrl": _art(base, "focus", s["key"], "gif"), "focusGifEnabled": True,
++            "tileShape": "LANDSCAPE", "hideTitle": True,
++            "heroBackdropUrl": _art(base, "hero", s["key"], "jpg"),
++            "heroVideoUrl": _art(base, "video", s["key"], "mp4"),
++            "titleLogoUrl": _art(base, "logo", s["key"], "png"),
++            "sources": sources,
++        })
++    return [{
++        "id": COLLECTION_ID, "title": "Streamings",
++        "backdropImageUrl": _art(base, "hero", FORYOU_ID, "jpg"),
++        "pinToTop": True, "focusGlowEnabled": True, "viewMode": "TABBED_GRID",
++        "showAllTab": False, "folders": folders,
++    }]
++
++
++# ───────────────────────── artes ─────────────────────────
++
++_FONT_BOLD = "/opt/comet/data/fonts/Montserrat.ttf"  # fonte variável do Google Fonts (OFL)
++if not os.path.exists(_FONT_BOLD):
++    _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
++_FORYOU = {"key": FORYOU_ID, "name": "Para Você", "c1": (14, 6, 34), "c2": (160, 60, 255),
++           "c3": (255, 70, 150)}
++_locks: dict[str, asyncio.Lock] = {}
++
++
++def _svc(key: str) -> dict:
++    if key == FORYOU_ID:
++        return _FORYOU
++    s = BY_KEY.get(key)
++    if not s:
++        raise HTTPException(status_code=404, detail="Serviço desconhecido")
++    return s
++
++
++async def _tmdb_image(size: str, path: str) -> bytes | None:
++    from comet.services.artwork import _fetch_tmdb_image
++    try:
++        return await _fetch_tmdb_image(size, path.lstrip("/"))
++    except Exception as e:
++        log_swallowed("streamings._tmdb_image", e)
++        return None
++
++
++async def _top_backdrops(key: str, n: int = 6) -> list[str]:
++    """Fundos (TMDB) dos títulos em alta no serviço, para o destaque e o vídeo."""
++    from comet.services import catalogs as _cat
++    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++    paths: list[str] = []
++    if key == FORYOU_ID:
++        sources = [("movie", "comet_trending"), ("series", "comet_trending")]
++        for mt, cid in sources:
++            try:
++                metas = await _cat.get_catalog(mt, cid, {}, base_url=base)
++            except Exception as e:
++                log_swallowed("streamings._top_backdrops", e)
++                metas = []
++            paths += [m.get("background") or "" for m in metas[:n]]
++    else:
++        for tab, mt in (("hots", "series"), ("hotm", "movie")):
++            try:
++                metas = await get_catalog(mt, CATALOG_PREFIX + tab, {"genre": key}, base)
++            except Exception as e:
++                log_swallowed("streamings._top_backdrops", e)
++                metas = []
++            paths += [m.get("background") or "" for m in metas[:n]]
++    out = []
++    for bg in paths:
++        mm = re.search(r"/t/p/\w+(/[A-Za-z0-9_-]+\.(?:jpg|png))", bg)
++        if mm and mm.group(1) not in out:
++            out.append(mm.group(1))
++    # alterna série e filme para o vídeo ficar variado
++    return out[: n]
++
++
++def _logo_image(raw: bytes | None, white: bool):
++    from PIL import Image
++    if not raw:
++        return None
++    im = Image.open(io.BytesIO(raw)).convert("RGBA")
++    bbox = im.getchannel("A").getbbox()
++    if bbox:
++        im = im.crop(bbox)
++    if white:
++        a = im.getchannel("A")
++        im = Image.new("RGBA", im.size, (255, 255, 255, 0))
++        im.putalpha(a)
++    return im
++
++
++def _text_logo(text: str, height: int = 160, gradient: tuple | None = None):
++    from PIL import Image, ImageDraw, ImageFont
++    font = ImageFont.truetype(_FONT_BOLD, height)
++    try:
++        font.set_variation_by_name("ExtraBold")
++    except Exception:
++        pass
++    l, t, r, b = font.getbbox(text)
++    im = Image.new("RGBA", (r - l + 20, b - t + 20), (0, 0, 0, 0))
++    d = ImageDraw.Draw(im)
++    d.text((10 - l, 10 - t), text, font=font, fill=(255, 255, 255, 255))
++    if gradient:
++        g = _lin_gradient(im.size, gradient[0], gradient[1], horizontal=True).convert("RGBA")
++        g.putalpha(im.getchannel("A"))
++        im = g
++    return im
++
++
++async def _logo_for(svc: dict):
++    if svc["key"] == FORYOU_ID:
++        return _text_logo("Para Você", 150, gradient=((255, 255, 255), (255, 190, 235)))
++    if svc.get("logo"):
++        raw = await _tmdb_image("w500", svc["logo"])
++        img = _logo_image(raw, svc.get("white", True))
++        if img is not None:
++            return img
++    return _text_logo(svc["name"], 150)
++
++
++def _lin_gradient(size, c_a, c_b, horizontal=False):
++    from PIL import Image
++    w, h = size
++    n = w if horizontal else h
++    line = Image.new("RGB", (n, 1))
++    for i in range(n):
++        f = i / max(1, n - 1)
++        line.putpixel((i, 0), tuple(int(c_a[k] + (c_b[k] - c_a[k]) * f) for k in range(3)))
++    if horizontal:
++        return line.resize((w, h))
++    return line.resize((h, 1)).rotate(-90, expand=True).resize((w, h))
++
++
++def _radial(size, center, radius, color, strength=1.0):
++    """Brilho radial: camada RGBA com a cor no centro sumindo nas bordas."""
++    from PIL import Image
++    w, h = size
++    small = Image.new("L", (64, 64))
++    cx, cy = center[0] / w * 64, center[1] / h * 64
++    rx, ry = radius / w * 64, radius / h * 64
++    for y in range(64):
++        for x in range(64):
++            d = math.hypot((x - cx) / max(rx, 1e-3), (y - cy) / max(ry, 1e-3))
++            small.putpixel((x, y), int(max(0.0, 1 - d) ** 1.8 * 255 * strength))
++    mask = small.resize((w, h), Image.BICUBIC)
++    layer = Image.new("RGBA", (w, h), color + (0,))
++    layer.putalpha(mask)
++    return layer
++
++
++def _noise(size, amount=10, seed=7):
++    from PIL import Image
++    rnd = random.Random(seed)
++    w, h = size[0] // 2, size[1] // 2
++    im = Image.new("L", (w, h))
++    im.putdata([128 + rnd.randint(-amount, amount) for _ in range(w * h)])
++    return im.resize(size)
++
++
++def _compose_tile(svc: dict, logo, backdrop=None, w=960, h=540):
++    """Bloco 16:9: vidro escuro na cor do serviço, brilho atrás do logo, borda de luz."""
++    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageEnhance
++    c1, c2 = svc["c1"], svc["c2"]
++    base = _lin_gradient((w, h), tuple(min(255, int(v * 1.6)) for v in c1), c1)
++    if backdrop is not None:
++        bd = backdrop.convert("RGB").resize((w, h), Image.LANCZOS).filter(ImageFilter.GaussianBlur(10))
++        bd = ImageEnhance.Brightness(bd).enhance(0.55)
++        base = Image.blend(base, bd, 0.45)
++        tint = Image.new("RGB", (w, h), c1)
++        base = Image.blend(base, tint, 0.35)
++    base = base.convert("RGBA")
++    base.alpha_composite(_radial((w, h), (w * 0.5, h * 0.58), w * 0.55, c2, 0.85))
++    if svc.get("c3"):
++        base.alpha_composite(_radial((w, h), (w * 0.85, h * 0.15), w * 0.45, svc["c3"], 0.55))
++    # luz no alto (vidro)
++    gloss = _lin_gradient((w, h // 2), (255, 255, 255), (0, 0, 0)).convert("L")
++    gloss = gloss.point(lambda v: int(v * 0.10))
++    top = Image.new("RGBA", (w, h // 2), (255, 255, 255, 0))
++    top.putalpha(gloss)
++    base.alpha_composite(top, (0, 0))
++    # vinheta
++    vig = _radial((w, h), (w / 2, h / 2), w * 0.9, (0, 0, 0), 1.0).getchannel("A")
++    vig = ImageChops.invert(vig).point(lambda v: int(v * 0.55))
++    dark = Image.new("RGBA", (w, h), (0, 0, 0, 0))
++    dark.putalpha(vig)
++    base.alpha_composite(dark)
++    # grão sutil
++    n = _noise((w, h), 9).convert("RGB")
++    base = Image.blend(base.convert("RGB"), ImageChops.overlay(base.convert("RGB"), n), 0.25).convert("RGBA")
++    # logo com sombra e brilho
++    if logo is not None:
++        max_w, max_h = int(w * 0.62), int(h * 0.36)
++        sc = min(max_w / logo.width, max_h / logo.height)
++        lg = logo.resize((max(1, int(logo.width * sc)), max(1, int(logo.height * sc))), Image.LANCZOS)
++        x, y = (w - lg.width) // 2, (h - lg.height) // 2 + int(h * 0.02)
++        glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
++        ga = Image.new("L", (w, h), 0)
++        ga.paste(lg.getchannel("A"), (x, y))
++        ga = ga.filter(ImageFilter.GaussianBlur(18)).point(lambda v: int(v * 0.9))
++        glow = Image.new("RGBA", (w, h), c2 + (0,))
++        glow.putalpha(ga)
++        base.alpha_composite(glow)
++        sh = Image.new("RGBA", (w, h), (0, 0, 0, 0))
++        sa = Image.new("L", (w, h), 0)
++        sa.paste(lg.getchannel("A"), (x, y + 6))
++        sh.putalpha(sa.filter(ImageFilter.GaussianBlur(8)).point(lambda v: int(v * 0.6)))
++        base.alpha_composite(sh)
++        base.alpha_composite(lg, (x, y))
++    # borda de luz
++    d = ImageDraw.Draw(base)
++    d.rounded_rectangle((1, 1, w - 2, h - 2), radius=28, outline=(255, 255, 255, 46), width=2)
++    return base
++
++
++def _sweep_frames(tile, n=18):
++    """Brilho que atravessa o bloco na diagonal (GIF do foco)."""
++    from PIL import Image, ImageFilter
++    w, h = tile.size
++    frames = []
++    band = Image.new("L", (w * 2, h * 2), 0)
++    from PIL import ImageDraw
++    bd = ImageDraw.Draw(band)
++    bd.rectangle((w - 70, 0, w + 70, h * 2), fill=150)
++    band = band.filter(ImageFilter.GaussianBlur(40)).rotate(-22, resample=Image.BICUBIC)
++    for i in range(n):
++        f = i / (n - 1)
++        off = int(-w * 1.2 + f * w * 2.0)
++        m = Image.new("L", (w, h), 0)
++        m.paste(band, (off - w // 2, -h // 2))
++        light = Image.new("RGBA", (w, h), (255, 255, 255, 0))
++        light.putalpha(m)
++        fr = tile.copy()
++        fr.alpha_composite(light)
++        frames.append(fr.convert("RGB"))
++    # pausa no fim (o brilho passa e o bloco descansa)
++    frames += [tile.convert("RGB")] * 8
++    return frames
++
++
++def _compose_hero(svc: dict, backdrops: list, w=1920, h=1080):
++    """Fundo do destaque: o título em alta no serviço, lavado na cor da marca à esquerda/embaixo."""
++    from PIL import Image, ImageEnhance, ImageFilter
++    c1, c2 = svc["c1"], svc["c2"]
++    if backdrops:
++        bg = backdrops[0].convert("RGB").resize((w, h), Image.LANCZOS)
++        bg = ImageEnhance.Contrast(ImageEnhance.Color(bg).enhance(1.1)).enhance(1.05)
++    else:
++        bg = _lin_gradient((w, h), c2, c1, horizontal=True)
++    base = bg.convert("RGBA")
++    # lavagem de cor da marca, mais forte à esquerda (onde o Nuvio põe o logo e o texto)
++    left = _lin_gradient((w, h), c1, (0, 0, 0), horizontal=True).convert("RGBA")
++    a = _lin_gradient((w, h), (150, 150, 150), (0, 0, 0), horizontal=True).convert("L")
++    a = a.point(lambda v: int(v * (v / 150.0)))  # some rápido: o meio e a direita ficam vivos
++    left.putalpha(a)
++    base.alpha_composite(left)
++    base.alpha_composite(_radial((w, h), (w * 0.08, h * 0.9), w * 0.55, c2, 0.40))
++    bottom = Image.new("RGBA", (w, h), (0, 0, 0, 0))
++    ba = _lin_gradient((w, h), (0, 0, 0), (110, 110, 110)).convert("L")
++    ba = ba.point(lambda v: int(v * (v / 110.0)))
++    bottom.putalpha(ba)
++    base.alpha_composite(bottom)
++    return base.convert("RGB")
++
++
++def _jpeg(im, q=88) -> bytes:
++    buf = io.BytesIO()
++    im.convert("RGB").save(buf, "JPEG", quality=q, optimize=True, progressive=True)
++    return buf.getvalue()
++
++
++def _path(kind: str, key: str, ext: str, daily: bool) -> str:
++    os.makedirs(DATA_DIR, exist_ok=True)
++    stamp = f"_{datetime.date.today():%Y%m%d}" if daily else ""
++    return os.path.join(DATA_DIR, f"{kind}_{key}_v{_ART_VERSION}{stamp}.{ext}")
++
++
++def _cleanup_old(prefix: str, keep: str) -> None:
++    try:
++        for f in os.listdir(DATA_DIR):
++            if f.startswith(prefix) and os.path.join(DATA_DIR, f) != keep:
++                os.unlink(os.path.join(DATA_DIR, f))
++    except OSError:
++        pass
++
++
++async def _open_backdrops(key: str, n: int, size: str = "w1280"):
++    from PIL import Image
++    imgs = []
++    for p in await _top_backdrops(key, n):
++        raw = await _tmdb_image(size, p)
++        if raw:
++            try:
++                imgs.append(Image.open(io.BytesIO(raw)).convert("RGB"))
++            except Exception as e:
++                log_swallowed("streamings._open_backdrops", e)
++    return imgs
++
++
++async def make_art(kind: str, key: str) -> str:
++    """Gera (ou reaproveita) a arte e devolve o caminho do arquivo."""
++    svc = _svc(key)
++    daily = kind in ("tile", "focus", "hero", "video")
++    ext = {"tile": "jpg", "focus": "gif", "hero": "jpg", "logo": "png", "video": "mp4"}[kind]
++    path = _path(kind, key, ext, daily)
++    if os.path.exists(path) and os.path.getsize(path) > 0:
++        return path
++    lock = _locks.setdefault(f"{kind}:{key}", asyncio.Lock())
++    async with lock:
++        if os.path.exists(path) and os.path.getsize(path) > 0:
++            return path
++        started = time.monotonic()
++        if kind == "logo":
++            logo = await _logo_for(svc)
++            buf = io.BytesIO()
++            logo.save(buf, "PNG", optimize=True)
++            data = buf.getvalue()
++        elif kind in ("tile", "focus"):
++            logo = await _logo_for(svc)
++            bds = await _open_backdrops(key, 1, "w780")
++            tile = await asyncio.to_thread(_compose_tile, svc, logo, bds[0] if bds else None)
++            if kind == "tile":
++                data = _jpeg(tile.resize((640, 360)), 90)
++            else:
++                small = tile.resize((640, 360))
++                frames = await asyncio.to_thread(_sweep_frames, small)
++                buf = io.BytesIO()
++                pal = [f.quantize(colors=200, method=2, dither=1) for f in frames]
++                pal[0].save(buf, "GIF", save_all=True, append_images=pal[1:], duration=55,
++                            loop=0, optimize=True, disposal=1)
++                data = buf.getvalue()
++        elif kind == "hero":
++            bds = await _open_backdrops(key, 1)
++            data = _jpeg(await asyncio.to_thread(_compose_hero, svc, bds), 86)
++        elif kind == "video":
++            data = await _make_video(svc, key)
++        else:
++            raise HTTPException(status_code=404)
++        tmp = path + ".tmp"
++        with open(tmp, "wb") as f:
++            f.write(data)
++        os.replace(tmp, path)
++        _cleanup_old(f"{kind}_{key}_", path)
++        logger.log("COMET", f"🎨 Streamings: {kind} de {svc['name']} pronto em "
++                            f"{time.monotonic() - started:.1f}s ({len(data) // 1024} KB)")
++        return path
++
++
++async def _make_video(svc: dict, key: str) -> bytes:
++    """Vídeo do destaque: os títulos em alta passando com zoom lento (Ken Burns) e
++    transição suave, na cor da marca. 1280x720, sem áudio, ~14 s."""
++    bds = await _open_backdrops(key, 5)
++    if not bds:
++        raise HTTPException(status_code=404)
++    tmpdir = os.path.join(DATA_DIR, f"vtmp_{key}")
++    os.makedirs(tmpdir, exist_ok=True)
++    try:
++        files = []
++        for i, im in enumerate(bds[:5]):
++            hero = await asyncio.to_thread(_compose_hero, svc, [im], 1280, 720)
++            p = os.path.join(tmpdir, f"{i}.jpg")
++            hero.save(p, "JPEG", quality=90)
++            files.append(p)
++        seg, fade, fps = 3.4, 0.8, 25
++        args = ["ffmpeg", "-y", "-loglevel", "error"]
++        for p in files:
++            args += ["-i", p]  # zoompan gera os quadros a partir de UMA imagem (d=quadros)
++        filt = []
++        frames = int((seg + fade) * fps)
++        for i in range(len(files)):
++            zin = i % 2 == 0
++            z = "min(zoom+0.0009,1.12)" if zin else "if(eq(on,0),1.12,max(zoom-0.0009,1.0))"
++            filt.append(
++                f"[{i}:v]scale=1600:-1,zoompan=z='{z}':d={frames}:s=1280x720:fps={fps}"
++                f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',format=yuv420p[v{i}]")
++        last = "v0"
++        for i in range(1, len(files)):
++            off = i * seg
++            filt.append(f"[{last}][v{i}]xfade=transition=fade:duration={fade}:offset={off:.2f}[x{i}]")
++            last = f"x{i}"
++        out = os.path.join(tmpdir, "out.mp4")
++        args += ["-filter_complex", ";".join(filt), "-map", f"[{last}]", "-an", "-c:v", "libx264",
++                 "-preset", "veryfast", "-crf", "27", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
++                 "-r", str(fps), out]
++        proc = await asyncio.to_thread(subprocess.run, args, capture_output=True, timeout=600)
++        if proc.returncode != 0 or not os.path.exists(out):
++            logger.warning(f"Streamings: vídeo de {svc['name']} falhou: {proc.stderr[-300:]!r}")
++            raise HTTPException(status_code=404)
++        with open(out, "rb") as f:
++            return f.read()
++    finally:
++        for f in os.listdir(tmpdir):
++            try:
++                os.unlink(os.path.join(tmpdir, f))
++            except OSError:
++                pass
++        try:
++            os.rmdir(tmpdir)
++        except OSError:
++            pass
++
++
++async def warm_all() -> None:
++    """Gera tudo em 2º plano (uma vez por dia): o 1º foco na TV já encontra as artes prontas."""
++    keys = [FORYOU_ID] + [s["key"] for s in SERVICES]
++    for kind in ("logo", "tile", "focus", "hero", "video"):
++        for key in keys:
++            try:
++                await make_art(kind, key)
++            except Exception as e:
++                log_swallowed("streamings.warm_all", e)
++            await asyncio.sleep(0.2)
++    await _warm_ranks()
++
++
++_warm_task: asyncio.Task | None = None
++
++
++def start_warm() -> None:
++    global _warm_task
++
++    async def loop():
++        await asyncio.sleep(90)
++        while True:
++            await warm_all()
++            now = datetime.datetime.now()
++            tomorrow = (now + datetime.timedelta(days=1)).replace(hour=5, minute=10, second=0)
++            await asyncio.sleep(max(600.0, (tomorrow - now).total_seconds()))
++
++    if _warm_task is None or _warm_task.done():
++        try:
++            _warm_task = asyncio.get_running_loop().create_task(loop())
++        except RuntimeError:
++            pass
++
++
++# ───────────────────────── rotas ─────────────────────────
++
++router = APIRouter(tags=["Stremio"])
++_MEDIA = {"jpg": "image/jpeg", "gif": "image/gif", "png": "image/png", "mp4": "video/mp4"}
++
++
++def _compose_rank(svc: dict, rank: int, art, w=960, h=540):
++    """Card do Top 10: número gigante com contorno à esquerda, a arte do título à direita."""
++    from PIL import Image, ImageDraw, ImageFilter, ImageFont
++    c1, c2 = svc["c1"], svc["c2"]
++    base = _lin_gradient((w, h), tuple(min(255, int(v * 1.4)) for v in c1), (0, 0, 0), horizontal=True).convert("RGBA")
++    base.alpha_composite(_radial((w, h), (w * 0.2, h * 0.75), w * 0.45, c2, 0.55))
++    # arte à direita, sumindo para a esquerda
++    aw = int(w * 0.66)
++    a = art.convert("RGB")
++    sc = max(aw / a.width, h / a.height)
++    a = a.resize((int(a.width * sc) + 1, int(a.height * sc) + 1), Image.LANCZOS)
++    a = a.crop(((a.width - aw) // 2, (a.height - h) // 2, (a.width - aw) // 2 + aw, (a.height - h) // 2 + h))
++    fade = _lin_gradient((aw, h), (0, 0, 0), (255, 255, 255), horizontal=True).convert("L")
++    fade = fade.point(lambda v: min(255, int(v * 2.2)))
++    layer = a.convert("RGBA")
++    layer.putalpha(fade)
++    base.alpha_composite(layer, (w - aw, 0))
++    # número
++    font = ImageFont.truetype(_FONT_BOLD, int(h * (0.95 if rank < 10 else 0.78)))
++    try:
++        font.set_variation_by_name("Black")
++    except Exception:
++        pass
++    txt = str(rank)
++    l, t, r, b = font.getbbox(txt)
++    tw, th = r - l, b - t
++    x = int(w * 0.20 - tw / 2) - l
++    y = int(h - th - h * 0.04) - t
++    mask = Image.new("L", (w, h), 0)
++    ImageDraw.Draw(mask).text((x, y), txt, font=font, fill=255)
++    outline = mask.filter(ImageFilter.MaxFilter(9))
++    glow = Image.new("RGBA", (w, h), c2 + (0,))
++    glow.putalpha(outline.filter(ImageFilter.GaussianBlur(14)).point(lambda v: int(v * 0.7)))
++    base.alpha_composite(glow)
++    ring = Image.new("RGBA", (w, h), (255, 255, 255, 0))
++    ring.putalpha(outline)
++    base.alpha_composite(ring)
++    fill = _lin_gradient((w, h), (28, 28, 34), (0, 0, 0)).convert("RGBA")
++    fill.putalpha(mask)
++    base.alpha_composite(fill)
++    d = ImageDraw.Draw(base)
++    d.rounded_rectangle((1, 1, w - 2, h - 2), radius=24, outline=(255, 255, 255, 40), width=2)
++    return base.convert("RGB")
++
++
++async def _ensure_rank(svc: dict, rank: int, src: str) -> str:
++    import aiohttp
++    from PIL import Image
++    os.makedirs(DATA_DIR, exist_ok=True)
++    key = re.sub(r"[^A-Za-z0-9]", "", src)[-60:]
++    path = os.path.join(DATA_DIR, f"rank_{svc['key']}_{rank}_{key}_v{_ART_VERSION}.jpg")
++    if os.path.exists(path):
++        return path
++    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as sess:
++        async with sess.get(f"http://127.0.0.1:8000{src}") as r:
++            if r.status != 200:
++                raise HTTPException(status_code=404)
++            raw = await r.read()
++    art = Image.open(io.BytesIO(raw))
++    img = await asyncio.to_thread(_compose_rank, svc, rank, art)
++    data = _jpeg(img.resize((640, 360), Image.LANCZOS), 88)
++    with open(path + ".tmp", "wb") as f:
++        f.write(data)
++    os.replace(path + ".tmp", path)
++    return path
++
++
++def _cleanup_ranks() -> None:
++    try:
++        now = time.time()
++        for f in os.listdir(DATA_DIR):
++            fp = os.path.join(DATA_DIR, f)
++            if f.startswith("rank_") and now - os.path.getmtime(fp) > 3 * 86400:
++                os.unlink(fp)
++    except OSError:
++        pass
++
++
++async def _warm_ranks() -> None:
++    from urllib.parse import parse_qs, urlparse
++    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++    for s in SERVICES:
++        for tab, mt in (("top10s", "series"), ("top10m", "movie")):
++            try:
++                metas = await get_catalog(mt, CATALOG_PREFIX + tab, {"genre": s["key"]}, base)
++            except Exception as e:
++                log_swallowed("streamings._warm_ranks", e)
++                continue
++            for i, m in enumerate(metas, start=1):
++                q = parse_qs(urlparse(m.get("landscapePoster") or "").query).get("s")
++                if q:
++                    try:
++                        await _ensure_rank(s, i, q[0])
++                    except Exception as e:
++                        log_swallowed("streamings._warm_ranks", e)
++    _cleanup_ranks()
++
++
++@router.get("/art/svc/rank/{name}")
++async def svc_rank(name: str, s: str):
++    """Arte do Top 10 (número + fundo do título). `s` = caminho /art/land/<fundo> do Comet."""
++    m = re.fullmatch(r"([a-z0-9]+)-(\d{1,2})\.jpg", name)
++    if not m or not s.startswith("/art/land/") or ".." in s:
++        raise HTTPException(status_code=404)
++    path = await _ensure_rank(_svc(m.group(1)), int(m.group(2)), s)
++    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
++
++
++@router.get("/art/svc/{kind}/{name}")
++async def svc_art(kind: str, name: str):
++    key, _, ext = name.partition(".")
++    if kind not in ("tile", "focus", "hero", "logo", "video") or ext not in _MEDIA:
++        raise HTTPException(status_code=404)
++    start_warm()
++    path = await make_art(kind, key)
++    return FileResponse(path, media_type=_MEDIA[ext],
++                        headers={"Cache-Control": "public, max-age=86400"})
++
++
++@router.get("/nuvio/colecoes.json")
++async def nuvio_collections():
++    """Sem token: a coleção só tem links das artes e o id do addon (nada secreto). O Nuvio
++    importa por URL em Ajustes > Conteúdo e Descoberta > Addons > Coleções > Importar > De URL."""
++    start_warm()
++    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++    return JSONResponse(build_collections(base), headers={"Cache-Control": "no-store"})
 diff --git a/comet/services/stremio_library.py b/comet/services/stremio_library.py
 new file mode 100644
 index 0000000..1c8a121

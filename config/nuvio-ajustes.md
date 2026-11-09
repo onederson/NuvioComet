@@ -118,6 +118,15 @@ Obs.: o app mostra os addons 2 e 3 com a chave desligada ("Desativar" ao lado da
 ### Instalar addon
 - Campo de URL (placeholder `https://example.com`): vazio.
 
+### Coleções (09/11/2026)
+- **Streamings** (fixada no topo, 11 pastas: Para Você + 10 serviços). Vem do Comet: `https://a71comet.duckdns.org:7443/nuvio/colecoes.json`.
+- **Para reinstalar:** o campo de URL de Ajustes > Conteúdo e Descoberta > Addons > Coleções > Importar > De URL prende o foco do controle (o botão "Buscar URL" fica inacessível), e "De arquivo" não lê arquivos enviados pelo ADB (Android 11). O que funciona:
+  1. Abra Addons > **Gerenciar pelo celular** (sobe um servidor na TV, porta 8080).
+  2. Leia `GET http://<ip-da-tv>:8080/api/state`.
+  3. Envie `POST /api/addons` com `urls` = os mesmos addons, `catalogOrderKeys` = a ordem atual (lista `catalogs[].key`), `disabledCatalogKeys` = os ocultos atuais e `collections` = o JSON acima.
+  4. Na TV, confira "Total de addons: 3" e "Catálogos: N" (N > 0) e aperte **Confirmar**.
+  - Atenção: se o Comet estiver desligado, a tela mostra "Catálogos: 0", e confirmar zeraria a ordem da tela inicial. Recuse e religue o Comet antes.
+
 ### Reordenar Tela inicial
 - Seguir ordem das Addons: DESLIGADO (a ordem abaixo é manual)
 - Nenhum catálogo está oculto (todos mostram o botão "Ocultar").

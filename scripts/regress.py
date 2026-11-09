@@ -504,6 +504,35 @@ def t_unit_fonte_falhou() -> tuple[str, str]:
     return "PASS", "troca em <1 min marca, depois de 1 min não, replay tira a marca"
 
 
+def t_unit_streamings() -> tuple[str, str]:
+    """09/11/2026: coleção "Streamings" do Nuvio (estilo Disney+), abas por serviço, fora da home."""
+    import datetime as _dt
+    from comet.services import streamings as sv
+    from comet.services.catalog_manifest import build_manifest_catalogs
+
+    cats = sv.manifest_catalogs()
+    assert len(cats) == len(sv.TABS) and all(c["showInHome"] is False for c in cats)
+    man = build_manifest_catalogs()
+    ids = {(c["type"], c["id"]): c for c in man}
+    assert ("series", "comet_sv_top10s") in ids and ("movie", "comet_sv_hotm") in ids
+    assert ids[("series", "comet_streams")].get("showInHome") is False, "a coleção substitui a fileira"
+    today = _dt.date(2026, 11, 9)
+    p, q = sv.tmdb_query("svx_netflix_top10s", "series", "pt-BR", "BR", 1, today)
+    assert p == "discover/tv" and q["with_watch_providers"] == 8 and q["watch_region"] == "BR"
+    p, q = sv.tmdb_query("svx_disney_orig", "series", "pt-BR", "BR", 1, today)
+    assert q["with_networks"] == "2739" and "with_watch_providers" not in q
+    assert sv.tmdb_query("svx_mubi_orig", "series", "pt-BR", "BR", 1, today) is None, "MUBI sem originais"
+    assert sv.tmdb_query("svx_netflix_top10s", "movie", "pt-BR", "BR", 1, today) is None, "tipo errado"
+    col = sv.build_collections("https://x")
+    folders = col[0]["folders"]
+    assert col[0]["pinToTop"] and folders[0]["id"] == "foryou" and len(folders) == len(sv.SERVICES) + 1
+    nf = next(f for f in folders if f["id"] == "netflix")
+    assert nf["tileShape"] == "LANDSCAPE" and nf["heroVideoUrl"].endswith(".mp4?v=" + sv._ART_VERSION)
+    assert [s["catalogId"] for s in nf["sources"]][:3] == ["comet_sv_top10s", "comet_sv_top10m", "comet_sv_orig"]
+    assert all(s["genre"] == "Netflix" for s in nf["sources"])
+    return "PASS", f"{len(cats)} abas fora da home, {len(folders)} pastas, consultas TMDB por serviço OK"
+
+
 def t_unit_pt_text() -> tuple[str, str]:
     """09/11/2026: título brasileiro (ou original legível, ou inglês) e detecção de PT."""
     from comet.services.pt_text import is_portuguese, has_nonlatin, title_for
@@ -1815,6 +1844,7 @@ def main():
         ("unit_fileiras_homonimos", t_unit_fileiras_homonimos),
         ("unit_homonimos_arquivo", t_unit_homonimos_arquivo),
         ("unit_fonte_falhou", t_unit_fonte_falhou),
+        ("unit_streamings", t_unit_streamings),
         ("unit_pt_text", t_unit_pt_text),
         ("unit_novidades_1108", t_unit_novidades_1108),
     ]
