@@ -903,7 +903,7 @@ index 0000000..ed35288
 +            headers={"Cache-Control": "public, max-age=21600"},
 +        )
 diff --git a/comet/api/endpoints/playback.py b/comet/api/endpoints/playback.py
-index 35b1121..a40f65e 100644
+index 35b1121..365d862 100644
 --- a/comet/api/endpoints/playback.py
 +++ b/comet/api/endpoints/playback.py
 @@ -1,6 +1,10 @@
@@ -966,7 +966,7 @@ index 35b1121..a40f65e 100644
  
  def _parse_optional_path_integer(value: str) -> int | None:
      if value == "n":
-@@ -181,6 +211,312 @@ async def _cache_download_link_safely(**kwargs) -> None:
+@@ -181,6 +211,317 @@ async def _cache_download_link_safely(**kwargs) -> None:
          )
  
  
@@ -1259,12 +1259,17 @@ index 35b1121..a40f65e 100644
 +_TASTE_TASKS: set = set()
 +
 +
-+def _record_play_bg(media_id, info_hash, name, torrent_name, service, resolution, season=None, episode=None):
++def _record_play_bg(media_id, info_hash, name, torrent_name, service, resolution, season=None, episode=None, ep_key=None):
 +    """Guarda o play para o motor de gosto (comet/services/taste.py), sem atrasar o player."""
 +    try:
 +        # o media_id da URL de play é só o IMDb; temporada e episódio vêm separados
 +        if media_id and media_id.startswith("tt") and ":" not in media_id and season is not None and episode is not None:
 +            media_id = f"{media_id}:{season}:{episode}"
++        try:
++            from comet.services.failed_sources import note_play
++            note_play(ep_key or media_id or "", info_hash)
++        except Exception as _fs_err:
++            logger.debug(f"failed_sources: {_fs_err}")
 +        import asyncio as _aio
 +        from comet.services.taste import record_play
 +        _txt = f"{name} {torrent_name}".lower()
@@ -1279,15 +1284,16 @@ index 35b1121..a40f65e 100644
  @router.get(
      "/{b64config}/playback/{hash}/{service_index}/{index}/{season}/{episode}",
      tags=["Stremio"],
-@@ -199,6 +535,7 @@ async def playback(
+@@ -199,6 +540,8 @@ async def playback(
      name: str = Query(),
      media_id: str | None = Query(default=None),
      media_type: str | None = Query(default=None),
 +    resolution: str | None = Query(default=None),
++    ep_key: str | None = Query(default=None),
  ):
      config = config_check(b64config, strict_b64config=True)
      if not config:
-@@ -227,11 +564,34 @@ async def playback(
+@@ -227,11 +570,34 @@ async def playback(
          debrid_service, debrid_api_key = get_debrid_credentials(
              config, parsed_service_index
          )
@@ -1316,13 +1322,13 @@ index 35b1121..a40f65e 100644
 +
 +    preresolved = get_preresolved_link(debrid_service, hash, season, episode)
 +    if preresolved:
-+        _record_play_bg(media_id, hash, name, torrent_name, debrid_service, resolution, season, episode)
++        _record_play_bg(media_id, hash, name, torrent_name, debrid_service, resolution, season, episode, ep_key=(ep_key or "").strip() or None)
 +        return RedirectResponse(preresolved, status_code=302)
 +
      account_key_hash = build_account_key_hash(debrid_api_key)
  
      session = await http_client_manager.get_session()
-@@ -331,10 +691,29 @@ async def playback(
+@@ -331,10 +697,29 @@ async def playback(
                      default_key="BAD_REQUEST",
                  )
  
@@ -1355,7 +1361,7 @@ index 35b1121..a40f65e 100644
  
          debrid = get_debrid(
              session,
-@@ -345,22 +724,133 @@ async def playback(
+@@ -345,22 +730,133 @@ async def playback(
              ip if not should_proxy else "",
          )
          try:
@@ -1502,11 +1508,11 @@ index 35b1121..a40f65e 100644
  
          if not download_url:
              return build_status_video_response(
-@@ -392,4 +882,5 @@ async def playback(
+@@ -392,4 +888,5 @@ async def playback(
              ip=ip,
          )
  
-+    _record_play_bg(media_id, hash, name, torrent_name, debrid_service, resolution, season, episode)
++    _record_play_bg(media_id, hash, name, torrent_name, debrid_service, resolution, season, episode, ep_key=(ep_key or "").strip() or None)
      return RedirectResponse(download_url, status_code=302)
 diff --git a/comet/api/endpoints/status.py b/comet/api/endpoints/status.py
 new file mode 100644
@@ -2062,7 +2068,7 @@ index 0000000..e2626b4
 +"""
 +    return HTMLResponse(content=content, status_code=200)
 diff --git a/comet/api/endpoints/stream.py b/comet/api/endpoints/stream.py
-index 94f56ae..ee36427 100644
+index 94f56ae..6eb70af 100644
 --- a/comet/api/endpoints/stream.py
 +++ b/comet/api/endpoints/stream.py
 @@ -1,13 +1,33 @@
@@ -2129,7 +2135,7 @@ index 94f56ae..ee36427 100644
  
  def _first_meta_value(value):
      if isinstance(value, list):
-@@ -68,6 +102,720 @@ def _build_kodi_meta(parsed, formatted_components: dict):
+@@ -68,6 +102,743 @@ def _build_kodi_meta(parsed, formatted_components: dict):
      }
  
  
@@ -2545,7 +2551,13 @@ index 94f56ae..ee36427 100644
 +    blocked_hashes: set[str] | None = None,
 +    remote: bool = False,
 +    is_episode: bool = False,
++    media_key: str = "",
 +) -> tuple[list[dict], dict | None, list[dict]]:
++    try:
++        from comet.services.failed_sources import failed_hashes
++        _failed = failed_hashes(media_key)
++    except Exception:
++        _failed = set()
 +    for s in final_streams:
 +        info = s.get("_info")
 +        if not info:
@@ -2668,7 +2680,7 @@ index 94f56ae..ee36427 100644
 +        # Nuvio na TV 4K: 4K PT, depois 1080p PT, depois o melhor que houver
 +        return {"2160p": 0, "4k": 0, "1440p": 1, "1080p": 1, "720p": 2}.get(r, 3)
 +
-+    def _pick(pred):
++    def _pick(pred, allow_failed=True):
 +        best_key = None
 +        chosen = None
 +        for idx, cand in enumerate(candidates):
@@ -2681,6 +2693,8 @@ index 94f56ae..ee36427 100644
 +                continue
 +            deb_svc = str(info.get("debrid_service") or info.get("service") or "").lower()
 +            chash = str(info.get("info_hash") or "").lower()
++            if not allow_failed and chash in _failed:
++                continue
 +            if not ("torbox" in deb_svc or deb_svc == "tb"):
 +                if chash and chash in blocked_set:
 +                    continue
@@ -2705,7 +2719,9 @@ index 94f56ae..ee36427 100644
 +                _tb = 0.0
 +            # A resolução pesa antes da confirmação do áudio PT (só desempata).
 +            _unconfirmed = info.get("has_pt") != 1
-+            key = (too_big or bool(_risky), _res_pref(info), _unconfirmed, _pt_nd, -_tb, idx)
++            # trocada por outra em menos de 1 min da última vez: só se não houver alternativa
++            _was_failed = chash in _failed
++            key = (_was_failed, too_big or bool(_risky), _res_pref(info), _unconfirmed, _pt_nd, -_tb, idx)
 +            if best_key is None or key < best_key:
 +                best_key, chosen = key, cand
 +        return chosen
@@ -2719,13 +2735,29 @@ index 94f56ae..ee36427 100644
 +
 +    # 1) dublado/dual pronto no debrid (4K PT > 1080p PT > 720p PT, arquivos até 30 GB)
 +    # NUNCA escolhe has_pt == 0 como dublado.
-+    chosen = _pick(
-+        lambda i: i.get("cached")
-+        and i.get("is_pt")
-+        and not i.get("is_cam")
-+        and i.get("has_pt") != 0
-+        and (_is_hd(i) or not _ready_hd)
-+    )
++    # Fonte trocada por outra em menos de 1 min (failed_sources) fica de fora enquanto houver
++    # alternativa dublada, inclusive link direto; só volta se não sobrar nenhuma.
++    def _pt_ready(i):
++        return (
++            i.get("cached")
++            and i.get("is_pt")
++            and not i.get("is_cam")
++            and i.get("has_pt") != 0
++            and (_is_hd(i) or not _ready_hd)
++        )
++
++    def _direct_pt():
++        for cand in candidates:
++            if (cand.get("_is_direct") or cand.get("_is_direct_pt")) and cand.get("_is_pt"):
++                # Costuma ser outra versao da obra (ex.: Hunter x Hunter de 1999 no lugar do de 2011).
++                if _ready_hd and str(cand.get("_res") or "") in ("480p", "SD"):
++                    continue
++                return cand
++        return None
++
++    chosen = _pick(_pt_ready, allow_failed=False)
++    if not chosen and _failed and not _direct_pt():
++        chosen = _pick(_pt_ready)
 +    if chosen:
 +        info = chosen["_info"]
 +        best_stream = chosen
@@ -2733,18 +2765,15 @@ index 94f56ae..ee36427 100644
 +
 +    # 2) link direto em PT-BR (validado)
 +    if not best_stream:
-+        for cand in candidates:
-+            if (cand.get("_is_direct") or cand.get("_is_direct_pt")) and cand.get("_is_pt"):
-+                # Costuma ser outra versao da obra (ex.: Hunter x Hunter de 1999 no lugar do de 2011).
-+                if _ready_hd and str(cand.get("_res") or "") in ("480p", "SD"):
-+                    continue
-+                best_stream = cand
-+                best_meta = ("🇧🇷 PT-BR", cand.get("_res") or "HD", None)
-+                break
++        cand = _direct_pt()
++        if cand:
++            best_stream = cand
++            best_meta = ("🇧🇷 PT-BR", cand.get("_res") or "HD", None)
 +
 +    # 3) qualquer um pronto no RD (audio original) cujo hash nao esta em 451
 +    if not best_stream:
-+        chosen = _pick(lambda i: i.get("cached") and not i.get("is_cam"))
++        _orig = lambda i: i.get("cached") and not i.get("is_cam")
++        chosen = _pick(_orig, allow_failed=False) or _pick(_orig)
 +        if chosen:
 +            info = chosen["_info"]
 +            best_stream = chosen
@@ -2850,7 +2879,7 @@ index 94f56ae..ee36427 100644
  def _stream_notice_name(kodi: bool, emoji_name: str, plain_name: str):
      return plain_name if kodi else emoji_name
  
-@@ -125,6 +873,37 @@ def _encode_playback_scope(value: int | None) -> str:
+@@ -125,6 +896,37 @@ def _encode_playback_scope(value: int | None) -> str:
      return str(value) if value is not None else "n"
  
  
@@ -2888,7 +2917,7 @@ index 94f56ae..ee36427 100644
  def _select_info_hashes_by_resolution(
      ranked_info_hashes,
      torrents: dict,
-@@ -132,6 +911,8 @@ def _select_info_hashes_by_resolution(
+@@ -132,6 +934,8 @@ def _select_info_hashes_by_resolution(
      max_results: int,
      cached_only: bool,
      prioritize_cached: bool,
@@ -2897,7 +2926,7 @@ index 94f56ae..ee36427 100644
  ):
      if max_results <= 0:
          return None
-@@ -153,27 +934,75 @@ def _select_info_hashes_by_resolution(
+@@ -153,27 +957,75 @@ def _select_info_hashes_by_resolution(
              for info_hash in ranked_info_hashes
          }
  
@@ -2988,7 +3017,7 @@ index 94f56ae..ee36427 100644
      return selected_info_hashes
  
  
-@@ -198,6 +1027,61 @@ async def stream(
+@@ -198,6 +1050,61 @@ async def stream(
      chilllink: bool = False,
      kodi: bool = False,
  ):
@@ -3050,7 +3079,7 @@ index 94f56ae..ee36427 100644
      if media_type not in ["movie", "series"]:
          return _build_stream_response(request, {"streams": []}, is_empty=True)
  
-@@ -240,12 +1124,30 @@ async def stream(
+@@ -240,12 +1147,30 @@ async def stream(
              "empty" if is_empty else "success",
              result_count,
          )
@@ -3082,7 +3111,7 @@ index 94f56ae..ee36427 100644
  
      search_result = await search_media(
          media_type,
-@@ -257,6 +1159,8 @@ async def stream(
+@@ -257,6 +1182,8 @@ async def stream(
      stream_cache_state = search_result.cache_state
  
      if search_result.status is MediaSearchStatus.INVALID:
@@ -3091,7 +3120,7 @@ index 94f56ae..ee36427 100644
          return _stream_response({"streams": []}, is_empty=True)
  
      if search_result.status is MediaSearchStatus.DISABLED:
-@@ -270,53 +1174,94 @@ async def stream(
+@@ -270,53 +1197,94 @@ async def stream(
          return _stream_response({"streams": [placeholder_stream]})
  
      if search_result.status is MediaSearchStatus.UNRELEASED:
@@ -3221,7 +3250,7 @@ index 94f56ae..ee36427 100644
              is_empty=True,
          )
  
-@@ -329,7 +1274,7 @@ async def stream(
+@@ -329,7 +1297,7 @@ async def stream(
      debrid_errors = search_result.debrid_errors
      sort_mixed = search_result.sort_mixed
      torrents = search_result.torrents
@@ -3230,7 +3259,7 @@ index 94f56ae..ee36427 100644
          {
              "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
              "description": error.display_message,
-@@ -337,6 +1282,7 @@ async def stream(
+@@ -337,6 +1305,7 @@ async def stream(
          }
          for service, error in search_result.debrid_errors.items()
      ]
@@ -3238,7 +3267,7 @@ index 94f56ae..ee36427 100644
      non_cached_results = []
      debrid_stream_specs = [
          (entry_index, entry["service"], get_debrid_extension(entry["service"]))
-@@ -348,7 +1294,7 @@ async def stream(
+@@ -348,7 +1317,7 @@ async def stream(
          and settings.PROXY_DEBRID_STREAM
          and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
      ):
@@ -3247,7 +3276,17 @@ index 94f56ae..ee36427 100644
              {
                  "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
                  "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
-@@ -378,7 +1324,7 @@ async def stream(
+@@ -359,6 +1328,9 @@ async def stream(
+     result_season = _encode_playback_scope(search_season)
+     result_episode = _encode_playback_scope(search_episode)
+     quoted_media_only_id = quote(media_only_id, safe="")
++    # ID exato pedido pelo app (com temporada:episódio): a URL de play o leva para o
++    # failed_sources, porque temporada/episódio do caminho saem "n" quando o nome não é lido.
++    quoted_ep_key = quote(str(media_id or ""), safe="")
+ 
+     base_playback_host = (
+         settings.PUBLIC_BASE_URL
+@@ -378,7 +1350,7 @@ async def stream(
  
      if search_result.show_account_sync_trigger:
          for entry_index, _, debrid_extension in debrid_stream_specs:
@@ -3256,7 +3295,7 @@ index 94f56ae..ee36427 100644
                  {
                      "name": (
                          f"[{debrid_extension}] Comet Sync"
-@@ -393,8 +1339,40 @@ async def stream(
+@@ -393,8 +1365,40 @@ async def stream(
                  }
              )
  
@@ -3298,7 +3337,7 @@ index 94f56ae..ee36427 100644
          torrents=torrents,
          service_cache_status=service_cache_status,
          max_results=config["maxResultsPerResolution"],
-@@ -402,18 +1380,31 @@ async def stream(
+@@ -402,18 +1406,31 @@ async def stream(
              config["cachedOnly"] and debrid_entries and not enable_torrent
          ),
          prioritize_cached=bool(debrid_entries and not sort_mixed),
@@ -3332,7 +3371,7 @@ index 94f56ae..ee36427 100644
          torrent_title = torrent["title"]
          torrent_size = torrent["size"]
          formatted_components = format_components(
-@@ -429,21 +1420,164 @@ async def stream(
+@@ -429,21 +1446,164 @@ async def stream(
          info_hash_cache_status = service_cache_status.get(info_hash)
          quoted_torrent_title = quote(torrent_title)
  
@@ -3505,7 +3544,7 @@ index 94f56ae..ee36427 100644
  
              behavior_hints = {
                  "bingeGroup": f"comet|{service}|{info_hash}",
-@@ -463,38 +1597,83 @@ async def stream(
+@@ -463,38 +1623,84 @@ async def stream(
                  seeders=torrent["seeders"],
                  status="C" if is_cached else "U",
              )
@@ -3569,6 +3608,7 @@ index 94f56ae..ee36427 100644
                  f"?torrent_name={quoted_torrent_title}&name={quoted_title}"
 -                f"&media_id={quoted_media_only_id}&media_type={media_type}"
 +                f"&media_id={quoted_media_only_id}&media_type={media_type}&resolution={res_param}"
++                f"&ep_key={quoted_ep_key}"
              )
  
 -            if is_cached:
@@ -3599,7 +3639,7 @@ index 94f56ae..ee36427 100644
                  continue
  
              behavior_hints = {
-@@ -515,6 +1694,10 @@ async def stream(
+@@ -515,6 +1721,10 @@ async def stream(
                  seeders=torrent["seeders"],
                  status="P2P",
              )
@@ -3610,7 +3650,7 @@ index 94f56ae..ee36427 100644
  
              the_stream = {
                  "name": stream_name,
-@@ -522,6 +1705,27 @@ async def stream(
+@@ -522,6 +1732,27 @@ async def stream(
                  "behaviorHints": behavior_hints,
                  "infoHash": info_hash,
              }
@@ -3638,7 +3678,7 @@ index 94f56ae..ee36427 100644
  
              if chilllink:
                  the_stream["_chilllink"] = format_chilllink(formatted_components, False)
-@@ -533,12 +1737,267 @@ async def stream(
+@@ -533,12 +1764,267 @@ async def stream(
              if sources:
                  the_stream["sources"] = sources
  
@@ -3650,9 +3690,7 @@ index 94f56ae..ee36427 100644
 +    ordered_entries = (
 +        cached_results if sort_mixed else cached_results + non_cached_results
 +    )
- 
--    if sort_mixed:
--        final_streams = cached_results
++
 +    if getattr(settings, "AUDIO_PROBE", True):
 +        try:
 +            from comet.services.audio_probe import get_probe_results_batch, format_audio_langs
@@ -3718,7 +3756,9 @@ index 94f56ae..ee36427 100644
 +        for s in direct_streams
 +        if not s.get("_is_pt")
 +    ]
-+
+ 
+-    if sort_mixed:
+-        final_streams = cached_results
 +    if settings.DEMOTE_CAM:
 +        if settings.PTBR_FIRST:
 +            pt_good = [entry for entry in ordered_entries if entry[1] and not entry[6]]
@@ -3797,7 +3837,7 @@ index 94f56ae..ee36427 100644
 +            logger.info("📶 fora de casa: ▶ Assistir prefere versão leve")
 +        final_streams, chosen_assistir, next_pt_candidates = _apply_clean_layout(
 +            final_streams, len(notice_streams), blocked_hashes=all_blocked, remote=_remote,
-+            is_episode=(media_type == "series"),
++            is_episode=(media_type == "series"), media_key=media_id,
 +        )
 +
 +    if chosen_assistir and chosen_assistir.get("_info"):
@@ -3910,7 +3950,7 @@ index 94f56ae..ee36427 100644
  
      has_results = len(final_streams) > 0
  
-@@ -546,3 +2005,12 @@ async def stream(
+@@ -546,3 +2032,12 @@ async def stream(
          {"streams": final_streams},
          is_empty=not has_results,
      )
@@ -5472,10 +5512,10 @@ index 7521a09..54a81d6 100644
 +        return None
 diff --git a/comet/metadata/siblings.py b/comet/metadata/siblings.py
 new file mode 100644
-index 0000000..b50a268
+index 0000000..246c38b
 --- /dev/null
 +++ b/comet/metadata/siblings.py
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,272 @@
 +import asyncio
 +import time
 +import urllib.parse
@@ -5538,18 +5578,39 @@ index 0000000..b50a268
 +            _cinemeta_episode_names(session, imdb_id),
 +            *(_cinemeta_episode_names(session, t) for t in twins),
 +        )
++    # "World War Three (2)" no Cinemeta vira "world war three 2"; o arquivo costuma vir sem o
++    # número da parte ("Doctor Who S01E05 World War Three"). Vale também o título sem ele.
++    own_all: dict[str, set] = {}
++    for n, eps in own.items():
++        for v in {n, _strip_part(n)}:
++            own_all.setdefault(v, set()).update(eps)
++    own_padded = [f" {o} " for o in own_all]
 +    phrases = set()
 +    for names in others:
-+        for n, eps in names.items():
-+            # genérico demais ("episode 1", "pilot") ou curto: fica de fora
-+            if len(n) < 10 or len(n.split()) < 2 or n.startswith("episode"):
-+                continue
-+            if n not in own:
-+                phrases.add(n)
-+                continue
-+            for se, ep in eps - own[n]:
-+                phrases.add(f"{se}:{ep}:{n}")
++        for name, eps in names.items():
++            for n in {name, _strip_part(name)}:
++                # genérico demais ("episode 1", "pilot") ou curto: fica de fora
++                if len(n) < 10 or len(n.split()) < 2 or n.startswith("episode"):
++                    continue
++                inside_own = [
++                    e for o, e in zip(own_padded, own_all.values()) if f" {n} " in o
++                ] if n not in own_all else None
++                if n not in own_all and not inside_own:
++                    phrases.add(n)
++                    continue
++                # o título (ou um trecho dele) também é nosso: bloqueia só pelo SxxEyy da outra
++                ours = own_all[n] if n in own_all else set().union(*inside_own)
++                for se, ep in eps - ours:
++                    phrases.add(f"{se}:{ep}:{n}")
 +    return phrases
++
++
++def _strip_part(name: str) -> str:
++    """Tira o número da parte no fim: "world war three 2" / "the daleks part 1" -> sem ele."""
++    words = name.split()
++    while words and (words[-1].isdigit() or words[-1] in ("part", "parte", "pt")):
++        words.pop()
++    return " ".join(words)
 +_cache: dict[tuple[str, str], tuple[float, frozenset[str]]] = {}
 +_locks: dict[tuple[str, str], asyncio.Lock] = {}
 +
@@ -6745,10 +6806,10 @@ index b73981c..44acb28 100644
              title = title_full.split("\n")[0]
  
 diff --git a/comet/services/anime.py b/comet/services/anime.py
-index 13cfaa3..a0455a0 100644
+index 13cfaa3..bc78e76 100644
 --- a/comet/services/anime.py
 +++ b/comet/services/anime.py
-@@ -1,6 +1,8 @@
+@@ -1,12 +1,14 @@
  import asyncio
  import os
 +import re
@@ -6757,6 +6818,13 @@ index 13cfaa3..a0455a0 100644
  from contextlib import asynccontextmanager
  
  import aiohttp
+ import orjson
+ 
+-from comet.core.database import backend_lock, database
++from comet.core.database import IS_SQLITE, backend_lock, database
+ from comet.core.logger import logger
+ from comet.core.models import settings
+ from comet.utils.memory import trim_process_memory
 @@ -57,6 +59,42 @@ async def _anime_refresh_lock():
          yield
  
@@ -6884,6 +6952,137 @@ index 13cfaa3..a0455a0 100644
      def is_loaded(self):
          return self.loaded
  
+@@ -510,6 +618,20 @@ class AnimeMapper:
+         fribb_list: list,
+         kitsu_imdb_data: list,
+     ) -> int:
++        if IS_SQLITE:
++            # A71: o execute_many do `databases` grava linha a linha (SQL montado em Python a
++            # cada linha). Com ~200 mil linhas isso levava 6 min com o banco travado, e todo o
++            # resto do Comet dava "database is locked". Aqui monta as linhas e grava com o
++            # executemany nativo do sqlite3, numa thread: mesma transação única, poucos segundos.
++            started = time.monotonic()
++            total_entries = await asyncio.to_thread(
++                _sqlite_write_mapping, anime_list, fribb_list, kitsu_imdb_data
++            )
++            logger.log(
++                "COMET",
++                f"Anime mapping gravado no SQLite em {time.monotonic() - started:.1f}s",
++            )
++            return total_entries
+         async with database.transaction():
+             total_entries = await self._persist_mapping(anime_list, fribb_list)
+             await self._persist_provider_overrides(kitsu_imdb_data)
+@@ -734,4 +856,109 @@ class AnimeMapper:
+             raise
+ 
+ 
++_SQLITE_ENTRIES_SQL = """
++    INSERT INTO anime_entries (id, data_json) VALUES (:id, :data_json)
++    ON CONFLICT (id) DO UPDATE SET data_json = excluded.data_json
++"""
++_SQLITE_IDS_SQL = """
++    INSERT INTO anime_ids (provider, provider_id, entry_id)
++    VALUES (:provider, :provider_id, :entry_id)
++    ON CONFLICT DO NOTHING
++"""
++_SQLITE_OVERRIDES_SQL = """
++    INSERT INTO anime_provider_overrides
++        (source_provider, source_id, target_provider, target_id, from_season, from_episode)
++    VALUES ('kitsu', :source_id, 'imdb', :target_id, :from_season, :from_episode)
++    ON CONFLICT (source_provider, source_id, target_provider) DO UPDATE SET
++        target_id = :target_id, from_season = :from_season, from_episode = :from_episode
++"""
++
++
++def _build_mapping_rows(anime_list: list, fribb_list: list) -> tuple[list, list]:
++    """Mesmas linhas que `_persist_mapping` grava (entradas e ids, Fribb por último)."""
++    entries: list[dict] = []
++    ids: list[dict] = []
++    lookup_map: dict[str, int] = {}
++    for idx, entry in enumerate(anime_list):
++        entry_id = idx + 1
++        entries.append({"id": entry_id, "data_json": orjson.dumps(entry).decode("utf-8")})
++        for source in entry.get("sources") or ():
++            for url_part, provider in _PROVIDER_URL_PATTERNS:
++                if url_part in source:
++                    try:
++                        if "id=" in source:
++                            provider_id = source.split("id=", 1)[1].split("&", 1)[0]
++                        else:
++                            provider_id = source.rstrip("/").rsplit("/", 1)[-1]
++                        ids.append({"provider": provider, "provider_id": provider_id,
++                                    "entry_id": entry_id})
++                        lookup_map[f"{provider}:{provider_id}"] = entry_id
++                    except (IndexError, ValueError):
++                        pass
++                    break
++    for entry in fribb_list:
++        imdb_id = entry.get("imdb_id")
++        if not imdb_id:
++            continue
++        imdb_ids = imdb_id if isinstance(imdb_id, list) else [imdb_id]
++        for provider, key in _FRIBB_PROVIDER_ORDER:
++            val = entry.get(key)
++            if val:
++                found_entry_id = lookup_map.get(f"{provider}:{val}")
++                if found_entry_id is not None:
++                    for single_imdb_id in imdb_ids:
++                        if single_imdb_id:
++                            ids.append({"provider": "imdb", "provider_id": str(single_imdb_id),
++                                        "entry_id": found_entry_id})
++                    break
++    return entries, ids
++
++
++def _build_override_rows(kitsu_imdb_data: list) -> list[dict]:
++    rows = []
++    for entry in kitsu_imdb_data:
++        imdb_id = entry.get("imdb_id")
++        if not imdb_id:
++            continue
++        rows.append({"source_id": str(entry["kitsu_id"]), "target_id": imdb_id,
++                     "from_season": entry.get("fromSeason"),
++                     "from_episode": entry.get("fromEpisode")})
++    return rows
++
++
++def _sqlite_write_mapping(anime_list: list, fribb_list: list, kitsu_imdb_data: list) -> int:
++    """Roda numa thread. Monta as linhas FORA da transação e só então trava o banco."""
++    import sqlite3
++
++    entries, ids = _build_mapping_rows(anime_list, fribb_list)
++    overrides = _build_override_rows(kitsu_imdb_data)
++    conn = sqlite3.connect(os.path.abspath(settings.DATABASE_PATH), timeout=60,
++                           isolation_level=None)
++    try:
++        conn.execute("PRAGMA busy_timeout=60000")
++        conn.execute("PRAGMA foreign_keys=ON")
++        conn.execute("BEGIN IMMEDIATE")
++        try:
++            conn.execute("DELETE FROM anime_ids")
++            conn.execute("DELETE FROM anime_entries")
++            conn.executemany(_SQLITE_ENTRIES_SQL, entries)
++            conn.executemany(_SQLITE_IDS_SQL, ids)
++            conn.execute("""
++                INSERT INTO anime_mapping_state (id, refreshed_at) VALUES (1, :ts)
++                ON CONFLICT (id) DO UPDATE SET refreshed_at = :ts
++            """, {"ts": time.time()})
++            conn.execute("""
++                DELETE FROM anime_provider_overrides
++                WHERE source_provider = 'kitsu' AND target_provider = 'imdb'
++            """)
++            conn.executemany(_SQLITE_OVERRIDES_SQL, overrides)
++            conn.execute("COMMIT")
++        except BaseException:
++            conn.execute("ROLLBACK")
++            raise
++    finally:
++        conn.close()
++    return len(entries)
++
++
+ anime_mapper = AnimeMapper()
 diff --git a/comet/services/anime_canon.py b/comet/services/anime_canon.py
 new file mode 100644
 index 0000000..ebeb575
@@ -15045,8 +15244,115 @@ index 0000000..a7f7f13
 +        if r is not None:
 +            out.append(r)
 +    return out
+diff --git a/comet/services/failed_sources.py b/comet/services/failed_sources.py
+new file mode 100644
+index 0000000..60fc299
+--- /dev/null
++++ b/comet/services/failed_sources.py
+@@ -0,0 +1,101 @@
++"""Fonte que falhou perde a vez no ▶ Assistir.
++
++Se você dá play numa fonte e, em até 1 minuto, dá play em OUTRA fonte do mesmo filme ou
++episódio, a primeira provavelmente não funcionou (travou, áudio errado, arquivo ruim). Ela fica
++marcada para aquele título e o ▶ Assistir passa a preferir outra. A marca some se você voltar a
++tocar a mesma fonte por escolha própria, ou depois de 30 dias.
++"""
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++
++from comet.core.logger import log_swallowed, logger
++
++PATH = "/opt/comet/data/failed_sources.json"
++WINDOW_S = 60
++TTL_S = 30 * 86400
++_MAX_TITLES = 2000
++
++_lock = threading.Lock()
++_last: dict[str, tuple[str, float]] = {}  # título -> (hash, quando deu play)
++_failed: dict[str, dict[str, float]] | None = None  # título -> {hash: quando marcou}
++
++
++def _load() -> dict[str, dict[str, float]]:
++    global _failed
++    if _failed is None:
++        try:
++            with open(PATH, encoding="utf-8") as f:
++                data = json.load(f)
++            _failed = {k: dict(v) for k, v in data.items() if isinstance(v, dict)}
++        except FileNotFoundError:
++            _failed = {}
++        except Exception as e:
++            log_swallowed("failed_sources._load", e)
++            _failed = {}
++    return _failed
++
++
++def _save(data: dict) -> None:
++    try:
++        tmp = PATH + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as f:
++            json.dump(data, f)
++        os.replace(tmp, PATH)
++    except Exception as e:
++        log_swallowed("failed_sources._save", e)
++
++
++def _prune(data: dict, now: float) -> None:
++    for key in list(data):
++        hashes = {h: t for h, t in data[key].items() if now - t < TTL_S}
++        if hashes:
++            data[key] = hashes
++        else:
++            del data[key]
++    if len(data) > _MAX_TITLES:
++        for key in sorted(data, key=lambda k: max(data[k].values()))[: len(data) - _MAX_TITLES]:
++            del data[key]
++    if len(_last) > _MAX_TITLES:
++        for key in sorted(_last, key=lambda k: _last[k][1])[: len(_last) - _MAX_TITLES]:
++            del _last[key]
++
++
++def note_play(media_key: str, info_hash: str, now: float | None = None) -> str | None:
++    """Registra um play. Devolve o hash que acabou de ser marcado como falho, se houver."""
++    if not media_key or not info_hash:
++        return None
++    now = time.time() if now is None else now
++    media_key = media_key[:80]
++    info_hash = info_hash.lower()[:64]
++    marked = None
++    with _lock:
++        data = _load()
++        changed = False
++        prev = _last.get(media_key)
++        if prev and prev[0] != info_hash and 0 <= now - prev[1] <= WINDOW_S:
++            data.setdefault(media_key, {})[prev[0]] = now
++            marked = prev[0]
++            changed = True
++        # tocar de novo uma fonte marcada, por escolha própria, tira a marca
++        if info_hash in data.get(media_key, {}) and marked != info_hash:
++            del data[media_key][info_hash]
++            changed = True
++        _last[media_key] = (info_hash, now)
++        if changed:
++            _prune(data, now)
++            _save(data)
++    if marked:
++        logger.log("PLAYBACK", f"👎 Fonte trocada em menos de {WINDOW_S}s: {marked[:8]} perde a vez no Assistir ({media_key})")
++    return marked
++
++
++def failed_hashes(media_key: str) -> set[str]:
++    if not media_key:
++        return set()
++    with _lock:
++        now = time.time()
++        return {h for h, t in _load().get(media_key, {}).items() if now - t < TTL_S}
 diff --git a/comet/services/filtering.py b/comet/services/filtering.py
-index b844e5e..da6afce 100644
+index b844e5e..ead4c3d 100644
 --- a/comet/services/filtering.py
 +++ b/comet/services/filtering.py
 @@ -1,6 +1,7 @@
@@ -15249,34 +15555,43 @@ index b844e5e..da6afce 100644
          )
  
          self.min_year = 0
-@@ -129,8 +281,34 @@ class TitleMatcher:
+@@ -128,9 +280,43 @@ class TitleMatcher:
+                 self.min_year = year - 1
                  self.max_year = year + 1
  
++    def homonym_blocked(self, torrent_title: str) -> bool:
++        """O nome (do torrent ou do arquivo escolhido no pacote) é da série homônima?
++        Ano a partir da estreia da outra, título de episódio exclusivo dela, HDR em série antiga."""
++        if not self.blocked_phrases or not torrent_title:
++            return False
++        _tt = f" {scrub(torrent_title)} "
++        _se = None
++        for p, ep in self.blocked_phrases:
++            if p == " __hdr__ ":
++                if _HDR_RE.search(torrent_title):
++                    return True
++                continue
++            if p.startswith(" __minyear:"):
++                _cut = int(p.strip()[10:-2])
++                if any(int(y) >= _cut for y in _YEAR_RE.findall(torrent_title)):
++                    return True
++                continue
++            if p not in _tt:
++                continue
++            if ep is None:
++                return True
++            if _se is None:
++                _m = re.search(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,4})", torrent_title)
++                _se = (int(_m.group(1)), int(_m.group(2))) if _m else ()
++            if _se == ep:
++                return True
++        return False
++
      def matches_title(self, torrent_title: str, parsed_title: str) -> bool:
 +        if self.blocked_titles and scrub(parsed_title) in self.blocked_titles:
 +            return False
-+        if self.blocked_phrases:
-+            _tt = f" {scrub(torrent_title)} "
-+            _se = None
-+            for p, ep in self.blocked_phrases:
-+                if p == " __hdr__ ":
-+                    if _HDR_RE.search(torrent_title):
-+                        return False
-+                    continue
-+                if p.startswith(" __minyear:"):
-+                    _cut = int(p.strip()[10:-2])
-+                    if any(int(y) >= _cut for y in _YEAR_RE.findall(torrent_title)):
-+                        return False
-+                    continue
-+                if p not in _tt:
-+                    continue
-+                if ep is None:
-+                    return False
-+                if _se is None:
-+                    _m = re.search(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,4})", torrent_title)
-+                    _se = (int(_m.group(1)), int(_m.group(2))) if _m else ()
-+                if _se == ep:
-+                    return False
++        if self.homonym_blocked(torrent_title):
++            return False
          if exact_alias_match(scrub(parsed_title), self.aliases_normalized):
              return True
 +        if _short_title_mismatch(self.title, parsed_title):
@@ -15284,7 +15599,7 @@ index b844e5e..da6afce 100644
          return title_match(
              self.title, parsed_title, aliases=self.aliases
          ) or alternate_title_match(torrent_title, self.title, self.aliases)
-@@ -146,7 +324,7 @@ class TitleMatcher:
+@@ -146,7 +332,7 @@ class TitleMatcher:
          self, torrent_title: str, parsed_title: str, parsed_year: int | None
      ) -> bool:
          cache_key = (
@@ -15293,7 +15608,7 @@ index b844e5e..da6afce 100644
              parsed_title,
              parsed_year,
          )
-@@ -295,10 +473,19 @@ def _do_parse_and_cache(
+@@ -295,10 +481,19 @@ def _do_parse_and_cache(
  
  
  def filter_worker(
@@ -15315,7 +15630,7 @@ index b844e5e..da6afce 100644
      aliases = matcher.aliases
  
      country_aliases = {}
-@@ -355,6 +542,7 @@ def filter_worker(
+@@ -355,6 +550,7 @@ def filter_worker(
                  )
                  parsed.languages.append(language)
  
@@ -20629,7 +20944,7 @@ index 0000000..2e6dd11
 +    score += _HDR_BONUS.get(v.get("hdr"), 0.0)
 +    return round(score, 3)
 diff --git a/comet/services/media_search.py b/comet/services/media_search.py
-index a111c8c..631dd5b 100644
+index a111c8c..5e82b21 100644
 --- a/comet/services/media_search.py
 +++ b/comet/services/media_search.py
 @@ -1,4 +1,6 @@
@@ -20832,6 +21147,14 @@ index a111c8c..631dd5b 100644
  
      for service in dict.fromkeys(entry["service"] for entry in debrid_entries):
          cached_count = sum(
+@@ -717,6 +817,7 @@ async def search_media(
+             f"{cached_count}/{len(torrent_manager.torrents)}",
+         )
+ 
++    torrent_manager.drop_homonym_files()
+     initial_torrent_count = len(torrent_manager.torrents)
+     await torrent_manager.rank_torrents(
+         config["rtnSettings"],
 diff --git a/comet/services/meta_ptbr.py b/comet/services/meta_ptbr.py
 new file mode 100644
 index 0000000..d24a751
@@ -22965,18 +23288,20 @@ index 0000000..8d81cdd
 +        await asyncio.sleep(0.3)
 +    return done
 diff --git a/comet/services/orchestration.py b/comet/services/orchestration.py
-index aa43646..722ba5b 100644
+index aa43646..564397b 100644
 --- a/comet/services/orchestration.py
 +++ b/comet/services/orchestration.py
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,9 @@
  import asyncio
++import copy
++import os
 +import re
  import time
 +from comet.services.anime import anime_mapper, release_cites_other_arc
  
  from RTN import DefaultRanking, ParsedData
  
-@@ -9,7 +11,7 @@ from comet.core.models import CometSettingsModel, database, settings
+@@ -9,7 +13,7 @@ from comet.core.models import CometSettingsModel, database, settings
  from comet.core.scrape import ScrapeContext
  from comet.scrapers.manager import scraper_manager
  from comet.scrapers.models import ScrapeRequest
@@ -22985,7 +23310,20 @@ index aa43646..722ba5b 100644
  from comet.services.ranking import rank_worker
  from comet.services.torrent_manager import torrent_update_queue
  from comet.utils.languages import select_indexer_titles
-@@ -76,6 +78,10 @@ class TorrentManager:
+@@ -24,6 +28,12 @@ from comet.utils.parsing import (
+ from comet.utils.torrent_cache import build_torrent_cache_where, normalize_search_params
+ 
+ 
++# Busca progressiva (PROGRESSIVE_SOFT_S=0 desliga e volta a esperar todas as fontes).
++_PROGRESSIVE_SOFT_S = float(os.environ.get("PROGRESSIVE_SOFT_S", "6") or 0)
++_PROGRESSIVE_MIN_RESULTS = int(os.environ.get("PROGRESSIVE_MIN_RESULTS", "3") or 1)
++_PROGRESSIVE_TAILS: set[asyncio.Task] = set()
++
++
+ def _is_optional_int(value: object) -> bool:
+     return value is None or type(value) is int
+ 
+@@ -76,6 +86,10 @@ class TorrentManager:
          target_air_date: str | None = None,
          reject_unknown_episode_files: bool = False,
          media_scope: MediaScope | None = None,
@@ -22996,7 +23334,7 @@ index aa43646..722ba5b 100644
      ):
          self.media_type = media_type
          self.media_id = media_full_id
-@@ -94,6 +100,15 @@ class TorrentManager:
+@@ -94,6 +108,15 @@ class TorrentManager:
              else media_scope
          )
          self.aliases = aliases
@@ -23012,7 +23350,7 @@ index aa43646..722ba5b 100644
          self.remove_adult_content = remove_adult_content
          self.is_kitsu = is_kitsu
          self.cache_media_ids = normalize_cache_media_ids(
-@@ -101,6 +116,16 @@ class TorrentManager:
+@@ -101,6 +124,16 @@ class TorrentManager:
          )
          self.target_air_date = target_air_date
          self.reject_unknown_episode_files = reject_unknown_episode_files
@@ -23029,7 +23367,7 @@ index aa43646..722ba5b 100644
  
          self.seen_hashes = set()
          self.torrents = {}
-@@ -109,6 +134,49 @@ class TorrentManager:
+@@ -109,6 +142,49 @@ class TorrentManager:
          self.primary_cached = False
          self.live_result_timestamp = time.time()
  
@@ -23079,7 +23417,7 @@ index aa43646..722ba5b 100644
      def _matches_requested_scope(
          self,
          parsed: ParsedData,
-@@ -116,6 +184,17 @@ class TorrentManager:
+@@ -116,6 +192,17 @@ class TorrentManager:
          reject_unknown_override: bool | None = None,
          scope_is_known: bool = False,
      ) -> bool:
@@ -23097,7 +23435,7 @@ index aa43646..722ba5b 100644
          reject_unknown = (
              self.reject_unknown_episode_files
              if reject_unknown_override is None
-@@ -128,6 +207,8 @@ class TorrentManager:
+@@ -128,6 +215,8 @@ class TorrentManager:
              target_air_date=self.target_air_date,
              reject_unknown_episode_files=reject_unknown,
              scope_is_known=scope_is_known,
@@ -23106,7 +23444,25 @@ index aa43646..722ba5b 100644
          )
  
      async def scrape_torrents(
-@@ -170,7 +251,7 @@ class TorrentManager:
+@@ -158,10 +247,13 @@ class TorrentManager:
+             f"🔤 Indexer titles ({len(request.query_titles)}): {titles}",
+         )
+ 
+-        async for scraper_name, results, response_time in scraper_manager.scrape_all(
+-            request
+-        ):
+-            await self.filter_manager(scraper_name, results, response_time)
++        if context == ScrapeContext.LIVE and _PROGRESSIVE_SOFT_S > 0:
++            await self._scrape_progressive(request)
++        else:
++            async for scraper_name, results, response_time in scraper_manager.scrape_all(
++                request
++            ):
++                await self.filter_manager(scraper_name, results, response_time)
+ 
+         await self.cache_torrents()
+ 
+@@ -170,7 +262,7 @@ class TorrentManager:
                  continue
  
              info_hash = torrent["infoHash"]
@@ -23115,7 +23471,7 @@ index aa43646..722ba5b 100644
                  "fileIndex": torrent["fileIndex"],
                  "title": torrent["title"],
                  "seeders": torrent["seeders"],
-@@ -180,6 +261,29 @@ class TorrentManager:
+@@ -180,6 +272,129 @@ class TorrentManager:
                  "parsed": torrent["parsed"],
                  "updatedAt": self.live_result_timestamp,
              }
@@ -23142,10 +23498,110 @@ index aa43646..722ba5b 100644
 +                if not candidate["sources"] and existing["sources"]:
 +                    candidate["sources"] = existing["sources"]
 +            self.torrents[info_hash] = candidate
++
++    def drop_homonym_files(self) -> int:
++        """Depois da consulta ao debrid, `title` é o nome do ARQUIVO escolhido dentro do
++        pacote. Um pacote sem ano no nome ("Doctor Who S01 1080p") pode trazer o arquivo
++        "Doctor.Who.2023.S01E05": aqui ele sai da lista da série homônima."""
++        if not self.title_matcher.blocked_phrases:
++            return 0
++        bad = [
++            info_hash
++            for info_hash, torrent in self.torrents.items()
++            if self.title_matcher.homonym_blocked(torrent.get("title") or "")
++        ]
++        for info_hash in bad:
++            del self.torrents[info_hash]
++        if bad:
++            logger.log(
++                "FILTER",
++                f"🧬 Homônimos: {len(bad)} arquivos de outra série com o mesmo nome "
++                f"removidos ({self.media_id})",
++            )
++        return len(bad)
++
++    def _has_enough_for_answer(self) -> bool:
++        """Já dá para responder? Precisa de ao menos um resultado em português, para o
++        ▶ Assistir não perder a versão dublada que só um scraper lento traria."""
++        if len(self.ready_to_cache) < _PROGRESSIVE_MIN_RESULTS:
++            return False
++        for torrent in self.ready_to_cache:
++            parsed = torrent.get("parsed")
++            if parsed is not None and "pt" in (getattr(parsed, "languages", None) or ()):
++                return True
++        return False
++
++    async def _scrape_progressive(self, request: ScrapeRequest) -> None:
++        """Busca progressiva (1ª busca de um título). Responde com as fontes que chegaram
++        em até _PROGRESSIVE_SOFT_S segundos, se já houver PT. As fontes lentas (Prowlarr leva
++        de 5 a 25 s) continuam em 2º plano e vão para o cache, para a próxima abertura."""
++        queue: asyncio.Queue = asyncio.Queue()
++
++        async def pump():
++            try:
++                async for item in scraper_manager.scrape_all(request):
++                    await queue.put(item)
++            finally:
++                await queue.put(None)
++
++        pump_task = asyncio.create_task(pump())
++        loop = asyncio.get_running_loop()
++        started = loop.time()
++        soft_deadline = started + _PROGRESSIVE_SOFT_S
++        try:
++            while True:
++                now = loop.time()
++                if now >= soft_deadline and self._has_enough_for_answer():
++                    break
++                try:
++                    if now < soft_deadline:
++                        item = await asyncio.wait_for(queue.get(), soft_deadline - now)
++                    else:
++                        item = await queue.get()
++                except TimeoutError:
++                    continue
++                if item is None:
++                    await pump_task
++                    return
++                await self.filter_manager(*item)
++                if loop.time() >= soft_deadline and self._has_enough_for_answer():
++                    break
++        except BaseException:
++            # Pedido cancelado antes de responder: não deixa scrapers órfãos rodando.
++            pump_task.cancel()
++            raise
++
++        logger.log(
++            "SCRAPER",
++            f"⚡ Busca progressiva: respondendo com {len(self.ready_to_cache)} torrents "
++            f"em {loop.time() - started:.1f}s; o resto continua em 2º plano",
++        )
++        # Estado próprio da cauda: a lista desta resposta não muda mais.
++        tail = copy.copy(self)
++        tail.ready_to_cache = []
++        tail.seen_hashes = set(self.seen_hashes)
++        tail.torrents = {}
++
++        async def finish_tail():
++            try:
++                while (item := await queue.get()) is not None:
++                    await tail.filter_manager(*item)
++                await tail.cache_torrents()
++                logger.log(
++                    "SCRAPER",
++                    f"📥 Busca progressiva: +{len(tail.ready_to_cache)} torrents "
++                    f"no cache em 2º plano ({self.media_id})",
++                )
++            except Exception as exc:
++                logger.warning(f"Busca progressiva: 2º plano falhou ({self.media_id}): {exc}")
++
++        task = asyncio.create_task(finish_tail())
++        _PROGRESSIVE_TAILS.add(task)
++        task.add_done_callback(_PROGRESSIVE_TAILS.discard)
  
      async def _fetch_cached_rows(self, media_id: str):
          where_clause, params = build_torrent_cache_where(
-@@ -204,7 +308,18 @@ class TorrentManager:
+@@ -204,7 +419,18 @@ class TorrentManager:
          )
          for cache_media_id, cache_rows in zip(self.cache_media_ids, cache_row_groups):
              if cache_rows and cache_media_id == self.media_only_id:
@@ -23165,7 +23621,7 @@ index aa43646..722ba5b 100644
              rows.extend(cache_rows)
  
          if rows:
-@@ -244,8 +359,14 @@ class TorrentManager:
+@@ -244,8 +470,14 @@ class TorrentManager:
                      f"Skipping torrent cache row with invalid parsed data: {row['info_hash']}"
                  )
                  continue
@@ -23180,7 +23636,7 @@ index aa43646..722ba5b 100644
              target_season = self.search_season
              if (
                  target_season is not None
-@@ -286,11 +407,27 @@ class TorrentManager:
+@@ -286,11 +518,27 @@ class TorrentManager:
          parsed_episodes = parsed.episodes or [None]
  
          if self.reject_unknown_episode_files and self.search_episode is not None:
@@ -23213,7 +23669,7 @@ index aa43646..722ba5b 100644
  
          episode = None if len(parsed_episodes) > 1 else parsed_episodes[0]
          info_hash = torrent["infoHash"]
-@@ -383,6 +520,7 @@ class TorrentManager:
+@@ -383,6 +631,7 @@ class TorrentManager:
                  self.media_type,
                  self.aliases,
                  self.remove_adult_content,

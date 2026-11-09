@@ -434,6 +434,76 @@ def t_unit_fileiras_homonimos() -> tuple[str, str]:
     return "PASS", "grupos (filtro, rodízio, posição) e homônimos (título de episódio, HDR, ano) OK"
 
 
+def t_unit_homonimos_arquivo() -> tuple[str, str]:
+    """09/11/2026: homônimo pelo ARQUIVO do pacote, título sem o nº da parte, busca progressiva."""
+    import asyncio as _aio
+    from types import SimpleNamespace
+    from comet.metadata import siblings
+    from comet.services.filtering import TitleMatcher
+    from comet.services.orchestration import TorrentManager
+
+    assert siblings._strip_part("world war three 2") == "world war three"
+    assert siblings._strip_part("the daleks part 1") == "the daleks"
+    names = {  # 1963 (nossa) x 2005 (homônima), como o Cinemeta devolve
+        "tt_a": {"the daleks 1": {(1, 5)}, "the keys of marinus 3": {(1, 7)}},
+        "tt_b": {"world war three 2": {(1, 5)}, "evolution of the daleks": {(3, 5)}},
+    }
+    orig = siblings._cinemeta_episode_names
+    async def _fake(_s, iid):
+        return names[iid]
+    siblings._cinemeta_episode_names = _fake
+    try:
+        ph_a = _aio.run(siblings._twin_episode_phrases("tt_a", ["tt_b"]))
+        ph_b = _aio.run(siblings._twin_episode_phrases("tt_b", ["tt_a"]))
+    finally:
+        siblings._cinemeta_episode_names = orig
+    assert "world war three" in ph_a, ph_a
+    assert "the daleks" not in ph_b and "1:5:the daleks" in ph_b, ph_b  # trecho de "evolution of the daleks"
+
+    m = TitleMatcher("Doctor Who", 1963, 1989, "series", {},
+                     {siblings.EP_PREFIX + p for p in ph_a} | {"ep:__minyear:2005__"})
+    tm = object.__new__(TorrentManager)
+    tm.title_matcher, tm.media_id = m, "tt_a:1:5"
+    tm.torrents = {
+        "a": {"title": "Doctor.Who.2023.S01E05.1080p.Kerob.mkv"},
+        "b": {"title": "Doctor Who S01E05 World War Three.mp4"},
+        "c": {"title": "Doctor Who (1963) S01E05 - The Dead Planet.mkv"},
+    }
+    assert tm.drop_homonym_files() == 2 and list(tm.torrents) == ["c"], tm.torrents
+
+    pt = SimpleNamespace(languages=["pt"]); en = SimpleNamespace(languages=["en"])
+    tm.ready_to_cache = [{"parsed": en}] * 5
+    assert not tm._has_enough_for_answer(), "sem PT espera as outras fontes"
+    tm.ready_to_cache = [{"parsed": en}] * 4 + [{"parsed": pt}]
+    assert tm._has_enough_for_answer()
+    return "PASS", "arquivo do pacote da homônima sai, parte (2) ignorada, trecho nosso protegido; progressiva só com PT"
+
+
+def t_unit_fonte_falhou() -> tuple[str, str]:
+    """09/11/2026: fonte trocada por outra em menos de 1 min perde a vez no ▶ Assistir."""
+    from comet.services import failed_sources as fs
+
+    saved = (fs.PATH, fs._failed, dict(fs._last))
+    fs.PATH, fs._failed = "/tmp/regress_failed_sources.json", {}
+    try:
+        k, t0 = "tt_teste:1:1", 1_000_000.0
+        assert fs.note_play(k, "AAA", t0) is None
+        assert fs.note_play(k, "BBB", t0 + 30) == "aaa", "troca em 30 s marca a 1ª"
+        assert fs.note_play(k, "CCC", t0 + 200) is None, "troca depois de 1 min não marca"
+        assert set(fs._failed[k]) == {"aaa"}
+        fs.note_play(k, "aaa", t0 + 400)
+        assert "aaa" not in fs._failed.get(k, {}), "tocar de novo por escolha tira a marca"
+        assert fs.note_play("tt_outro", "DDD", t0 + 401) is None, "outro título não conta"
+    finally:
+        fs.PATH, fs._failed = saved[0], saved[1]
+        fs._last.clear(); fs._last.update(saved[2])
+        try:
+            os.unlink("/tmp/regress_failed_sources.json")
+        except OSError:
+            pass
+    return "PASS", "troca em <1 min marca, depois de 1 min não, replay tira a marca"
+
+
 def t_unit_pt_text() -> tuple[str, str]:
     """09/11/2026: título brasileiro (ou original legível, ou inglês) e detecção de PT."""
     from comet.services.pt_text import is_portuguese, has_nonlatin, title_for
@@ -1743,6 +1813,8 @@ def main():
         ("unit_nuvio_4k_natal", t_unit_nuvio_4k_natal),
         ("unit_trakt", t_unit_trakt),
         ("unit_fileiras_homonimos", t_unit_fileiras_homonimos),
+        ("unit_homonimos_arquivo", t_unit_homonimos_arquivo),
+        ("unit_fonte_falhou", t_unit_fonte_falhou),
         ("unit_pt_text", t_unit_pt_text),
         ("unit_novidades_1108", t_unit_novidades_1108),
     ]

@@ -65,6 +65,9 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
   - **Ordem:** 4K PT > 1080p PT > 720p PT > link direto PT > melhor original (4K primeiro). Limite de 30 GB.
   - **Fora de casa:** a versão leve vem primeiro, pelo bitrate (`REMOTE_MAX_MBPS`, padrão 12).
   - **Novo (09/11):** um torrent SD/480p dublado só vira ▶ Assistir se não houver nada pronto em HD. Costuma ser outra versão da obra (Hunter x Hunter 1999 × 2011). Ele continua na lista.
+  - **Fonte que falhou perde a vez (09/11, `failed_sources.py`):** se você dá play numa fonte e, em até 60 s, em outra do mesmo título, a 1ª fica marcada para aquele título por 30 dias (`data/failed_sources.json`). O ▶ Assistir pula a marcada enquanto houver alternativa dublada, inclusive link direto. Tocar de novo a fonte marcada tira a marca. A URL de play leva `&ep_key=` (ID exato com temporada:episódio).
+- **Busca progressiva (09/11, `orchestration._scrape_progressive`):** na 1ª busca de um título, a resposta sai com o que chegou em 6 s, se já houver resultado em PT. Sem PT, espera todas as fontes, como antes. O que chega depois (Prowlarr, que leva de 5 a 25 s, e MediaFusion) é filtrado à parte e vai para o cache, então a próxima abertura já vem completa. Para ajustar: `PROGRESSIVE_SOFT_S` (0 desliga) e `PROGRESSIVE_MIN_RESULTS`, como variáveis de ambiente do processo. 1ª busca medida: de 12 a 15 s (antes até 30 s), dos quais uns 4 s são a consulta ao TorBox/RD.
+- **Homônimos pelo arquivo (09/11):** depois da consulta ao debrid, o nome do **arquivo** escolhido dentro do pacote também passa pelas regras de homônimo (`TitleMatcher.homonym_blocked`, `TorrentManager.drop_homonym_files`). Os títulos de episódio da homônima valem também sem o número da parte ("World War Three (2)" → "world war three"). Um trecho que também aparece num título nosso só bloqueia pelo SxxEyy ("the daleks" × "evolution of the daleks"). Ainda passam pacotes **não baixados** sem ano e sem título de episódio no nome ("Doctor Who S01 1080p"): pelo nome não dá para saber de qual série são.
 - **Rádio:** a 1ª opção é vídeo (`/radio/<id>/tv.ts`: capa parada + áudio, ffmpeg), porque o player do Nuvio espera um quadro de vídeo.
 - **Fileiras:** 47 catálogos (42 na tela inicial), agrupadas (`row_groups.py`). Inclui:
   - fileiras pessoais;
@@ -75,8 +78,7 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 - **Biblioteca pessoal = Stremio + Trakt** (`comet/services/trakt.py`, novo em 09/11).
   - O Nuvio usa o Trakt como "Fonte para Biblioteca". O Comet lê do Trakt a lista de desejos, o histórico e o progresso pausado, e junta com a conta antiga do Stremio (`stremio_library.get_stremio_library`).
   - Minha lista, Novos episódios, Recomendados, Chegou dublado, Minha TV, gosto, madrugada e aquecimento passam a seguir o Nuvio.
-  - **App do Trakt criado (09/11):** é um app PKCE, que **não tem Client Secret**. O `trakt.py` só manda `client_secret` se ele existir no `.env`. O `TRAKT_CLIENT_ID` já está gravado no `.env` do A71.
-  - **Falta o usuário:** mandar `/trakt` no Telegram e digitar o código em trakt.tv/activate.
+  - **Conectado em 09/11.** O app do Trakt é PKCE e **não tem Client Secret**: o `trakt.py` só manda `client_secret` se ele existir no `.env`. O `TRAKT_CLIENT_ID` está no `.env` do A71. Na conexão vieram 37 títulos com histórico e 1 na lista de desejos.
   - O token fica em `/opt/comet/data/trakt_token.json` e é renovado sozinho. Teste: `unit_trakt`.
 
 ### Ajustes da TV
@@ -104,17 +106,20 @@ Mudanças de 09/11:
 6. **Trakt na biblioteca pessoal** (Seção 3).
 7. **Testes:** `REGRESS OK` (49 pass, 1 warn: `comet_mylist` vazio, normal). Patch: 83 arquivos.
 
+### Segunda leva (09/11, noite)
+8. **Banco travado resolvido.** A causa não era a partida: era a atualização do mapa de animes (a cada 5 dias). Ela apagava e regravava ~230 mil linhas numa transação só, e o `execute_many` do `databases` grava linha a linha, montando o SQL em Python. Isso prendia o SQLite por 6 minutos e gerou 202 `database is locked`. No SQLite, `anime.py` agora monta as linhas e grava com o `executemany` nativo do sqlite3, numa thread (`_sqlite_write_mapping`). A transação continua única e leva **6 s**. Conferido: o resultado é idêntico ao do código antigo (entradas, ids e overrides) e houve 0 travas com a regressão rodando junto.
+9. **Busca progressiva**, **homônimos pelo arquivo** e **fonte que falhou perde a vez** (Seção 3).
+10. **Testes:** `REGRESS OK` (51 pass, 1 warn). Novos: `unit_homonimos_arquivo` e `unit_fonte_falhou`. Patch: 84 arquivos (novo: `comet/services/failed_sources.py`).
+
 ---
 
 ## 5. Pendências e próximos passos
 
 | # | O quê | De quem |
 |---|---|---|
-| 1 | Mandar `/trakt` no Telegram e digitar o código em trakt.tv/activate (Seção 3). O app e o `TRAKT_CLIENT_ID` já estão prontos | usuário (1 min) |
-| 3 | **Banco travado logo após reiniciar:** com muitos pedidos ao mesmo tempo no 1º minuto, o SQLite dá `database is locked` e algumas listas levam 60 s. Some depois do aquecimento. Melhoria: `busy_timeout` maior e menos gravações concorrentes na partida | Claude |
-| 4 | **A 1ª busca de um episódio leva 8 a 17 s** (o Prowlarr pesa 5 a 16 s). Proposta: responder com as fontes rápidas e completar o resto em 2º plano. Ligado a isto: o autoplay "Assistir" do Nuvio espera 3 s; numa 1ª busca lenta ele pode cair na lista | Claude |
-| 5 | Pacotes de temporada de séries homônimas sem ano no nome ainda passam (Doctor Who 1963 × 2005) | Claude |
-| 6 | Ideias sem dono: fonte que falhou perde pontos, podcasts, pedido por foto | — |
+| 1 | **1ª busca ainda leva de 12 a 15 s.** Uns 6 s vêm do corte da busca progressiva, para esperar o BrSites, que traz os dublados BR em 5,5 a 6 s. Outros ~4 s são a consulta ao TorBox/RD. O autoplay do Nuvio espera 3 s, então numa 1ª busca ainda pode cair na lista. Ideia: aquecer antes os episódios prováveis (próximo da série em andamento), como o `prefetch` já faz | Claude |
+| 2 | Pacotes de homônimos **não baixados** sem ano nem título de episódio no nome (Seção 3) | — |
+| 3 | Ideias sem dono: podcasts, pedido por foto | — |
 
 ---
 
