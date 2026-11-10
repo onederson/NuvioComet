@@ -278,10 +278,10 @@ index 0000000..1fdce15
 +        raise HTTPException(status_code=404, detail="Artwork not found")
 diff --git a/comet/api/endpoints/catalog.py b/comet/api/endpoints/catalog.py
 new file mode 100644
-index 0000000..58fb1e5
+index 0000000..8d207cf
 --- /dev/null
 +++ b/comet/api/endpoints/catalog.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,245 @@
 +import urllib.parse
 +from fastapi import APIRouter, Request
 +from fastapi.responses import JSONResponse
@@ -512,6 +512,11 @@ index 0000000..58fb1e5
 +        except Exception as _lc_err:
 +            logger.debug(f"live covers: {_lc_err}")
 +        metas = await _pt_fix(metas, type)
++        try:  # cards do Nuvio: arte com logo no card horizontal, Top 10 com número
++            from comet.services.streamings import nuvio_cards
++            metas = nuvio_cards(metas, id, base_url)
++        except Exception as _nc_err:
++            log_swallowed("catalog.nuvio_cards", _nc_err)
 +        return JSONResponse(
 +            content={"metas": metas},
 +            headers={"Cache-Control": "public, max-age=600"},
@@ -9027,10 +9032,10 @@ index 0000000..1202f91
 +    }
 diff --git a/comet/services/catalog_manifest.py b/comet/services/catalog_manifest.py
 new file mode 100644
-index 0000000..f453a56
+index 0000000..95288d1
 --- /dev/null
 +++ b/comet/services/catalog_manifest.py
-@@ -0,0 +1,776 @@
+@@ -0,0 +1,834 @@
 +"""Montagem do manifesto (lista de fileiras) do Comet. Separado de catalogs.py (que só responde as fileiras)."""
 +from comet.services.catalogs import (  # noqa: F401
 +    MOVIE_GENRE_OPTIONS,
@@ -9806,7 +9811,65 @@ index 0000000..f453a56
 +            if c.get("id") in ("comet_streams", "comet_origs"):
 +                c["showInHome"] = False
 +        catalogs.extend(_svc.manifest_catalogs())
++        # Nomes de vitrine (Nuvio): sem emoji, e filme/série no próprio nome (o "- Filme" do app
++        # fica desligado nos ajustes da TV).
++        for c in catalogs:
++            nm = _CLEAN_NAMES.get((c.get("type"), c.get("id"))) or _CLEAN_NAMES.get((None, c.get("id")))
++            if nm:
++                c["name"] = nm
 +    return catalogs
++
++
++_CLEAN_NAMES: dict[tuple, str] = {
++    ("movie", "comet_top10"): "Top 10 filmes hoje",
++    ("series", "comet_top10"): "Top 10 séries hoje",
++    ("movie", "comet_foryou"): "Filmes para você",
++    ("series", "comet_foryou"): "Séries para você",
++    ("movie", "comet_mylist"): "Minha lista · filmes",
++    ("series", "comet_mylist"): "Minha lista · séries",
++    (None, "comet_newep"): "Novos episódios das suas séries",
++    (None, "comet_dubready"): "Acabou de chegar dublado",
++    (None, "comet_myweek"): "Sua semana",
++    (None, "comet_week"): "Estreias da semana",
++    ("movie", "comet_trending"): "Filmes em alta",
++    ("series", "comet_trending"): "Séries em alta",
++    ("movie", "comet_new"): "Filmes recém-lançados",
++    ("series", "comet_new"): "Séries que acabaram de estrear",
++    ("movie", "comet_ready"): "Filmes dublados prontos para ver",
++    ("series", "comet_ready"): "Séries dubladas prontas para ver",
++    ("movie", "comet_lucky"): "Sorteio do dia · filme",
++    ("series", "comet_lucky"): "Sorteio do dia · série",
++    (None, "comet_tonight"): "Para hoje à noite",
++    (None, "comet_moods"): "Para cada clima",
++    (None, "comet_genres"): "Gêneros",
++    ("movie", "comet_br"): "Cinema nacional",
++    ("series", "comet_br"): "Séries brasileiras",
++    (None, "comet_sagas"): "Sagas completas",
++    (None, "comet_saga"): "Sagas",
++    (None, "comet_orders"): "Maratonas na ordem da história",
++    (None, "comet_canon"): "Animes sem filler",
++    (None, "comet_anime_season"): "Animes da temporada",
++    (None, "comet_anime_dub"): "Animes dublados",
++    (None, "comet_anime"): "Animes",
++    (None, "comet_livehome"): "Ao vivo agora",
++    (None, "comet_mytv"): "Minha TV",
++    (None, "comet_fut"): "Futebol hoje",
++    (None, "comet_recap"): "Sua retrospectiva",
++    (None, "comet_mood_binge"): "Séries para maratonar em um dia",
++    (None, "comet_xmas_new"): "Natal: filmes novos",
++    (None, "comet_xmas_all"): "Natal: clássicos",
++    ("series", "comet_streams"): "Séries nos streamings",
++    ("movie", "comet_streams"): "Filmes nos streamings",
++    (None, "comet_origs"): "Originais dos streamings",
++    ("movie", "comet_sv_top10m"): "Top 10 filmes",
++    ("series", "comet_sv_top10s"): "Top 10 séries",
++    (None, "comet_sv_orig"): "Originais",
++    (None, "comet_sv_hots"): "Séries em alta",
++    (None, "comet_sv_hotm"): "Filmes em alta",
++    (None, "comet_sv_newm"): "Novidades",
++    (None, "comet_sv_bests"): "Séries aclamadas",
++    (None, "comet_sv_bestm"): "Filmes aclamados",
++}
 diff --git a/comet/services/catalogs.py b/comet/services/catalogs.py
 new file mode 100644
 index 0000000..e07db0f
@@ -21916,10 +21979,10 @@ index 0000000..d24a751
 +    return copy.deepcopy(base_meta)
 diff --git a/comet/services/mytv.py b/comet/services/mytv.py
 new file mode 100644
-index 0000000..82e9a91
+index 0000000..aac7869
 --- /dev/null
 +++ b/comet/services/mytv.py
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,483 @@
 +"""Canal ao vivo "📺 Minha TV": grade do dia montada com as séries que a pessoa assiste.
 +
 +Grade determinística por dia (semente = data local, sem estado): quem calcular de novo no mesmo
@@ -22063,11 +22126,13 @@ index 0000000..82e9a91
 +
 +
 +def describe(schedule: list[dict], idx: int, now: datetime, upcoming: int = 8) -> str:
++    # Curto: o destaque do Nuvio mostra só 3-4 linhas (antes vinha a grade inteira e cortava).
 +    p = schedule[idx]
-+    verbo = "começou" if p["start"] <= now else "começa"
-+    lines = [f"Agora: {prog_label(p)} ({verbo} {p['start']:%H:%M}, termina {p['end']:%H:%M})"]
-+    for q in schedule[idx + 1: idx + 1 + upcoming]:
-+        lines.append(f"{'Depois: ' if q is schedule[idx + 1] else ''}{q['start']:%H:%M} {prog_label(q)}")
++    quando = f"até {p['end']:%H:%M}" if p["start"] <= now else f"às {p['start']:%H:%M}"
++    lines = [f"Agora: {prog_label(p)} · {quando}"]
++    nxt = schedule[idx + 1: idx + 1 + min(upcoming, 2)]
++    if nxt:
++        lines.append("A seguir: " + "  ·  ".join(f"{q['start']:%H:%M} {q['series']}" for q in nxt))
 +    return "\n".join(lines)
 +
 +
@@ -23306,7 +23371,7 @@ index 0000000..8d81cdd
 +        await asyncio.sleep(0.3)
 +    return done
 diff --git a/comet/services/orchestration.py b/comet/services/orchestration.py
-index aa43646..564397b 100644
+index aa43646..7ffa273 100644
 --- a/comet/services/orchestration.py
 +++ b/comet/services/orchestration.py
 @@ -1,5 +1,9 @@
@@ -23489,7 +23554,7 @@ index aa43646..564397b 100644
                  "fileIndex": torrent["fileIndex"],
                  "title": torrent["title"],
                  "seeders": torrent["seeders"],
-@@ -180,6 +272,129 @@ class TorrentManager:
+@@ -180,6 +272,130 @@ class TorrentManager:
                  "parsed": torrent["parsed"],
                  "updatedAt": self.live_result_timestamp,
              }
@@ -23528,13 +23593,14 @@ index aa43646..564397b 100644
 +            for info_hash, torrent in self.torrents.items()
 +            if self.title_matcher.homonym_blocked(torrent.get("title") or "")
 +        ]
++        names = [str(self.torrents[h].get("title") or "")[:70] for h in bad[:4]]
 +        for info_hash in bad:
 +            del self.torrents[info_hash]
 +        if bad:
 +            logger.log(
 +                "FILTER",
 +                f"🧬 Homônimos: {len(bad)} arquivos de outra série com o mesmo nome "
-+                f"removidos ({self.media_id})",
++                f"removidos ({self.media_id}): {' | '.join(names)}",
 +            )
 +        return len(bad)
 +
@@ -23619,7 +23685,7 @@ index aa43646..564397b 100644
  
      async def _fetch_cached_rows(self, media_id: str):
          where_clause, params = build_torrent_cache_where(
-@@ -204,7 +419,18 @@ class TorrentManager:
+@@ -204,7 +420,18 @@ class TorrentManager:
          )
          for cache_media_id, cache_rows in zip(self.cache_media_ids, cache_row_groups):
              if cache_rows and cache_media_id == self.media_only_id:
@@ -23639,7 +23705,7 @@ index aa43646..564397b 100644
              rows.extend(cache_rows)
  
          if rows:
-@@ -244,8 +470,14 @@ class TorrentManager:
+@@ -244,8 +471,14 @@ class TorrentManager:
                      f"Skipping torrent cache row with invalid parsed data: {row['info_hash']}"
                  )
                  continue
@@ -23654,7 +23720,7 @@ index aa43646..564397b 100644
              target_season = self.search_season
              if (
                  target_season is not None
-@@ -286,11 +518,27 @@ class TorrentManager:
+@@ -286,11 +519,27 @@ class TorrentManager:
          parsed_episodes = parsed.episodes or [None]
  
          if self.reject_unknown_episode_files and self.search_episode is not None:
@@ -23687,7 +23753,7 @@ index aa43646..564397b 100644
  
          episode = None if len(parsed_episodes) > 1 else parsed_episodes[0]
          info_hash = torrent["infoHash"]
-@@ -383,6 +631,7 @@ class TorrentManager:
+@@ -383,6 +632,7 @@ class TorrentManager:
                  self.media_type,
                  self.aliases,
                  self.remove_adult_content,
@@ -28409,10 +28475,10 @@ index 0000000..efec780
 +    }
 diff --git a/comet/services/streamings.py b/comet/services/streamings.py
 new file mode 100644
-index 0000000..c6ee24f
+index 0000000..2790e80
 --- /dev/null
 +++ b/comet/services/streamings.py
-@@ -0,0 +1,806 @@
+@@ -0,0 +1,952 @@
 +"""Streamings no estilo Disney+: uma coleção do Nuvio com uma pasta por serviço.
 +
 +Na tela inicial do Nuvio aparece, fixada no topo, a fileira "Streamings" com um bloco por serviço
@@ -28488,7 +28554,7 @@ index 0000000..c6ee24f
 +FORYOU_ID = "foryou"
 +
 +DATA_DIR = "/opt/comet/data/svc_art"
-+_ART_VERSION = "4"  # muda a URL das artes quando o desenho muda (o Nuvio guarda em cache)
++_ART_VERSION = "5"  # muda a URL das artes quando o desenho muda (o Nuvio guarda em cache)
 +
 +
 +def manifest_catalogs() -> list[dict]:
@@ -28582,6 +28648,27 @@ index 0000000..c6ee24f
 +        skip = 0
 +    if tab.startswith("top10") and skip:
 +        return []
++    metas = await _raw_items(svc, tab, media_type, skip, base_url)
++    if tab.startswith("top10"):
++        metas = metas[:10]
++    out = []
++    for idx, meta in enumerate(metas, start=1):
++        meta = dict(meta)
++        if tab.startswith("top10"):
++            art = rank_url(base_url, svc["key"], idx, meta)
++        else:
++            art = _land_url(meta, base_url)
++        if art:
++            # na grade da pasta o Nuvio usa `background` primeiro: arte com logo (e número no Top 10)
++            meta["poster"] = art
++            meta["landscapePoster"] = art
++            meta["background"] = art
++            meta["posterShape"] = "landscape"
++        out.append(meta)
++    return out
++
++
++async def _raw_items(svc: dict, tab: str, media_type: str, skip: int, base_url: str) -> list[dict]:
 +    key = (svc["key"], tab, media_type, skip, base_url)
 +    hit = _CACHE.get(key)
 +    if hit and time.time() - hit[0] < _CACHE_TTL:
@@ -28589,31 +28676,64 @@ index 0000000..c6ee24f
 +    from comet.services import catalogs as _cat
 +    metas = await _cat._fetch_catalog_items(media_type, f"svx_{svc['key']}_{tab}", None, skip,
 +                                            base_url=base_url)
-+    if tab.startswith("top10"):
-+        from urllib.parse import quote
-+        metas = [dict(m) for m in metas[:10]]
-+        for idx, meta in enumerate(metas, start=1):
-+            src = meta.get("poster") or ""
-+            if src.startswith(base_url):
-+                src = src[len(base_url):]
-+            if not src.startswith("/art/land/"):
-+                bg = meta.get("background") or ""
-+                mm = re.search(r"/t/p/\w+/([A-Za-z0-9_-]+\.(?:jpg|png))", bg)
-+                src = f"/art/land/{mm.group(1)}" if mm else ""
-+            mb = re.match(r"/art/land/([A-Za-z0-9_-]+\.(?:jpg|png))", src)
-+            src = f"/art/land/{mb.group(1)}" if mb else ""  # só o fundo: logo e selo cortariam
-+            if src:
-+                art = f"{base_url}/art/svc/rank/{svc['key']}-{idx}.jpg?v={_ART_VERSION}&s={quote(src, safe='')}"
-+                meta["poster"] = art
-+                meta["landscapePoster"] = art
-+                meta["background"] = art  # o card horizontal do Nuvio usa background primeiro
-+                meta["posterShape"] = "landscape"
 +    if metas:
 +        _CACHE[key] = (time.time(), metas)
 +        if len(_CACHE) > 400:
 +            for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[:100]:
 +                _CACHE.pop(k, None)
 +    return metas
++
++
++_LAND_RE = re.compile(r"/art/land/([A-Za-z0-9_-]+\.(?:jpg|png))")
++_TMDB_RE = re.compile(r"/t/p/\w+/([A-Za-z0-9_-]+\.(?:jpg|png))")
++
++
++def _backdrop_file(meta: dict) -> str | None:
++    for field in ("poster", "landscapePoster", "background"):
++        v = meta.get(field) or ""
++        m = _LAND_RE.search(v) or (_TMDB_RE.search(v) if field == "background" else None)
++        if m:
++            return m.group(1)
++    return None
++
++
++def _land_url(meta: dict, base_url: str) -> str | None:
++    """Arte horizontal com logo do título (a /art/land do Comet), se o item já tiver uma."""
++    p = meta.get("poster") or ""
++    if "/art/land/" in p:
++        return p
++    return None
++
++
++def rank_url(base_url: str, key: str, idx: int, meta: dict) -> str | None:
++    from urllib.parse import quote
++    bf = _backdrop_file(meta)
++    if not bf:
++        return None
++    src = quote(f"/art/land/{bf}", safe="")
++    return f"{base_url}/art/svc/rank/{key}-{idx}.jpg?v={_ART_VERSION}&s={src}"
++
++
++def nuvio_cards(metas: list[dict], catalog_id: str, base_url: str) -> list[dict]:
++    """Saída de qualquer catálogo para o Nuvio. O card horizontal do app usa `landscapePoster`;
++    sem ele, mostra o fundo cru (sem logo). Aqui: a arte com logo vira `landscapePoster`, e o
++    Top 10 de hoje ganha o card com o número gigante."""
++    out = []
++    for idx, m in enumerate(metas or [], start=1):
++        if not isinstance(m, dict):
++            out.append(m)
++            continue
++        m = dict(m)
++        if catalog_id == "comet_top10" and idx <= 10:
++            art = rank_url(base_url, "top", idx, m)
++            if art:
++                m["landscapePoster"] = art
++        elif not m.get("landscapePoster"):
++            art = _land_url(m, base_url)
++            if art:
++                m["landscapePoster"] = art
++        out.append(m)
++    return out
 +
 +
 +# ───────────────────────── coleção do Nuvio ─────────────────────────
@@ -28630,7 +28750,7 @@ index 0000000..c6ee24f
 +    folders.append({
 +        "id": FORYOU_ID, "title": "Para Você",
 +        "coverImageUrl": _art(base, "tile", FORYOU_ID, "jpg"),
-+        "focusGifUrl": _art(base, "focus", FORYOU_ID, "gif"), "focusGifEnabled": True,
++        "focusGifUrl": _art(base, "focus", FORYOU_ID, "webp"), "focusGifEnabled": True,
 +        "tileShape": "LANDSCAPE", "hideTitle": True,
 +        "heroBackdropUrl": _art(base, "hero", FORYOU_ID, "jpg"),
 +        "heroVideoUrl": _art(base, "video", FORYOU_ID, "mp4"),
@@ -28654,7 +28774,7 @@ index 0000000..c6ee24f
 +        folders.append({
 +            "id": s["key"], "title": s["name"],
 +            "coverImageUrl": _art(base, "tile", s["key"], "jpg"),
-+            "focusGifUrl": _art(base, "focus", s["key"], "gif"), "focusGifEnabled": True,
++            "focusGifUrl": _art(base, "focus", s["key"], "webp"), "focusGifEnabled": True,
 +            "tileShape": "LANDSCAPE", "hideTitle": True,
 +            "heroBackdropUrl": _art(base, "hero", s["key"], "jpg"),
 +            "heroVideoUrl": _art(base, "video", s["key"], "mp4"),
@@ -28675,13 +28795,18 @@ index 0000000..c6ee24f
 +if not os.path.exists(_FONT_BOLD):
 +    _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 +_FORYOU = {"key": FORYOU_ID, "name": "Para Você", "c1": (14, 6, 34), "c2": (160, 60, 255),
-+           "c3": (255, 70, 150)}
++           "c3": (255, 70, 150), "logo_w": 0.80, "logo_h": 0.40, "tint": 120, "glow": 0.75}
 +_locks: dict[str, asyncio.Lock] = {}
++
++
++_TOP = {"key": "top", "name": "Top 10", "c1": (22, 12, 0), "c2": (255, 170, 0)}
 +
 +
 +def _svc(key: str) -> dict:
 +    if key == FORYOU_ID:
 +        return _FORYOU
++    if key == "top":
++        return _TOP
 +    s = BY_KEY.get(key)
 +    if not s:
 +        raise HTTPException(status_code=404, detail="Serviço desconhecido")
@@ -28698,34 +28823,62 @@ index 0000000..c6ee24f
 +
 +
 +async def _top_backdrops(key: str, n: int = 6) -> list[str]:
-+    """Fundos (TMDB) dos títulos em alta no serviço, para o destaque e o vídeo."""
++    """Fundos (TMDB) dos títulos em alta no serviço, alternando série e filme."""
 +    from comet.services import catalogs as _cat
 +    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
-+    paths: list[str] = []
++    groups: list[list[dict]] = []
 +    if key == FORYOU_ID:
-+        sources = [("movie", "comet_trending"), ("series", "comet_trending")]
-+        for mt, cid in sources:
++        for mt, cid in (("movie", "comet_foryou"), ("series", "comet_foryou"),
++                        ("movie", "comet_trending"), ("series", "comet_trending")):
 +            try:
-+                metas = await _cat.get_catalog(mt, cid, {}, base_url=base)
++                groups.append(await _cat.get_catalog(mt, cid, {}, base_url=base))
 +            except Exception as e:
 +                log_swallowed("streamings._top_backdrops", e)
-+                metas = []
-+            paths += [m.get("background") or "" for m in metas[:n]]
 +    else:
-+        for tab, mt in (("hots", "series"), ("hotm", "movie")):
++        svc = BY_KEY[key]
++        # originais primeiro: a cena tem a cara do serviço (e não se repete entre serviços)
++        tabs = (("orig", "series"), ("hots", "series"), ("hotm", "movie")) if svc.get("networks")             else (("hotm", "movie"), ("hots", "series"))
++        for tab, mt in tabs:
 +            try:
-+                metas = await get_catalog(mt, CATALOG_PREFIX + tab, {"genre": key}, base)
++                groups.append(await _raw_items(svc, tab, mt, 0, base))
 +            except Exception as e:
 +                log_swallowed("streamings._top_backdrops", e)
-+                metas = []
-+            paths += [m.get("background") or "" for m in metas[:n]]
-+    out = []
-+    for bg in paths:
-+        mm = re.search(r"/t/p/\w+(/[A-Za-z0-9_-]+\.(?:jpg|png))", bg)
-+        if mm and mm.group(1) not in out:
-+            out.append(mm.group(1))
-+    # alterna série e filme para o vídeo ficar variado
-+    return out[: n]
++    out: list[str] = []
++    taken = {f for f, k in _SCENE_OWNER.items() if k != key}
++    for i in range(max((len(g) for g in groups), default=0)):
++        for g in groups:
++            if i < len(g):
++                bf = _backdrop_file(g[i])
++                if bf and "/" + bf not in out and bf not in taken:
++                    out.append("/" + bf)
++    if out:
++        _SCENE_OWNER.setdefault(out[0][1:], key)
++    return out[:n]
++
++
++_SCENE_OWNER: dict[str, str] = {}  # fundo -> serviço que o usa como cena principal
++
++
++async def _poster_files(n: int = 24) -> list[str]:
++    """Pôsteres para o mural do "Para Você": recomendados, Minha lista e em alta."""
++    from comet.services import catalogs as _cat
++    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++    out: list[str] = []
++    for mt, cid in (("movie", "comet_foryou"), ("series", "comet_foryou"), ("series", "comet_mylist"),
++                    ("movie", "comet_mylist"), ("series", "comet_newep"), ("movie", "comet_trending"),
++                    ("series", "comet_trending"), ("movie", "comet_top10"), ("series", "comet_top10"),
++                    ("movie", "comet_new"), ("series", "comet_new")):
++        try:
++            metas = await _cat.get_catalog(mt, cid, {}, base_url=base)
++        except Exception as e:
++            log_swallowed("streamings._poster_files", e)
++            continue
++        for m in metas[:12]:
++            v = m.get("poster") or ""
++            mm = re.search(r"/(?:t/p/\w+|art/poster|art/top10/\d+)/([A-Za-z0-9_-]+\.(?:jpg|png))", v)
++            if mm and mm.group(1) not in out:
++                out.append(mm.group(1))
++    return out[:n]
 +
 +
 +def _logo_image(raw: bytes | None, white: bool):
@@ -28811,109 +28964,168 @@ index 0000000..c6ee24f
 +    return im.resize(size)
 +
 +
-+def _compose_tile(svc: dict, logo, backdrop=None, w=960, h=540):
-+    """Bloco 16:9: vidro escuro na cor do serviço, brilho atrás do logo, borda de luz."""
-+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageEnhance
++def _cover(img, w, h, zoom=1.0, fx=0.5, fy=0.5):
++    """Recorta a imagem cobrindo w x h, com zoom e ponto de foco (fx, fy em 0..1)."""
++    from PIL import Image
++    sc = max(w / img.width, h / img.height) * zoom
++    iw, ih = max(w, int(img.width * sc + 0.5)), max(h, int(img.height * sc + 0.5))
++    im = img.resize((iw, ih), Image.BICUBIC)
++    x = int((iw - w) * fx)
++    y = int((ih - h) * fy)
++    return im.crop((x, y, x + w, y + h))
++
++
++def _tile_overlay(svc: dict, logo, w: int, h: int):
++    """Tudo que fica por cima da cena no bloco: cor da marca, luz, vinheta, logo e vidro."""
++    from PIL import Image, ImageChops, ImageDraw, ImageFilter
 +    c1, c2 = svc["c1"], svc["c2"]
-+    base = _lin_gradient((w, h), tuple(min(255, int(v * 1.6)) for v in c1), c1)
-+    if backdrop is not None:
-+        bd = backdrop.convert("RGB").resize((w, h), Image.LANCZOS).filter(ImageFilter.GaussianBlur(10))
-+        bd = ImageEnhance.Brightness(bd).enhance(0.55)
-+        base = Image.blend(base, bd, 0.45)
-+        tint = Image.new("RGB", (w, h), c1)
-+        base = Image.blend(base, tint, 0.35)
-+    base = base.convert("RGBA")
-+    base.alpha_composite(_radial((w, h), (w * 0.5, h * 0.58), w * 0.55, c2, 0.85))
++    ov = Image.new("RGBA", (w, h), c1 + (svc.get("tint", 72),))
++    ov.alpha_composite(_radial((w, h), (w * 0.5, h * 1.18), w * 0.95, c2, svc.get("glow", 0.55)))
 +    if svc.get("c3"):
-+        base.alpha_composite(_radial((w, h), (w * 0.85, h * 0.15), w * 0.45, svc["c3"], 0.55))
-+    # luz no alto (vidro)
-+    gloss = _lin_gradient((w, h // 2), (255, 255, 255), (0, 0, 0)).convert("L")
-+    gloss = gloss.point(lambda v: int(v * 0.10))
-+    top = Image.new("RGBA", (w, h // 2), (255, 255, 255, 0))
-+    top.putalpha(gloss)
-+    base.alpha_composite(top, (0, 0))
-+    # vinheta
-+    vig = _radial((w, h), (w / 2, h / 2), w * 0.9, (0, 0, 0), 1.0).getchannel("A")
-+    vig = ImageChops.invert(vig).point(lambda v: int(v * 0.55))
++        ov.alpha_composite(_radial((w, h), (w * 0.92, h * 0.05), w * 0.55, svc["c3"], 0.55))
++    ov.alpha_composite(_radial((w, h), (w * 0.12, -h * 0.15), w * 0.6, (255, 255, 255), 0.10))
++    vig = _radial((w, h), (w / 2, h / 2), w * 0.78, (0, 0, 0), 1.0).getchannel("A")
++    vig = ImageChops.invert(vig).point(lambda v: int(v * 0.5))
 +    dark = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 +    dark.putalpha(vig)
-+    base.alpha_composite(dark)
-+    # grão sutil
-+    n = _noise((w, h), 9).convert("RGB")
-+    base = Image.blend(base.convert("RGB"), ImageChops.overlay(base.convert("RGB"), n), 0.25).convert("RGBA")
-+    # logo com sombra e brilho
++    ov.alpha_composite(dark)
 +    if logo is not None:
-+        max_w, max_h = int(w * 0.62), int(h * 0.36)
++        max_w, max_h = int(w * svc.get("logo_w", 0.58)), int(h * svc.get("logo_h", 0.30))
 +        sc = min(max_w / logo.width, max_h / logo.height)
 +        lg = logo.resize((max(1, int(logo.width * sc)), max(1, int(logo.height * sc))), Image.LANCZOS)
-+        x, y = (w - lg.width) // 2, (h - lg.height) // 2 + int(h * 0.02)
-+        glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-+        ga = Image.new("L", (w, h), 0)
-+        ga.paste(lg.getchannel("A"), (x, y))
-+        ga = ga.filter(ImageFilter.GaussianBlur(18)).point(lambda v: int(v * 0.9))
++        x, y = (w - lg.width) // 2, (h - lg.height) // 2
++        a = Image.new("L", (w, h), 0)
++        a.paste(lg.getchannel("A"), (x, y))
 +        glow = Image.new("RGBA", (w, h), c2 + (0,))
-+        glow.putalpha(ga)
-+        base.alpha_composite(glow)
++        glow.putalpha(a.filter(ImageFilter.GaussianBlur(max(6, w // 40))).point(lambda v: min(255, int(v * 1.1))))
++        ov.alpha_composite(glow)
 +        sh = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 +        sa = Image.new("L", (w, h), 0)
-+        sa.paste(lg.getchannel("A"), (x, y + 6))
-+        sh.putalpha(sa.filter(ImageFilter.GaussianBlur(8)).point(lambda v: int(v * 0.6)))
-+        base.alpha_composite(sh)
-+        base.alpha_composite(lg, (x, y))
-+    # borda de luz
-+    d = ImageDraw.Draw(base)
-+    d.rounded_rectangle((1, 1, w - 2, h - 2), radius=28, outline=(255, 255, 255, 46), width=2)
-+    return base
++        sa.paste(lg.getchannel("A"), (x, y + max(3, h // 90)))
++        sh.putalpha(sa.filter(ImageFilter.GaussianBlur(max(4, w // 110))).point(lambda v: int(v * 0.75)))
++        ov.alpha_composite(sh)
++        ov.alpha_composite(lg, (x, y))
++    d = ImageDraw.Draw(ov)
++    r = max(12, w // 34)
++    d.rounded_rectangle((1, 1, w - 2, h - 2), radius=r, outline=(255, 255, 255, 54), width=2)
++    d.line((r, 2, w - r, 2), fill=(255, 255, 255, 90), width=1)
++    return ov
 +
 +
-+def _sweep_frames(tile, n=18):
-+    """Brilho que atravessa o bloco na diagonal (GIF do foco)."""
-+    from PIL import Image, ImageFilter
-+    w, h = tile.size
++def _tile_frame(scene, overlay, zoom=1.0, fx=0.5, fy=0.42):
++    from PIL import Image, ImageEnhance
++    w, h = overlay.size
++    if scene is None:
++        base = Image.new("RGB", (w, h), (8, 8, 12))
++    else:
++        base = _cover(scene, w, h, zoom, fx, fy)
++        base = ImageEnhance.Color(ImageEnhance.Brightness(base).enhance(0.9)).enhance(1.12)
++    base = base.convert("RGBA")
++    base.alpha_composite(overlay)
++    return base.convert("RGB")
++
++
++def _focus_frames(scenes: list, overlay, fps=20, seg=1.7, fade=0.45, pan=False):
++    """Animação do foco: as cenas passam com zoom lento e transição suave; o logo fica parado.
++    Com pan=True (mural do Para Você), a câmera desliza pelo mural e volta."""
++    from PIL import Image
++    if pan:
++        n = int(fps * 4.2)
++        frames = [_tile_frame(scenes[0], overlay, 1.18, 0.1 + 0.8 * (i / (n - 1)), 0.5) for i in range(n)]
++        return frames + frames[::-1]
++    per = int(fps * seg)
++    nf = int(fps * fade)
++    clips = []
++    for k, sc in enumerate(scenes):
++        clip = []
++        for i in range(per + nf):
++            t = i / (per + nf)
++            clip.append(_tile_frame(sc, overlay, 1.0 + 0.09 * t, 0.5 + (0.06 if k % 2 else -0.06) * t, 0.42))
++        clips.append(clip)
 +    frames = []
-+    band = Image.new("L", (w * 2, h * 2), 0)
-+    from PIL import ImageDraw
-+    bd = ImageDraw.Draw(band)
-+    bd.rectangle((w - 70, 0, w + 70, h * 2), fill=150)
-+    band = band.filter(ImageFilter.GaussianBlur(40)).rotate(-22, resample=Image.BICUBIC)
-+    for i in range(n):
-+        f = i / (n - 1)
-+        off = int(-w * 1.2 + f * w * 2.0)
-+        m = Image.new("L", (w, h), 0)
-+        m.paste(band, (off - w // 2, -h // 2))
-+        light = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-+        light.putalpha(m)
-+        fr = tile.copy()
-+        fr.alpha_composite(light)
-+        frames.append(fr.convert("RGB"))
-+    # pausa no fim (o brilho passa e o bloco descansa)
-+    frames += [tile.convert("RGB")] * 8
++    for k, clip in enumerate(clips):
++        if k > 0:
++            prev = clips[k - 1]
++            for j in range(nf):
++                frames.append(Image.blend(prev[per + j], clip[j], (j + 1) / (nf + 1)))
++            frames.extend(clip[nf:per])
++        else:
++            frames.extend(clip[:per])
++    if len(clips) > 1:  # volta para a 1ª cena: o loop fica contínuo
++        last, first = clips[-1], clips[0]
++        for j in range(nf):
++            frames.append(Image.blend(last[per + j], first[j], (j + 1) / (nf + 1)))
 +    return frames
 +
 +
++def _poster_wall(posters: list, w: int, h: int, angle=-9):
++    """Mural de pôsteres inclinado (fundo do Para Você)."""
++    from PIL import Image, ImageEnhance
++    W, H = int(w * 1.5), int(h * 1.5)
++    wall = Image.new("RGB", (W, H), (10, 6, 20))
++    ph = int(H / 3.05)
++    pw = int(ph * 2 / 3)
++    gap = max(6, pw // 18)
++    k, row, y = 0, 0, -ph // 4
++    while y < H and posters:
++        x = -(pw // 2) * (row % 2) - gap
++        while x < W:
++            wall.paste(_cover(posters[k % len(posters)], pw, ph), (x, y))
++            k += 1
++            x += pw + gap
++        y += ph + gap
++        row += 1
++    wall = wall.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=(10, 6, 20))
++    wall = _cover(wall, w, h, 1.0, 0.5, 0.5)
++    return ImageEnhance.Brightness(wall).enhance(0.9)
++
++
 +def _compose_hero(svc: dict, backdrops: list, w=1920, h=1080):
-+    """Fundo do destaque: o título em alta no serviço, lavado na cor da marca à esquerda/embaixo."""
-+    from PIL import Image, ImageEnhance, ImageFilter
++    """Fundo do destaque: o título em alta, lavado na cor da marca à esquerda e embaixo
++    (onde o Nuvio põe o logo e o texto), vivo no meio e à direita."""
++    from PIL import Image, ImageEnhance
 +    c1, c2 = svc["c1"], svc["c2"]
 +    if backdrops:
-+        bg = backdrops[0].convert("RGB").resize((w, h), Image.LANCZOS)
-+        bg = ImageEnhance.Contrast(ImageEnhance.Color(bg).enhance(1.1)).enhance(1.05)
++        bg = _cover(backdrops[0].convert("RGB"), w, h)
++        bg = ImageEnhance.Contrast(ImageEnhance.Color(bg).enhance(1.12)).enhance(1.06)
 +    else:
 +        bg = _lin_gradient((w, h), c2, c1, horizontal=True)
 +    base = bg.convert("RGBA")
-+    # lavagem de cor da marca, mais forte à esquerda (onde o Nuvio põe o logo e o texto)
 +    left = _lin_gradient((w, h), c1, (0, 0, 0), horizontal=True).convert("RGBA")
-+    a = _lin_gradient((w, h), (150, 150, 150), (0, 0, 0), horizontal=True).convert("L")
-+    a = a.point(lambda v: int(v * (v / 150.0)))  # some rápido: o meio e a direita ficam vivos
-+    left.putalpha(a)
++    a = _lin_gradient((w, h), (165, 165, 165), (0, 0, 0), horizontal=True).convert("L")
++    left.putalpha(a.point(lambda v: int(v * (v / 165.0))))
 +    base.alpha_composite(left)
-+    base.alpha_composite(_radial((w, h), (w * 0.08, h * 0.9), w * 0.55, c2, 0.40))
++    base.alpha_composite(_radial((w, h), (w * 0.05, h * 1.05), w * 0.55, c2, 0.42))
 +    bottom = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-+    ba = _lin_gradient((w, h), (0, 0, 0), (110, 110, 110)).convert("L")
-+    ba = ba.point(lambda v: int(v * (v / 110.0)))
-+    bottom.putalpha(ba)
++    ba = _lin_gradient((w, h), (0, 0, 0), (120, 120, 120)).convert("L")
++    bottom.putalpha(ba.point(lambda v: int(v * (v / 120.0))))
 +    base.alpha_composite(bottom)
 +    return base.convert("RGB")
++
++
++def _webp_anim(frames, fps=20, q=74) -> bytes:
++    buf = io.BytesIO()
++    frames[0].save(buf, "WEBP", save_all=True, append_images=frames[1:], duration=int(1000 / fps),
++                   loop=0, quality=q, method=4)
++    return buf.getvalue()
++
++
++async def _scenes(key: str, n: int, size: str = "w1280"):
++    """Imagens de cena: fundos em alta no serviço; no Para Você, o mural de pôsteres."""
++    from PIL import Image
++    if key == FORYOU_ID:
++        posters = []
++        for f in await _poster_files(40):
++            raw = await _tmdb_image("w342", "/" + f)
++            if raw:
++                try:
++                    posters.append(Image.open(io.BytesIO(raw)).convert("RGB"))
++                except Exception as e:
++                    log_swallowed("streamings._scenes", e)
++        if not posters:
++            return []
++        return [await asyncio.to_thread(_poster_wall, posters, 1920, 1080)]
++    return await _open_backdrops(key, n, size)
 +
 +
 +def _jpeg(im, q=88) -> bytes:
@@ -28954,7 +29166,7 @@ index 0000000..c6ee24f
 +    """Gera (ou reaproveita) a arte e devolve o caminho do arquivo."""
 +    svc = _svc(key)
 +    daily = kind in ("tile", "focus", "hero", "video")
-+    ext = {"tile": "jpg", "focus": "gif", "hero": "jpg", "logo": "png", "video": "mp4"}[kind]
++    ext = {"tile": "jpg", "focus": "webp", "hero": "jpg", "logo": "png", "video": "mp4"}[kind]
 +    path = _path(kind, key, ext, daily)
 +    if os.path.exists(path) and os.path.getsize(path) > 0:
 +        return path
@@ -28968,23 +29180,23 @@ index 0000000..c6ee24f
 +            buf = io.BytesIO()
 +            logo.save(buf, "PNG", optimize=True)
 +            data = buf.getvalue()
-+        elif kind in ("tile", "focus"):
++        elif kind == "tile":
 +            logo = await _logo_for(svc)
-+            bds = await _open_backdrops(key, 1, "w780")
-+            tile = await asyncio.to_thread(_compose_tile, svc, logo, bds[0] if bds else None)
-+            if kind == "tile":
-+                data = _jpeg(tile.resize((640, 360)), 90)
-+            else:
-+                small = tile.resize((640, 360))
-+                frames = await asyncio.to_thread(_sweep_frames, small)
-+                buf = io.BytesIO()
-+                pal = [f.quantize(colors=200, method=2, dither=1) for f in frames]
-+                pal[0].save(buf, "GIF", save_all=True, append_images=pal[1:], duration=55,
-+                            loop=0, optimize=True, disposal=1)
-+                data = buf.getvalue()
++            scenes = await _scenes(key, 1, "w1280")
++            ov = await asyncio.to_thread(_tile_overlay, svc, logo, 960, 540)
++            fx = 0.3 if key == FORYOU_ID else 0.5
++            tile = await asyncio.to_thread(_tile_frame, scenes[0] if scenes else None, ov, 1.0, fx, 0.42)
++            data = _jpeg(tile, 90)
++        elif kind == "focus":
++            logo = await _logo_for(svc)
++            scenes = await _scenes(key, 4, "w780")
++            ov = await asyncio.to_thread(_tile_overlay, svc, logo, 640, 360)
++            frames = await asyncio.to_thread(_focus_frames, scenes or [None], ov, 20, 1.7, 0.45,
++                                             key == FORYOU_ID)
++            data = await asyncio.to_thread(_webp_anim, frames, 20, 72)
 +        elif kind == "hero":
-+            bds = await _open_backdrops(key, 1)
-+            data = _jpeg(await asyncio.to_thread(_compose_hero, svc, bds), 86)
++            scenes = await _scenes(key, 1)
++            data = _jpeg(await asyncio.to_thread(_compose_hero, svc, scenes), 86)
 +        elif kind == "video":
 +            data = await _make_video(svc, key)
 +        else:
@@ -29090,7 +29302,7 @@ index 0000000..c6ee24f
 +# ───────────────────────── rotas ─────────────────────────
 +
 +router = APIRouter(tags=["Stremio"])
-+_MEDIA = {"jpg": "image/jpeg", "gif": "image/gif", "png": "image/png", "mp4": "video/mp4"}
++_MEDIA = {"jpg": "image/jpeg", "gif": "image/gif", "png": "image/png", "mp4": "video/mp4", "webp": "image/webp"}
 +
 +
 +def _compose_rank(svc: dict, rank: int, art, w=960, h=540):

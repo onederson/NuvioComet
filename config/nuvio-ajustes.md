@@ -24,7 +24,13 @@ Caminho no app: barra lateral > Ajustes (engrenagem). Menu da esquerda: Conta, P
 - Sem ajustes. Só o campo "Entrar em uma sessão" (código de 6 caracteres enviado por um amigo).
 
 ## 4. Aparência
-- Tema de cores: Esmeralda (opções: Carmesim, Oceano, Violeta, Esmeralda, Âmbar, Rosa)
+- Tema de cores: **Âmbar** (desde 09/11 à noite; antes Esmeralda) (opções: Carmesim, Oceano, Violeta, Esmeralda, Âmbar, Rosa)
+- Fonte do App: **DM Sans** (desde 09/11 à noite; antes Inter)
+- Layout > Conteúdo da Tela inicial > Tipo de conteúdo: **DESLIGADO**
+- Layout > Foco no Pôster > Autorreprodução de trailer: **DESLIGADO** (Local do trailer: No destaque)
+- Layout > Cartão de Pôster > Largura: **Confortável**
+- Ordem da tela inicial (09/11): Streamings, Top 10 filmes/séries hoje, Filmes/Séries para você, Novos episódios, Minha lista (séries, filmes), Filmes/Séries em alta, Recém-lançados, Acabou de chegar dublado, Dublados prontos, Para hoje à noite, Para cada clima, Maratonar em um dia, Natal, Estreias/Sua semana, Gêneros, Nacionais, Sagas, Maratonas, Animes, Sorteio, Ao vivo, Minha TV, Futebol, TV ao vivo, Rádios, Retrospectiva.
+- (Os itens abaixo são o registro anterior; onde houver conflito, valem as linhas acima.)
 - Modo AMOLED (preto puro no fundo): LIGADO
 - Superfícies em Preto Puro (cartões, painéis e menus): LIGADO
 - Estilo de layout: Padrão (layout tradicional com cartões)

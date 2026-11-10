@@ -117,6 +117,14 @@ Mudanças de 09/11:
 9. **Busca progressiva**, **homônimos pelo arquivo** e **fonte que falhou perde a vez** (Seção 3).
 10. **Testes:** `REGRESS OK` (51 pass, 1 warn). Novos: `unit_homonimos_arquivo` e `unit_fonte_falhou`. Patch: 84 arquivos (novo: `comet/services/failed_sources.py`).
 11. **Streamings no estilo Disney+** (Seção 3), instalado na TV. `REGRESS OK` (52 pass, 1 warn; novo `unit_streamings`). Patch: 85 arquivos (novo: `comet/services/streamings.py`).
+12. **Repaginação visual (09/11, noite):**
+    - **Cards:** a saída de todo catálogo passa por `streamings.nuvio_cards`. A arte `/art/land` (fundo + logo do título + selos) vira `landscapePoster`, que o card horizontal do Nuvio usa (sem isso ele mostrava o fundo cru). O "Top 10 filmes/séries hoje" da tela inicial ganhou o card com número gigante dourado (`/art/svc/rank/top-<n>.jpg`).
+    - **Blocos dos streamings:** a cena do título em alta (originais primeiro; uma cena diferente por serviço), banhada na cor da marca, com o logo flutuando com brilho e borda de vidro. Com foco, os títulos em alta passam dentro do bloco (WebP animado, `focus/<serviço>.webp`). O "Para Você" é um mural inclinado com os pôsteres dos seus recomendados e da sua lista. `_ART_VERSION = 5`.
+    - **Nomes das fileiras** sem emoji e com filme/série no nome (`catalog_manifest._CLEAN_NAMES`). "Ao vivo agora" e "Minha TV" com texto curto ("Agora: … · até 21:25" / "A seguir: …").
+    - **Ordem da tela inicial** (enviada pela API da TV): Streamings, Top 10, Para você, Novos episódios, Minha lista, Em alta, Lançamentos, Dublados, clima, Natal, semana, gêneros, sagas, animes, sorteio, TV ao vivo, retrospectiva. Script: `order.py` (no histórico desta sessão); a lista está em `config/nuvio-ajustes.md`.
+    - **Na TV:** tema Âmbar, fonte DM Sans, cards "Confortável", "Tipo de conteúdo" desligado (tirou o "- Filme") e **trailer automático desligado**. Os trailers do YouTube falham nesta Fire TV e deixavam o card, ou a tela toda no modo "No destaque", preta.
+    - **Homônimos:** o log agora mostra os nomes removidos. No One Piece (anime), os 4 removidos eram do live-action, e a referência da regressão foi corrigida (pt 1 → 0).
+    - **Pendente pequeno:** 10 `database is locked` (DEBUG) num mesmo segundo em `subtitles._persist_pt_filename`, durante a regressão junto com a geração das artes. Não afeta o uso.
     - **Pegadinha da TV:** no Addons do Nuvio, um OK na lista de instalados liga/desliga o addon. Na instalação, o Comet foi desligado sem querer e religado em seguida. Confira a chave do Comet: **verde = ligado**.
 
 ---
