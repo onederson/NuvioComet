@@ -6,6 +6,17 @@
 
 Backup manual: o Nuvio não exporta ajustes; para restaurar, refaça na mesma ordem.
 
+## Projetor (Horlat T9N, 17/11/2026)
+- `192.168.3.64:5555`, Android 12, `armeabi-v7a` (APK `app-full-armeabi-v7a-release.apk`), NuvioTV 1.1.0, com root.
+- **Vem do Nuvio Sync ao entrar na conta** (código em nuvio.tv/link): addons e as chaves deles, ordem da tela inicial, coleção Streamings, tema, fonte, autoplay "Assistir", PT-BR, pular trechos, TMDB, perfil, biblioteca e progresso.
+- **Não vem, é preciso refazer em cada aparelho:**
+  - Trakt, Simkl, MDBList e TorBox: códigos de aparelho (trakt.tv/activate, simkl.com/pin, mdblist.com/oauth/device, tor.box/link);
+  - Client ID do Anime-Skip;
+  - "Reproduzir trailers automaticamente" da Página de detalhes: DESLIGADO;
+  - Idioma do app: **Português (Brasil)**. O firmware só tem português de Portugal e desfaz `persist.sys.locale` no boot, por isso o idioma é escolhido em Aparência > Idioma do app.
+- O protetor de tela do sistema (DreamActivity) fecha as telas de código. Durante a espera: `settings put secure screensaver_enabled 0`, e depois volte para `1`.
+- O app ignora toque (`input tap`). Num diálogo com campo de texto, use TAB para chegar aos botões.
+
 Legenda: LIGADO / DESLIGADO para chaves. Em Ajustes, as seções com "Esconder/Exibir" abrem e fecham ao apertar OK.
 Caminho no app: barra lateral > Ajustes (engrenagem). Menu da esquerda: Conta, Perfis, Assistir juntos, Aparência, Layout, Conteúdo e Descoberta, Reprodução, Integrações, Rastreamento, Avançado, Sobre.
 
@@ -126,6 +137,7 @@ Obs.: o app mostra os addons 2 e 3 com a chave desligada ("Desativar" ao lado da
 
 ### Coleções (09/11/2026)
 - **Streamings** (fixada no topo, 11 pastas: Para Você + 10 serviços). Vem do Comet: `https://a71comet.duckdns.org:7443/nuvio/colecoes.json`.
+  - Desde 10/11: modo da pasta **Seguir layout** (fileiras como a tela inicial), sem GIF de foco e sem vídeo no destaque. Reinstalada em 10/11.
 - **Para reinstalar:** o campo de URL de Ajustes > Conteúdo e Descoberta > Addons > Coleções > Importar > De URL prende o foco do controle (o botão "Buscar URL" fica inacessível), e "De arquivo" não lê arquivos enviados pelo ADB (Android 11). O que funciona:
   1. Abra Addons > **Gerenciar pelo celular** (sobe um servidor na TV, porta 8080).
   2. Leia `GET http://<ip-da-tv>:8080/api/state`.

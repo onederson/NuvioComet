@@ -141,18 +141,20 @@ index f7832d1..b77df1c 100644
  for stremio_router in stremio_routers:
 diff --git a/comet/api/endpoints/artwork.py b/comet/api/endpoints/artwork.py
 new file mode 100644
-index 0000000..1fdce15
+index 0000000..796703b
 --- /dev/null
 +++ b/comet/api/endpoints/artwork.py
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,150 @@
 +from fastapi import APIRouter, HTTPException, Response
 +
 +from comet.services.artwork import (
++    VALID_BADGES,
 +    ArtworkNotFound,
 +    render_animation,
 +    render_landscape,
 +    render_poster,
 +    render_top10,
++    render_top10_wide,
 +)
 +
 +router = APIRouter(tags=["Stremio"])
@@ -178,6 +180,23 @@ index 0000000..1fdce15
 +
 +
 +@router.get(
++    "/art/top10w/{rank}/{poster_file:path}",
++    summary="Top 10 Artwork (16:9)",
++    description="Card 16:9 no estilo Netflix: número vazado e pôster em pé.",
++)
++async def get_art_top10_wide(rank: int, poster_file: str, b: str | None = None, p: int | None = None):
++    try:
++        data = await render_top10_wide(rank, poster_file, badge=b, provider_id=p)
++        return Response(
++            content=data,
++            media_type="image/jpeg",
++            headers={"Cache-Control": "public, max-age=2592000, immutable"},
++        )
++    except Exception:
++        raise HTTPException(status_code=404, detail="Artwork not found")
++
++
++@router.get(
 +    "/art/poster/{poster_file:path}",
 +    summary="Poster Artwork with Badge",
 +    description="Returns portrait poster artwork with optional badge.",
@@ -185,7 +204,7 @@ index 0000000..1fdce15
 +async def get_art_poster(
 +    poster_file: str, b: str | None = None, p: int | None = None, o: int | None = None
 +):
-+    if b and b not in ("new_ep", "new", "dub", "top10"):
++    if b and b not in VALID_BADGES:
 +        raise HTTPException(status_code=404, detail="Invalid badge")
 +    try:
 +        data = await render_poster(poster_file, badge=b, provider_id=p, oscar=bool(o))
@@ -208,7 +227,7 @@ index 0000000..1fdce15
 +async def get_art_land_no_logo(
 +    backdrop_file: str, b: str | None = None, p: int | None = None, o: int | None = None
 +):
-+    if b and b not in ("new_ep", "new", "dub", "top10"):
++    if b and b not in VALID_BADGES:
 +        raise HTTPException(status_code=404, detail="Invalid badge")
 +    try:
 +        data = await render_landscape(backdrop_file, None, badge=b, provider_id=p, oscar=bool(o))
@@ -231,7 +250,7 @@ index 0000000..1fdce15
 +async def get_art_land_with_logo(
 +    backdrop_file: str, logo_file: str, b: str | None = None, p: int | None = None, o: int | None = None
 +):
-+    if b and b not in ("new_ep", "new", "dub", "top10"):
++    if b and b not in VALID_BADGES:
 +        raise HTTPException(status_code=404, detail="Invalid badge")
 +    try:
 +        data = await render_landscape(backdrop_file, logo_file, badge=b, provider_id=p, oscar=bool(o))
@@ -278,10 +297,10 @@ index 0000000..1fdce15
 +        raise HTTPException(status_code=404, detail="Artwork not found")
 diff --git a/comet/api/endpoints/catalog.py b/comet/api/endpoints/catalog.py
 new file mode 100644
-index 0000000..8d207cf
+index 0000000..f6e87f2
 --- /dev/null
 +++ b/comet/api/endpoints/catalog.py
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,261 @@
 +import urllib.parse
 +from fastapi import APIRouter, Request
 +from fastapi.responses import JSONResponse
@@ -438,7 +457,9 @@ index 0000000..8d207cf
 +
 +        extra_dict = {}
 +        if extra:
-+            parsed = urllib.parse.parse_qs(extra)
++            # O caminho já chega decodificado: um "+" aqui é literal ("Apple TV+",
++            # "Disney+", "Paramount+"). O parse_qs o trocaria por espaço.
++            parsed = urllib.parse.parse_qs(extra.replace("+", "%2B"))
 +            for k, v in parsed.items():
 +                if v:
 +                    extra_dict[k] = v[0]
@@ -450,6 +471,9 @@ index 0000000..8d207cf
 +        base_url = (getattr(settings, "PUBLIC_BASE_URL", None) or f"{request.url.scheme}://{request.url.netloc}").rstrip("/")
 +        kids = is_kids_request(b64config)
 +        is_personal = is_personal_request(b64config)
++        from comet.core.config_validation import GUEST_HIDDEN_CATALOGS, is_guest_request
++        if id in GUEST_HIDDEN_CATALOGS and is_guest_request(b64config):
++            return JSONResponse(content={"metas": []}, headers={"Cache-Control": "public, max-age=600"})
 +        if id in ("comet_livetv", "comet_livehome", "comet_radio") and b64config is not None and not is_personal and not kids:
 +            return JSONResponse(
 +                content={"metas": []},
@@ -469,8 +493,14 @@ index 0000000..8d207cf
 +            except (TypeError, ValueError):
 +                _skip = 0
 +            _base_tok = f"{base_url}/{b64config}" if b64config else base_url
++            _xm = await _pt_fix(await _extra_rows.catalog(id, _base_tok, _skip), type)
++            try:  # Para hoje à noite: card com logo do serviço e etiqueta, como as outras fileiras
++                from comet.services.streamings import land_enrich, nuvio_cards
++                _xm = nuvio_cards(await land_enrich(_xm, id, base_url), id, base_url)
++            except Exception as _xe:
++                log_swallowed("catalog.extra_cards", _xe)
 +            return JSONResponse(
-+                content={"metas": await _pt_fix(await _extra_rows.catalog(id, _base_tok, _skip), type)},
++                content={"metas": _xm},
 +                headers={"Cache-Control": "public, max-age=60"},
 +            )
 +        metas = await get_catalog(
@@ -507,6 +537,11 @@ index 0000000..8d207cf
 +                    _m["poster"] = _p + ("&" if "?" in _p else "?") + "o=1"
 +        except Exception as _e:
 +            log_swallowed("catalog.get_catalog_endpoint", _e)
++        try:  # fileiras sem logo do serviço/etiqueta: monta o card como nas do TMDB
++            from comet.services.streamings import land_enrich
++            metas = await land_enrich(metas, id, base_url)
++        except Exception as _le_err:
++            log_swallowed("catalog.land_enrich", _le_err)
 +        try:
 +            metas = await _apply_live_covers(metas, id, is_personal)
 +        except Exception as _lc_err:
@@ -629,7 +664,7 @@ index 0000000..1450026
 +    from comet.services.radio import relay_radio
 +    return await relay_radio(station_id, request)
 diff --git a/comet/api/endpoints/manifest.py b/comet/api/endpoints/manifest.py
-index bce0fec..bce38a9 100644
+index bce0fec..8b0d00f 100644
 --- a/comet/api/endpoints/manifest.py
 +++ b/comet/api/endpoints/manifest.py
 @@ -1,8 +1,12 @@
@@ -646,7 +681,7 @@ index bce0fec..bce38a9 100644
  from comet.utils.cache import CachePolicies, cached_json_response
  
  router = APIRouter()
-@@ -29,16 +33,61 @@ async def manifest(request: Request, b64config: str | None = None):
+@@ -29,16 +33,65 @@ async def manifest(request: Request, b64config: str | None = None):
          "resources": [
              {
                  "name": "stream",
@@ -688,6 +723,10 @@ index bce0fec..bce38a9 100644
 +        )
 +    elif settings.CATALOGS_ENABLED:
 +        base_manifest["catalogs"] = build_manifest_catalogs(is_personal=is_personal)
++        from comet.core.config_validation import GUEST_HIDDEN_CATALOGS, is_guest_request
++        if is_guest_request(b64config):
++            base_manifest["catalogs"] = [c for c in base_manifest["catalogs"]
++                                         if c.get("id") not in GUEST_HIDDEN_CATALOGS]
 +        base_manifest["resources"].append("catalog")
 +        base_manifest["resources"].append(
 +            {
@@ -711,7 +750,7 @@ index bce0fec..bce38a9 100644
      config = config_check(b64config, strict_b64config=True)
      if not config:
          base_manifest["name"] = "❌ | Comet"
-@@ -47,7 +96,10 @@ async def manifest(request: Request, b64config: str | None = None):
+@@ -47,7 +100,10 @@ async def manifest(request: Request, b64config: str | None = None):
          )
          return base_manifest
  
@@ -910,7 +949,7 @@ index 0000000..ed35288
 +            headers={"Cache-Control": "public, max-age=21600"},
 +        )
 diff --git a/comet/api/endpoints/playback.py b/comet/api/endpoints/playback.py
-index 35b1121..365d862 100644
+index 35b1121..b8fece2 100644
 --- a/comet/api/endpoints/playback.py
 +++ b/comet/api/endpoints/playback.py
 @@ -1,6 +1,10 @@
@@ -1300,7 +1339,17 @@ index 35b1121..365d862 100644
  ):
      config = config_check(b64config, strict_b64config=True)
      if not config:
-@@ -227,11 +570,34 @@ async def playback(
+@@ -210,6 +553,9 @@ async def playback(
+     torrent_name = torrent_name.strip()
+     name = name.strip()
+     media_id = media_id.strip() if media_id else None
++    if not media_id and ep_key and ep_key.strip().startswith("tt"):
++        # sem o id da série, a escolha do arquivo no pacote não confere o episódio
++        media_id = ep_key.strip().split(":", 1)[0]
+     if not torrent_name or not name or media_type not in {None, "movie", "series"}:
+         return build_status_video_response(
+             ["BAD_REQUEST"],
+@@ -227,11 +573,34 @@ async def playback(
          debrid_service, debrid_api_key = get_debrid_credentials(
              config, parsed_service_index
          )
@@ -1335,7 +1384,7 @@ index 35b1121..365d862 100644
      account_key_hash = build_account_key_hash(debrid_api_key)
  
      session = await http_client_manager.get_session()
-@@ -331,10 +697,29 @@ async def playback(
+@@ -331,10 +700,29 @@ async def playback(
                      default_key="BAD_REQUEST",
                  )
  
@@ -1368,7 +1417,7 @@ index 35b1121..365d862 100644
  
          debrid = get_debrid(
              session,
-@@ -345,22 +730,133 @@ async def playback(
+@@ -345,22 +733,133 @@ async def playback(
              ip if not should_proxy else "",
          )
          try:
@@ -1515,7 +1564,7 @@ index 35b1121..365d862 100644
  
          if not download_url:
              return build_status_video_response(
-@@ -392,4 +888,5 @@ async def playback(
+@@ -392,4 +891,5 @@ async def playback(
              ip=ip,
          )
  
@@ -2075,7 +2124,7 @@ index 0000000..e2626b4
 +"""
 +    return HTMLResponse(content=content, status_code=200)
 diff --git a/comet/api/endpoints/stream.py b/comet/api/endpoints/stream.py
-index 94f56ae..6eb70af 100644
+index 94f56ae..c9431e4 100644
 --- a/comet/api/endpoints/stream.py
 +++ b/comet/api/endpoints/stream.py
 @@ -1,13 +1,33 @@
@@ -2142,7 +2191,7 @@ index 94f56ae..6eb70af 100644
  
  def _first_meta_value(value):
      if isinstance(value, list):
-@@ -68,6 +102,743 @@ def _build_kodi_meta(parsed, formatted_components: dict):
+@@ -68,6 +102,808 @@ def _build_kodi_meta(parsed, formatted_components: dict):
      }
  
  
@@ -2398,7 +2447,7 @@ index 94f56ae..6eb70af 100644
 +                has_portuguese,
 +                get_mem_available_mb,
 +            )
-+            for cand in extra_candidates[:2]:
++            for cand in extra_candidates[:4]:  # até 2 PT + até 2 "Multi-Audio"
 +                if get_mem_available_mb() < 600.0:
 +                    break
 +                c_hash = cand.get("info_hash")
@@ -2492,6 +2541,8 @@ index 94f56ae..6eb70af 100644
 +        i = c.get("_info") or {}
 +        if not i or i.get("kind") == "p2p" or not i.get("cached") or i.get("is_cam"):
 +            return False
++        if _EXTRA_RE.search(str(i.get("raw_title") or "")):
++            return False  # NCOP/NCED/trailer não é o episódio
 +        svc = str(i.get("debrid_service") or i.get("service") or "").lower()
 +        h = str(i.get("info_hash") or "").lower()
 +        if not ("torbox" in svc or svc == "tb") and h in blocked_set:
@@ -2549,6 +2600,12 @@ index 94f56ae..6eb70af 100644
 +    return out
 +
 +
++# "Multi Subs"/"MultiSub" são legendas, não áudio
++_MULTI_AUDIO_RE = re.compile(r"multi[\s._-]*audio|\bmulti\b(?![\s._-]*sub)|dual[\s._-]*audio|\bdual\b", re.IGNORECASE)
++_MULTI_STRONG_RE = re.compile(r"multi[\s._-]*audio|\bmulti\b(?![\s._-]*sub)", re.IGNORECASE)
++# abertura/encerramento sem créditos, trailer, prévia: não são o episódio
++_EXTRA_RE = re.compile(r"\bNC(?:OP|ED)\b|\bcreditless\b|\btrailer\b|\bpreview\b|\bPV\s?\d*\b", re.IGNORECASE)
++
 +_REMOTE_MAX_MBPS = float(getattr(settings, "REMOTE_MAX_MBPS", 12) or 12)  # teto do ▶ Assistir fora de casa
 +
 +
@@ -2559,12 +2616,28 @@ index 94f56ae..6eb70af 100644
 +    remote: bool = False,
 +    is_episode: bool = False,
 +    media_key: str = "",
++    ep_runtime: int | None = None,
 +) -> tuple[list[dict], dict | None, list[dict]]:
 +    try:
 +        from comet.services.failed_sources import failed_hashes
 +        _failed = failed_hashes(media_key)
 +    except Exception:
 +        _failed = set()
++
++    def _cut_minutes(info) -> float | None:
++        """Duração do arquivo (min) quando é de outro corte do episódio (ex.: corte da Netflix)."""
++        if not ep_runtime or not info:
++            return None
++        mi = info.get("_media") or {}
++        dur = mi.get("duration_s")
++        if not dur:
++            return None
++        try:
++            from comet.services.direct_addons import _is_other_cut
++            mins = float(dur) / 60.0
++            return mins if _is_other_cut({"min": mins, "rt": ep_runtime}) else None
++        except Exception:
++            return None
 +    for s in final_streams:
 +        info = s.get("_info")
 +        if not info:
@@ -2655,6 +2728,10 @@ index 94f56ae..6eb70af 100644
 +                    warn_line = "⚠️ " + " · ".join(_ml["warnings"][:2])
 +            except Exception:
 +                pass
++        _cm = _cut_minutes(info)
++        if _cm:
++            _cw = f"⚠️ Outra divisão de episódios: {_cm:.0f} min (este episódio tem {ep_runtime} min)"
++            warn_line = f"{_cw}\n{warn_line}" if warn_line else _cw
 +        desc_lines = [l for l in [line1, video_line, audio_line, warn_line, line2, line3] if l]
 +        s["description"] = "\n".join(desc_lines)
 +
@@ -2698,6 +2775,10 @@ index 94f56ae..6eb70af 100644
 +                continue
 +            if not info.get("cached"):
 +                continue
++            if _cut_minutes(info):
++                continue  # outro corte (ex.: Netflix): não é este episódio
++            if _EXTRA_RE.search(str(info.get("raw_title") or "")):
++                continue  # NCOP/NCED/trailer não é o episódio
 +            deb_svc = str(info.get("debrid_service") or info.get("service") or "").lower()
 +            chash = str(info.get("info_hash") or "").lower()
 +            if not allow_failed and chash in _failed:
@@ -2849,7 +2930,10 @@ index 94f56ae..6eb70af 100644
 +
 +        # Atalhos com curadoria logo abaixo do ▶ Assistir (só quando existem e são diferentes dele)
 +        try:
-+            _extra = _curated_shortcuts(candidates, best_stream, blocked_set)
++            _extra = _curated_shortcuts(
++                [c for c in candidates if not _cut_minutes(c.get("_info"))],
++                best_stream, blocked_set,
++            )
 +            for _k, _cs in enumerate(_extra):
 +                final_streams.insert(notice_count + 1 + _k, _cs)
 +        except Exception as _cur_err:
@@ -2880,13 +2964,43 @@ index 94f56ae..6eb70af 100644
 +        c["_info"] for c in pt_cand_list if c is not best_stream
 +    ][:2]
 +
++    # Sem dublado confirmado: sonda também releases "Multi-Audio"/"MULTi"/"Dual" (anime da
++    # Crunchyroll traz PT-BR sem dizer no nome). Achando a faixa, a próxima abertura já mostra 🇧🇷.
++    if not any(
++        (c.get("_info") or {}).get("has_pt") == 1 and (c.get("_info") or {}).get("cached")
++        for c in candidates
++    ):
++        def _raw(c):
++            i = c.get("_info") or {}
++            return str(i.get("raw_title") or i.get("torrent_title") or "")
++
++        multi = [
++            c for c in candidates
++            if c.get("_info")
++            and c is not best_stream
++            and c["_info"].get("cached")
++            and c["_info"].get("kind") != "p2p"
++            and not c["_info"].get("is_cam")
++            and c["_info"].get("has_pt") is None
++            and _MULTI_AUDIO_RE.search(_raw(c))
++            and not _cut_minutes(c["_info"])
++        ]
++        multi.sort(key=lambda c: (
++            0 if _MULTI_STRONG_RE.search(_raw(c)) else 1,
++            _res_pref(c["_info"]),
++            candidates.index(c),
++        ))
++        for c in multi[:2]:
++            if c["_info"] not in next_pt_candidates:
++                next_pt_candidates.append(c["_info"])
++
 +    return final_streams, best_stream, next_pt_candidates
 +
 +
  def _stream_notice_name(kodi: bool, emoji_name: str, plain_name: str):
      return plain_name if kodi else emoji_name
  
-@@ -125,6 +896,37 @@ def _encode_playback_scope(value: int | None) -> str:
+@@ -125,6 +961,37 @@ def _encode_playback_scope(value: int | None) -> str:
      return str(value) if value is not None else "n"
  
  
@@ -2924,7 +3038,7 @@ index 94f56ae..6eb70af 100644
  def _select_info_hashes_by_resolution(
      ranked_info_hashes,
      torrents: dict,
-@@ -132,6 +934,8 @@ def _select_info_hashes_by_resolution(
+@@ -132,6 +999,8 @@ def _select_info_hashes_by_resolution(
      max_results: int,
      cached_only: bool,
      prioritize_cached: bool,
@@ -2933,7 +3047,7 @@ index 94f56ae..6eb70af 100644
  ):
      if max_results <= 0:
          return None
-@@ -153,27 +957,75 @@ def _select_info_hashes_by_resolution(
+@@ -153,27 +1022,75 @@ def _select_info_hashes_by_resolution(
              for info_hash in ranked_info_hashes
          }
  
@@ -3024,7 +3138,7 @@ index 94f56ae..6eb70af 100644
      return selected_info_hashes
  
  
-@@ -198,6 +1050,61 @@ async def stream(
+@@ -198,6 +1115,67 @@ async def stream(
      chilllink: bool = False,
      kodi: bool = False,
  ):
@@ -3071,10 +3185,16 @@ index 94f56ae..6eb70af 100644
 +    if _extra_rows.owns(clean_id):
 +        _xb = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
 +        _xs = await _extra_rows.streams(clean_id, f"{_xb}/{b64config}" if b64config else _xb)
++        # Minha TV e outras fileiras extras: a 1ª fonte toca sozinha (regex "Assistir" do Nuvio)
++        if _xs and isinstance(_xs[0], dict) and "Assistir" not in (_xs[0].get("name") or ""):
++            _xs[0] = {**_xs[0], "name": "▶ Assistir" + chr(10) + (_xs[0].get("name") or "")}
 +        return _build_stream_response(request, {"streams": _xs}, is_empty=(len(_xs) == 0))
 +    if media_type == "tv" and clean_id.startswith("cometlive:"):
 +        from comet.services.live_tv import get_live_tv_stream
 +        live_streams = await get_live_tv_stream(clean_id)
++        # o Nuvio toca sozinho a fonte com "Assistir" no nome (regex): a 1ª é a melhor
++        if live_streams and isinstance(live_streams[0], dict) and "Assistir" not in (live_streams[0].get("name") or ""):
++            live_streams[0] = {**live_streams[0], "name": "▶ Assistir\n" + (live_streams[0].get("name") or "")}
 +        return _build_stream_response(
 +            request, {"streams": live_streams}, is_empty=(len(live_streams) == 0)
 +        )
@@ -3086,7 +3206,7 @@ index 94f56ae..6eb70af 100644
      if media_type not in ["movie", "series"]:
          return _build_stream_response(request, {"streams": []}, is_empty=True)
  
-@@ -240,12 +1147,30 @@ async def stream(
+@@ -240,12 +1218,30 @@ async def stream(
              "empty" if is_empty else "success",
              result_count,
          )
@@ -3118,7 +3238,7 @@ index 94f56ae..6eb70af 100644
  
      search_result = await search_media(
          media_type,
-@@ -257,6 +1182,8 @@ async def stream(
+@@ -257,6 +1253,8 @@ async def stream(
      stream_cache_state = search_result.cache_state
  
      if search_result.status is MediaSearchStatus.INVALID:
@@ -3127,7 +3247,7 @@ index 94f56ae..6eb70af 100644
          return _stream_response({"streams": []}, is_empty=True)
  
      if search_result.status is MediaSearchStatus.DISABLED:
-@@ -270,53 +1197,94 @@ async def stream(
+@@ -270,53 +1268,94 @@ async def stream(
          return _stream_response({"streams": [placeholder_stream]})
  
      if search_result.status is MediaSearchStatus.UNRELEASED:
@@ -3257,7 +3377,7 @@ index 94f56ae..6eb70af 100644
              is_empty=True,
          )
  
-@@ -329,7 +1297,7 @@ async def stream(
+@@ -329,7 +1368,7 @@ async def stream(
      debrid_errors = search_result.debrid_errors
      sort_mixed = search_result.sort_mixed
      torrents = search_result.torrents
@@ -3266,7 +3386,7 @@ index 94f56ae..6eb70af 100644
          {
              "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
              "description": error.display_message,
-@@ -337,6 +1305,7 @@ async def stream(
+@@ -337,6 +1376,7 @@ async def stream(
          }
          for service, error in search_result.debrid_errors.items()
      ]
@@ -3274,7 +3394,7 @@ index 94f56ae..6eb70af 100644
      non_cached_results = []
      debrid_stream_specs = [
          (entry_index, entry["service"], get_debrid_extension(entry["service"]))
-@@ -348,7 +1317,7 @@ async def stream(
+@@ -348,7 +1388,7 @@ async def stream(
          and settings.PROXY_DEBRID_STREAM
          and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
      ):
@@ -3283,7 +3403,7 @@ index 94f56ae..6eb70af 100644
              {
                  "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
                  "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
-@@ -359,6 +1328,9 @@ async def stream(
+@@ -359,6 +1399,9 @@ async def stream(
      result_season = _encode_playback_scope(search_season)
      result_episode = _encode_playback_scope(search_episode)
      quoted_media_only_id = quote(media_only_id, safe="")
@@ -3293,7 +3413,7 @@ index 94f56ae..6eb70af 100644
  
      base_playback_host = (
          settings.PUBLIC_BASE_URL
-@@ -378,7 +1350,7 @@ async def stream(
+@@ -378,7 +1421,7 @@ async def stream(
  
      if search_result.show_account_sync_trigger:
          for entry_index, _, debrid_extension in debrid_stream_specs:
@@ -3302,7 +3422,7 @@ index 94f56ae..6eb70af 100644
                  {
                      "name": (
                          f"[{debrid_extension}] Comet Sync"
-@@ -393,8 +1365,40 @@ async def stream(
+@@ -393,8 +1436,40 @@ async def stream(
                  }
              )
  
@@ -3344,7 +3464,7 @@ index 94f56ae..6eb70af 100644
          torrents=torrents,
          service_cache_status=service_cache_status,
          max_results=config["maxResultsPerResolution"],
-@@ -402,18 +1406,31 @@ async def stream(
+@@ -402,18 +1477,31 @@ async def stream(
              config["cachedOnly"] and debrid_entries and not enable_torrent
          ),
          prioritize_cached=bool(debrid_entries and not sort_mixed),
@@ -3378,7 +3498,7 @@ index 94f56ae..6eb70af 100644
          torrent_title = torrent["title"]
          torrent_size = torrent["size"]
          formatted_components = format_components(
-@@ -429,21 +1446,164 @@ async def stream(
+@@ -429,21 +1517,164 @@ async def stream(
          info_hash_cache_status = service_cache_status.get(info_hash)
          quoted_torrent_title = quote(torrent_title)
  
@@ -3387,13 +3507,13 @@ index 94f56ae..6eb70af 100644
 -                continue
 +        chosen_spec = None
 +        chosen_is_cached = False
-+
+ 
 +        specs_by_svc = {
 +            svc: (idx, svc, ext)
 +            for idx, svc, ext in debrid_stream_specs
 +            if svc not in debrid_errors
 +        }
- 
++
 +        # 1-2. Em cache (⚡), na ordem de preferência: TorBox primeiro (medido em 02/11/2026: começa em
 +        # 0,5 s e entrega 130+ Mbit/s; o RD bloqueia muito dublado com 451 na hora do play).
 +        # Fora de casa (4G) o RD fica de fora: ele só aceita 1 IP por vez por conta.
@@ -3551,7 +3671,7 @@ index 94f56ae..6eb70af 100644
  
              behavior_hints = {
                  "bingeGroup": f"comet|{service}|{info_hash}",
-@@ -463,38 +1623,84 @@ async def stream(
+@@ -463,38 +1694,84 @@ async def stream(
                  seeders=torrent["seeders"],
                  status="C" if is_cached else "U",
              )
@@ -3646,7 +3766,7 @@ index 94f56ae..6eb70af 100644
                  continue
  
              behavior_hints = {
-@@ -515,6 +1721,10 @@ async def stream(
+@@ -515,6 +1792,10 @@ async def stream(
                  seeders=torrent["seeders"],
                  status="P2P",
              )
@@ -3657,7 +3777,7 @@ index 94f56ae..6eb70af 100644
  
              the_stream = {
                  "name": stream_name,
-@@ -522,6 +1732,27 @@ async def stream(
+@@ -522,6 +1803,27 @@ async def stream(
                  "behaviorHints": behavior_hints,
                  "infoHash": info_hash,
              }
@@ -3685,7 +3805,7 @@ index 94f56ae..6eb70af 100644
  
              if chilllink:
                  the_stream["_chilllink"] = format_chilllink(formatted_components, False)
-@@ -533,12 +1764,267 @@ async def stream(
+@@ -533,12 +1835,275 @@ async def stream(
              if sources:
                  the_stream["sources"] = sources
  
@@ -3693,7 +3813,9 @@ index 94f56ae..6eb70af 100644
 +            cached_results.append(
 +                (the_stream, is_pt, res_rank, 1, rank_idx, seed_key, is_cam)
 +            )
-+
+ 
+-    if sort_mixed:
+-        final_streams = cached_results
 +    ordered_entries = (
 +        cached_results if sort_mixed else cached_results + non_cached_results
 +    )
@@ -3763,9 +3885,7 @@ index 94f56ae..6eb70af 100644
 +        for s in direct_streams
 +        if not s.get("_is_pt")
 +    ]
- 
--    if sort_mixed:
--        final_streams = cached_results
++
 +    if settings.DEMOTE_CAM:
 +        if settings.PTBR_FIRST:
 +            pt_good = [entry for entry in ordered_entries if entry[1] and not entry[6]]
@@ -3842,9 +3962,17 @@ index 94f56ae..6eb70af 100644
 +                _remote = False
 +        if _remote:
 +            logger.info("📶 fora de casa: ▶ Assistir prefere versão leve")
++        _ep_rt = None
++        if media_type == "series" and media_id.startswith("tt") and media_id.count(":") == 2:
++            try:
++                from comet.services.direct_addons import _tmdb_episode_runtime
++                _imdb, _s, _e = media_id.split(":")
++                _ep_rt = await asyncio.wait_for(_tmdb_episode_runtime(_imdb, int(_s), int(_e)), 2.5)
++            except Exception:
++                _ep_rt = None
 +        final_streams, chosen_assistir, next_pt_candidates = _apply_clean_layout(
 +            final_streams, len(notice_streams), blocked_hashes=all_blocked, remote=_remote,
-+            is_episode=(media_type == "series"), media_key=media_id,
++            is_episode=(media_type == "series"), media_key=media_id, ep_runtime=_ep_rt,
 +        )
 +
 +    if chosen_assistir and chosen_assistir.get("_info"):
@@ -3957,7 +4085,7 @@ index 94f56ae..6eb70af 100644
  
      has_results = len(final_streams) > 0
  
-@@ -546,3 +2032,12 @@ async def stream(
+@@ -546,3 +2111,12 @@ async def stream(
          {"streams": final_streams},
          is_empty=not has_results,
      )
@@ -4626,10 +4754,10 @@ index 0000000..eea7d2f
 +            )
 +        return res
 diff --git a/comet/core/config_validation.py b/comet/core/config_validation.py
-index 44bf701..3722421 100644
+index 44bf701..a560b8a 100644
 --- a/comet/core/config_validation.py
 +++ b/comet/core/config_validation.py
-@@ -112,12 +112,73 @@ def _parse_and_validate_config(b64config: str):
+@@ -112,12 +112,88 @@ def _parse_and_validate_config(b64config: str):
          return None
  
  
@@ -4646,10 +4774,25 @@ index 44bf701..3722421 100644
 +    return b64config == settings.NUVIO_LINK_TOKEN
 +
 +
++def is_guest_request(b64config: str | None) -> bool:
++    """Link de convidado (outro perfil do Nuvio): igual ao do Nuvio, sem as fileiras pessoais."""
++    token = getattr(settings, "GUEST_LINK_TOKEN", None)
++    return bool(b64config and token and b64config == token)
++
++
++# fileiras feitas com a biblioteca/histórico do dono (Stremio + Trakt): fora do link de convidado
++GUEST_HIDDEN_CATALOGS = {
++    "comet_foryou", "comet_mylist", "comet_newep", "comet_dubready", "comet_myweek",
++    "comet_tonight", "comet_mytv", "comet_recap",
++    "comet_sv_conts", "comet_sv_contm", "comet_sv_picks", "comet_sv_becs", "comet_sv_becm",
++    "comet_sv_mylists", "comet_sv_mylistm",
++}
++
++
 +def is_personal_request(b64config: str | None) -> bool:
 +    if not b64config:
 +        return False
-+    if is_nuvio_request(b64config):
++    if is_nuvio_request(b64config) or is_guest_request(b64config):
 +        return True
 +    return bool(settings.PERSONAL_LINK_TOKEN and b64config == settings.PERSONAL_LINK_TOKEN)
 +
@@ -4879,7 +5022,7 @@ index 88b8606..a66f209 100644
 +    except Exception:
 +        pass
 diff --git a/comet/core/models.py b/comet/core/models.py
-index 835a975..8868ad5 100644
+index 835a975..a705142 100644
 --- a/comet/core/models.py
 +++ b/comet/core/models.py
 @@ -60,6 +60,8 @@ _SCRAPER_MODE_FIELDS = (
@@ -4907,7 +5050,7 @@ index 835a975..8868ad5 100644
      CUSTOM_HEADER_HTML: str | None = None
      PROXY_DEBRID_STREAM: bool | None = False
      PROXY_DEBRID_STREAM_PASSWORD: str | None = Field(default_factory=_generate_secret)
-@@ -268,6 +279,10 @@ class AppSettings(ServerSettings):
+@@ -268,6 +279,11 @@ class AppSettings(ServerSettings):
      )
      TORRENT_DISABLED_STREAM_URL: str | None = "https://comet.feels.legal"
      PUBLIC_BASE_URL: str | None = None
@@ -4915,10 +5058,11 @@ index 835a975..8868ad5 100644
 +    PERSONAL_LINK_CONFIG: str | None = None
 +    KIDS_LINK_TOKEN: str | None = None
 +    NUVIO_LINK_TOKEN: str | None = None
++    GUEST_LINK_TOKEN: str | None = None  # perfil de convidado: tudo menos as fileiras pessoais
      REMOVE_ADULT_CONTENT: bool | None = False
      BACKGROUND_SCRAPER_ENABLED: bool | None = False
      BACKGROUND_SCRAPER_CONCURRENT_WORKERS: int | None = 1
-@@ -317,6 +332,57 @@ class AppSettings(ServerSettings):
+@@ -317,6 +333,57 @@ class AppSettings(ServerSettings):
      HTTP_CACHE_CONFIGURE_TTL: int | None = 86400
      DOWNLOAD_GENERIC_TRACKERS: bool | None = False
      SMART_LANGUAGE_DETECTION: bool | None = False
@@ -4976,7 +5120,7 @@ index 835a975..8868ad5 100644
  
      # CometNet P2P Network Configuration
      COMETNET_ENABLED: bool | None = False
-@@ -653,12 +719,27 @@ class AppSettings(ServerSettings):
+@@ -653,12 +720,27 @@ class AppSettings(ServerSettings):
          "JACKETT_URL",
          "PROWLARR_URL",
          "PUBLIC_BASE_URL",
@@ -5161,16 +5305,17 @@ index cd66755..aa70756 100644
      table_name="series_episode_index",
      create_sql="""
 diff --git a/comet/debrid/stremthru.py b/comet/debrid/stremthru.py
-index 90a2aa5..194b50e 100644
+index 90a2aa5..9299772 100644
 --- a/comet/debrid/stremthru.py
 +++ b/comet/debrid/stremthru.py
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  import asyncio
++import re
 +import time
  from urllib.parse import quote, unquote
  
  import aiohttp
-@@ -6,12 +7,14 @@ from RTN import normalize_title, parse, title_match
+@@ -6,12 +8,14 @@ from RTN import normalize_title, parse, title_match
  
  from comet.core.execution import get_executor
  from comet.core.logger import logger
@@ -5186,7 +5331,7 @@ index 90a2aa5..194b50e 100644
  from comet.utils.parsing import (
      ensure_multi_language,
      is_video,
-@@ -20,6 +23,59 @@ from comet.utils.parsing import (
+@@ -20,6 +24,83 @@ from comet.utils.parsing import (
  )
  
  
@@ -5243,10 +5388,34 @@ index 90a2aa5..194b50e 100644
 +        )
 +
 +
++_BR_SS_EE = re.compile(r"(?<![\d])(\d{1,2})[._ x-](\d{2,3})(?=[._ \-\[\(]|$)", re.IGNORECASE)
++_BR_YEAR_BEFORE = re.compile(r"(?:19|20)\d{2}[._ -]$")
++_BR_EP_WORD = re.compile(
++    r"(?:^|[._ \-\[])(?:ep|epis[oó]dio|episode|cap[ií]tulo)[._ \-]*(\d{1,3})(?![\d])",
++    re.IGNORECASE,
++)
++
++
++def br_episode_hint(filename: str, pack_season: int | None) -> tuple[int, int] | None:
++    """Temporada/episódio em nomes que o parser não entende, comuns em pacotes BR:
++    "2.Garotas.Apuros.04.21.720p.mkv" (TT.EE) e "Episodio 21.mkv" (temporada do pacote)."""
++    stem = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", filename or "")
++    for m in _BR_SS_EE.finditer(stem):
++        if _BR_YEAR_BEFORE.search(stem[: m.start()]):
++            continue  # data (2015.05.12), não temporada.episódio
++        s, e = int(m.group(1)), int(m.group(2))
++        if 1 <= s <= 40 and 1 <= e <= 300:
++            return s, e
++    m = _BR_EP_WORD.search(stem)
++    if m and pack_season:
++        return pack_season, int(m.group(1))
++    return None
++
++
  def batch_parse(filenames):
      parsed_results = [parse(f) for f in filenames]
      for parsed in parsed_results:
-@@ -136,6 +192,8 @@ class StremThru:
+@@ -136,6 +217,8 @@ class StremThru:
          season: int,
          episode: int,
          target_air_date: str | None,
@@ -5255,7 +5424,7 @@ index 90a2aa5..194b50e 100644
      ) -> bool:
          return match_parsed_episode_target(
              parsed,
-@@ -143,6 +201,8 @@ class StremThru:
+@@ -143,6 +226,8 @@ class StremThru:
              episode,
              target_air_date=target_air_date,
              reject_unknown_episode_files=True,
@@ -5264,7 +5433,7 @@ index 90a2aa5..194b50e 100644
          )
  
      async def _episode_request_context(
-@@ -151,7 +211,7 @@ class StremThru:
+@@ -151,7 +236,7 @@ class StremThru:
          season: int | None,
          episode: int | None,
          target_air_date: str | None = None,
@@ -5273,7 +5442,7 @@ index 90a2aa5..194b50e 100644
          is_episode_request = (
              isinstance(series_id, str)
              and series_id.startswith("tt")
-@@ -159,19 +219,32 @@ class StremThru:
+@@ -159,19 +244,32 @@ class StremThru:
              and episode is not None
          )
          if not is_episode_request:
@@ -5311,7 +5480,7 @@ index 90a2aa5..194b50e 100644
          ) as response:
              try:
                  data = await response.json(content_type=None)
-@@ -198,7 +271,7 @@ class StremThru:
+@@ -198,7 +296,7 @@ class StremThru:
                          message or f"{self.store_name}: Failed to {action}.",
                          error_code=error.get("code"),
                          upstream_error_code=self._extract_upstream_error_code(upstream),
@@ -5320,7 +5489,7 @@ index 90a2aa5..194b50e 100644
                      )
                  elif error:
                      raise DebridLinkGenerationError(
-@@ -206,7 +279,7 @@ class StremThru:
+@@ -206,7 +304,7 @@ class StremThru:
                          str(error)
                          if isinstance(error, str)
                          else f"{self.store_name}: Failed to {action}.",
@@ -5329,7 +5498,7 @@ index 90a2aa5..194b50e 100644
                      )
  
                  if response.status < 400:
-@@ -255,6 +328,19 @@ class StremThru:
+@@ -255,6 +353,19 @@ class StremThru:
                  f"Exception while checking hash instant availability on {self.store_name}: {e}"
              )
  
@@ -5349,7 +5518,7 @@ index 90a2aa5..194b50e 100644
      async def list_magnets(self, limit: int = 500, offset: int = 0):
          try:
              async with self.session.get(
-@@ -305,6 +391,8 @@ class StremThru:
+@@ -305,6 +416,8 @@ class StremThru:
              requested_season,
              requested_episode,
              target_air_date,
@@ -5358,7 +5527,7 @@ index 90a2aa5..194b50e 100644
          ) = await self._episode_request_context(
              requested_series_id,
              requested_season,
-@@ -361,6 +449,8 @@ class StremThru:
+@@ -361,6 +474,8 @@ class StremThru:
                          requested_season,
                          requested_episode,
                          target_air_date,
@@ -5367,7 +5536,7 @@ index 90a2aa5..194b50e 100644
                      ):
                          continue
                      season = requested_season
-@@ -426,25 +516,44 @@ class StremThru:
+@@ -426,25 +541,44 @@ class StremThru:
          try:
              magnet_uri = f"magnet:?xt=urn:btih:{hash}&dn={quote(torrent_name)}"
  
@@ -5422,16 +5591,47 @@ index 90a2aa5..194b50e 100644
                  )
              if magnet_status in self._MAGNET_INVALID_STATUSES:
                  raise DebridLinkGenerationError(
-@@ -501,6 +610,8 @@ class StremThru:
+@@ -501,7 +635,39 @@ class StremThru:
                  season,
                  episode,
                  target_air_date,
 +                absolute_episode,
 +                is_anime,
              ) = await self._episode_request_context(self.media_only_id, season, episode)
++            if (
++                not is_episode_request
++                and not self.media_only_id
++                and season is not None
++                and episode is not None
++            ):
++                # play sem o id da série: ainda assim só vale o arquivo do episódio pedido
++                is_episode_request = True
++
++            pack_season = None
++            if is_episode_request:
++                try:
++                    _tp = parse(torrent_name)
++                    if _tp.seasons and len(_tp.seasons) == 1:
++                        pack_season = _tp.seasons[0]
++                except Exception:
++                    pack_season = None
++                _fixed = []
++                for _p, _fn in zip(parsed_results, filenames_to_parse):
++                    if not _p.seasons:
++                        _hint = br_episode_hint(_fn, pack_season)
++                        if _hint and (_hint[0] == season or pack_season == season):
++                            try:
++                                _p = _p.model_copy(
++                                    update={"seasons": [_hint[0]], "episodes": [_hint[1]]}
++                                )
++                            except Exception:
++                                pass
++                    _fixed.append(_p)
++                parsed_results = _fixed
  
              for file, filename, parsed in zip(
-@@ -522,6 +633,8 @@ class StremThru:
+                 video_files, filenames_to_parse, parsed_results
+@@ -522,6 +688,8 @@ class StremThru:
                          season,
                          episode,
                          target_air_date,
@@ -5440,7 +5640,7 @@ index 90a2aa5..194b50e 100644
                      ):
                          continue
                      file_season = season
-@@ -534,7 +647,14 @@ class StremThru:
+@@ -534,7 +702,14 @@ class StremThru:
                  # Season + Episode matching (highest priority)
                  if season is not None and episode is not None:
                      season_matches = (not parsed.seasons) or (season in parsed.seasons)
@@ -7351,10 +7551,10 @@ index 0000000..c7b9d17
 +    return {}
 diff --git a/comet/services/artwork.py b/comet/services/artwork.py
 new file mode 100644
-index 0000000..53e0bfa
+index 0000000..f8d3d95
 --- /dev/null
 +++ b/comet/services/artwork.py
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1118 @@
 +import asyncio
 +import hashlib
 +import io
@@ -7381,7 +7581,8 @@ index 0000000..53e0bfa
 +    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 +]
 +
-+VALID_BADGES = {"new_ep", "new", "dub", "top10"}
++VALID_BADGES = {"new_ep", "new_ep_now", "new_season", "new", "dub", "top10",
++                "new_ep_dub", "new_season_dub", "new_dub", "top10_dub"}
 +
 +_WP_TABLE_INIT = False
 +_WP_TABLE_LOCK = asyncio.Lock()
@@ -7436,12 +7637,12 @@ index 0000000..53e0bfa
 +    idx = 0
 +    for y in range(H):
 +        if y >= half_y:
-+            a_bot = 0.85 * ((y - half_y) / (H - 1 - half_y))
++            a_bot = 0.72 * ((y - half_y) / (H - 1 - half_y)) ** 1.4
 +        else:
 +            a_bot = 0.0
 +        for x in range(W):
 +            if x <= third_x:
-+                a_left = 0.60 * ((third_x - x) / third_x)
++                a_left = 0.38 * ((third_x - x) / third_x)
 +            else:
 +                a_left = 0.0
 +            a_comb = 1.0 - (1.0 - a_bot) * (1.0 - a_left)
@@ -7536,75 +7737,103 @@ index 0000000..53e0bfa
 +    }
 +
 +
++# Selos no estilo Netflix (10/11/2026): faixa no pé do card, centralizada e colada na borda de baixo,
++# texto normal (não caixa-alta). Vermelho = novidade; branco = dublado. "TOP 10" fica no canto.
++_RED, _WHITE, _INK = "#E50914", "#FFFFFF", "#141414"
++# cada selo é uma ou duas partes (texto, fundo, letra), como "Novo episódio | Assista já"
++_NF_BADGES: dict[str, list[tuple[str, str, str]]] = {
++    "new_ep": [("Novo episódio", _RED, _WHITE)],
++    "new_ep_now": [("Novo episódio", _RED, _WHITE), ("Assista já", _WHITE, _INK)],
++    "new_season": [("Nova temporada", _RED, _WHITE)],
++    "new": [("Novidade", _RED, _WHITE)],
++    "dub": [("Dublado", _WHITE, _INK)],
++    # novidade + dublado pronto (10/11): as duas informações no mesmo selo
++    "new_ep_dub": [("Novo episódio", _RED, _WHITE), ("Dublado", _WHITE, _INK)],
++    "new_season_dub": [("Nova temporada", _RED, _WHITE), ("Dublado", _WHITE, _INK)],
++    "new_dub": [("Novidade", _RED, _WHITE), ("Dublado", _WHITE, _INK)],
++}
++
++
++def _nf_badge_parts(H: int, badge: str | None):
++    if badge == "top10_dub":  # TOP 10 fica no canto; embaixo, "Dublado"
++        badge = "dub"
++    if badge not in _NF_BADGES:
++        return None
++    bh = max(18, round(H * 0.085))
++    font = _get_font(max(11, round(bh * 0.66)))
++    pad = max(7, round(bh * 0.45))
++    parts = []
++    for text, bg, fg in _NF_BADGES[badge]:
++        bb = font.getbbox(text)
++        parts.append((text, bg, fg, (bb[2] - bb[0]) + 2 * pad))
++    return bh, font, parts
++
++
++def _nf_badge_box(W: int, H: int, badge: str | None) -> tuple[int, int] | None:
++    """Altura e largura total da faixa (para o logo subir acima dela)."""
++    got = _nf_badge_parts(H, badge)
++    if not got:
++        return None
++    bh, _font, parts = got
++    return bh, min(W, sum(p[3] for p in parts))
++
++
++def _draw_nf_badge(canvas: Image.Image, badge: str | None) -> None:
++    """Faixa colada no pé do card, centralizada; com duas partes, vermelha + branca."""
++    got = _nf_badge_parts(canvas.size[1], badge)
++    if not got:
++        return
++    W, H = canvas.size
++    bh, font, parts = got
++    total = sum(p[3] for p in parts)
++    if total > W:  # pôster estreito: só a 1ª parte
++        parts, total = parts[:1], parts[0][3]
++    draw = ImageDraw.Draw(canvas)
++    x = (W - total) // 2
++    y0 = H - bh
++    r = max(3, round(bh * 0.18))
++    for i, (text, bg, fg, w) in enumerate(parts):
++        if len(parts) == 1:
++            draw.rounded_rectangle([x, y0, x + w, H + r], radius=r, fill=bg)
++        elif i == 0:
++            draw.rounded_rectangle([x, y0, x + w + r, H + r], radius=r, fill=bg)
++        else:
++            draw.rounded_rectangle([x - r, y0, x + w, H + r], radius=r, fill=bg)
++            draw.rectangle([x, y0, x + r, H], fill=bg)
++        bb = draw.textbbox((0, 0), text, font=font)
++        draw.text((x + (w - (bb[2] - bb[0])) / 2 - bb[0], y0 + (bh - (bb[3] - bb[1])) / 2 - bb[1] - 1),
++                  text, font=font, fill=fg)
++        x += w
++
++
++def _draw_nf_top10(canvas: Image.Image, corner: str = "right") -> None:
++    """Quadradinho vermelho "TOP 10" (como o da Netflix), no canto de cima."""
++    W, H = canvas.size
++    S = max(28, round(H * 0.15))
++    m = max(6, round(H * 0.03))
++    x0 = W - m - S if corner == "right" else m
++    y0 = m
++    draw = ImageDraw.Draw(canvas)
++    draw.rectangle([x0, y0, x0 + S, y0 + S], fill="#E50914")
++    f_top, f_10 = _get_font(round(S * 0.27)), _get_font(round(S * 0.5))
++    bt, b10 = draw.textbbox((0, 0), "TOP", font=f_top), draw.textbbox((0, 0), "10", font=f_10)
++    ht, h10 = bt[3] - bt[1], b10[3] - b10[1]
++    gap = max(1, round(S * 0.05))
++    y = y0 + (S - ht - gap - h10) / 2
++    draw.text((x0 + (S - (bt[2] - bt[0])) / 2 - bt[0], y - bt[1]), "TOP", font=f_top, fill="#FFFFFF")
++    draw.text((x0 + (S - (b10[2] - b10[0])) / 2 - b10[0], y + ht + gap - b10[1]), "10", font=f_10,
++              fill="#FFFFFF")
++
++
 +def _draw_badge(canvas: Image.Image, badge: str | None, is_poster: bool = False):
 +    if not badge or badge not in VALID_BADGES:
 +        return
-+    W, H = canvas.size
-+    metrics = _badge_metrics(canvas, is_poster=is_poster)
-+    draw = ImageDraw.Draw(canvas)
-+
-+    if badge == "top10":
-+        S = metrics["top10_s"]
-+        margin = metrics["margin"]
-+        radius = max(4, round(S * 0.12))
-+        x0 = margin
-+        y0 = margin
-+        x1 = x0 + S
-+        y1 = y0 + S
-+
-+        draw.rounded_rectangle([x0 + 1, y0 + 1, x1 + 1, y1 + 1], radius=radius, fill=(0, 0, 0, 90))
-+        draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill="#E50914", outline=(0, 0, 0, 100), width=1)
-+
-+        font_top = _get_font(round(S * 0.25))
-+        font_10 = _get_font(round(S * 0.44))
-+        bb_top = draw.textbbox((0, 0), "TOP", font=font_top)
-+        w_top = bb_top[2] - bb_top[0]
-+        h_top = bb_top[3] - bb_top[1]
-+        bb_10 = draw.textbbox((0, 0), "10", font=font_10)
-+        w_10 = bb_10[2] - bb_10[0]
-+        h_10 = bb_10[3] - bb_10[1]
-+        gap = max(1, round(S * 0.02))
-+        total_h = h_top + gap + h_10
-+        start_y = y0 + (S - total_h) / 2
-+        tx_top = x0 + (S - w_top) / 2 - bb_top[0]
-+        ty_top = start_y - bb_top[1]
-+        tx_10 = x0 + (S - w_10) / 2 - bb_10[0]
-+        ty_10 = start_y + h_top + gap - bb_10[1]
-+        draw.text((tx_top, ty_top), "TOP", font=font_top, fill="#FFFFFF")
-+        draw.text((tx_10, ty_10), "10", font=font_10, fill="#FFFFFF")
++    if badge in ("top10", "top10_dub"):
++        _draw_nf_top10(canvas, "right")
++        if badge == "top10_dub":
++            _draw_nf_badge(canvas, badge)
 +    else:
-+        text_map = {
-+            "new_ep": ("NOVO EPISÓDIO", "#E50914"),
-+            "new": ("NOVIDADE", "#E50914"),
-+            "dub": ("DUBLADO", "#1565C0"),
-+        }
-+        text, bg = text_map[badge]
-+        font = _get_font(metrics["font_size"])
-+        bb = draw.textbbox((0, 0), text, font=font)
-+        tw = bb[2] - bb[0]
-+        th = bb[3] - bb[1]
-+        pad_x = metrics["pad_x"]
-+        bw = tw + 2 * pad_x
-+        bh = metrics["badge_h"]
-+        margin = metrics["margin"]
-+        radius = metrics["radius"]
-+
-+        if is_poster:
-+            x0 = (W - bw) // 2
-+            y1 = H - margin
-+            y0 = y1 - bh
-+            x1 = x0 + bw
-+        else:
-+            x0 = margin
-+            y0 = margin
-+            x1 = x0 + bw
-+            y1 = y0 + bh
-+
-+        draw.rounded_rectangle([x0 + 1, y0 + 1, x1 + 1, y1 + 1], radius=radius, fill=(0, 0, 0, 90))
-+        draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=bg, outline=(0, 0, 0, 100), width=1)
-+        tx = x0 + (bw - tw) / 2 - bb[0]
-+        ty = y0 + (bh - th) / 2 - bb[1]
-+        draw.text((tx, ty), text, font=font, fill="#FFFFFF")
++        _draw_nf_badge(canvas, badge)
 +
 +
 +def _draw_oscar(canvas: Image.Image, is_poster: bool = False):
@@ -7645,11 +7874,10 @@ index 0000000..53e0bfa
 +def _draw_provider_logo(canvas: Image.Image, logo_bytes: bytes, is_poster: bool = False):
 +    try:
 +        W, H = canvas.size
-+        metrics = _badge_metrics(canvas, is_poster=is_poster)
-+        S = metrics["provider_size"]
-+        margin = metrics["margin"]
-+        x1 = W - margin
-+        x0 = x1 - S
++        S = max(22, round(H * (0.08 if is_poster else 0.13)))
++        margin = max(6, round(H * 0.03))
++        x0 = margin
++        x1 = x0 + S
 +        y0 = margin
 +        y1 = y0 + S
 +        radius = max(4, round(S * 0.18))
@@ -7927,6 +8155,91 @@ index 0000000..53e0bfa
 +    return out.getvalue()
 +
 +
++TOP10_BG = (16, 16, 16)
++
++
++def _render_top10_wide_pillow(rank: int, poster_bytes: bytes, badge: str | None = None,
++                              provider_logo_bytes: bytes | None = None) -> bytes:
++    """Card 16:9 do Top 10, igual ao da Netflix: o número gigante só com o contorno cinza,
++    e o pôster em pé à direita, por cima da ponta do número."""
++    from PIL import ImageFilter
++
++    W, H = 800, 450
++    canvas = Image.new("RGB", (W, H), TOP10_BG)
++    poster = Image.open(io.BytesIO(poster_bytes)).convert("RGB")
++    ph = H
++    pw = round(ph * 2 / 3)
++    sc = max(pw / poster.width, ph / poster.height)
++    poster = poster.resize((max(pw, round(poster.width * sc)), max(ph, round(poster.height * sc))),
++                           Image.Resampling.LANCZOS)
++    poster = poster.crop(((poster.width - pw) // 2, (poster.height - ph) // 2,
++                          (poster.width - pw) // 2 + pw, (poster.height - ph) // 2 + ph))
++    px = W - pw - round(W * 0.06)
++
++    text = str(rank)
++    narrow = "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Bold.ttf"
++    bold = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
++    font_path = narrow if rank == 10 and os.path.exists(narrow) else bold
++    stroke = 6
++    draw = ImageDraw.Draw(canvas)
++    size = 700
++    while size > 60:
++        font = ImageFont.truetype(font_path, size)
++        l, t, r, b = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
++        if b - t <= H * 0.98 and r - l <= px + pw * 0.22:
++            break
++        size -= 10
++    l, t, r, b = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
++    x = px + round(pw * (0.20 if rank != 1 else 0.14)) - r
++    y = H - b + round(H * 0.01)
++    draw.text((x, y), text, font=font, fill=TOP10_BG, stroke_width=stroke, stroke_fill=(86, 86, 86))
++
++    # sombra do pôster sobre o número
++    shadow = Image.new("L", (W, H), 0)
++    ImageDraw.Draw(shadow).rectangle((px - 6, 0, px + pw, H), fill=170)
++    shadow = shadow.filter(ImageFilter.GaussianBlur(12))
++    canvas = Image.composite(Image.new("RGB", (W, H), (0, 0, 0)), canvas, shadow)
++    pcard = poster.convert("RGBA")
++    if badge in _NF_BADGES:
++        _draw_nf_badge(pcard, badge)
++    if provider_logo_bytes:
++        _draw_provider_logo(pcard, provider_logo_bytes, is_poster=True)
++    canvas.paste(pcard.convert("RGB"), (px, 0))
++
++    out = io.BytesIO()
++    canvas.save(out, "JPEG", quality=88, optimize=True)
++    return out.getvalue()
++
++
++async def render_top10_wide(rank: int, poster_file: str, badge: str | None = None,
++                            provider_id: int | None = None) -> bytes:
++    if rank < 1 or rank > 10:
++        raise ArtworkNotFound(f"Invalid rank: {rank}")
++    clean_poster = poster_file.lstrip("/")
++    if not FILENAME_REGEX.match(clean_poster):
++        raise ArtworkNotFound(f"Invalid poster filename: {poster_file}")
++    badge = badge if badge in _NF_BADGES else None
++    cache_key = f"top10w1:{rank}:{clean_poster}:{badge or ''}:{provider_id or ''}"
++    cache_path = os.path.join(CACHE_DIR, f"{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}.jpg")
++    if os.path.exists(cache_path):
++        try:
++            with open(cache_path, "rb") as f:
++                return f.read()
++        except Exception as _e:
++            log_swallowed("artwork.render_top10_wide", _e)
++    async with _SEMAPHORE:
++        if os.path.exists(cache_path):
++            with open(cache_path, "rb") as f:
++                return f.read()
++        poster_bytes = await _fetch_tmdb_image("w500", clean_poster)
++        provider_logo_bytes = await get_provider_logo_bytes(provider_id) if provider_id else None
++        jpeg_bytes = await asyncio.to_thread(_render_top10_wide_pillow, rank, poster_bytes, badge,
++                                             provider_logo_bytes)
++        _save_atomic(cache_path, jpeg_bytes)
++        _cleanup_cache_if_needed()
++        return jpeg_bytes
++
++
 +def _render_landscape_pillow(
 +    backdrop_bytes: bytes,
 +    logo_bytes: bytes | None,
@@ -7947,14 +8260,23 @@ index 0000000..53e0bfa
 +    canvas.alpha_composite(_get_gradient_overlay())
 +
 +    if logo_bytes:
++        from PIL import ImageFilter as _IF
 +        logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
-+        max_lw = int(round(W * 0.45))
-+        max_lh = int(round(H * 0.32))
++        max_lw = int(round(W * 0.50))
++        max_lh = int(round(H * 0.34))
 +        lscale = min(max_lw / logo.width, max_lh / logo.height)
 +        nlw = max(1, int(round(logo.width * lscale)))
 +        nlh = max(1, int(round(logo.height * lscale)))
 +        logo_resized = logo.resize((nlw, nlh), Image.Resampling.LANCZOS)
-+        canvas.paste(logo_resized, (28, H - 28 - nlh), mask=logo_resized)
++        box = _nf_badge_box(W, H, badge)
++        lift = box[0] + 4 if box and 26 + nlw > (W - box[1]) // 2 else 0
++        bottom = H - 26 - lift
++        # sombra leve para o logo não sumir em cena clara
++        sh = Image.new("RGBA", logo_resized.size, (0, 0, 0, 0))
++        sh.putalpha(logo_resized.split()[3].point(lambda v: int(v * 0.55)))
++        sh = sh.filter(_IF.GaussianBlur(6))
++        canvas.alpha_composite(sh, (26, bottom - nlh + 2))
++        canvas.alpha_composite(logo_resized, (26, bottom - nlh))
 +
 +    if badge:
 +        _draw_badge(canvas, badge, is_poster=False)
@@ -8057,7 +8379,7 @@ index 0000000..53e0bfa
 +    if clean_badge and clean_badge not in VALID_BADGES:
 +        raise ArtworkNotFound(f"Invalid badge: {badge}")
 +
-+    cache_key = f"landv3:{clean_backdrop}:{clean_logo or ''}:{clean_badge or ''}:{provider_id or ''}:{int(bool(oscar))}"
++    cache_key = f"landv4:{clean_backdrop}:{clean_logo or ''}:{clean_badge or ''}:{provider_id or ''}:{int(bool(oscar))}"
 +    cache_path = os.path.join(
 +        CACHE_DIR, f"{hashlib.sha1(cache_key.encode('utf-8')).hexdigest()}.jpg"
 +    )
@@ -9032,10 +9354,10 @@ index 0000000..1202f91
 +    }
 diff --git a/comet/services/catalog_manifest.py b/comet/services/catalog_manifest.py
 new file mode 100644
-index 0000000..95288d1
+index 0000000..1708138
 --- /dev/null
 +++ b/comet/services/catalog_manifest.py
-@@ -0,0 +1,834 @@
+@@ -0,0 +1,866 @@
 +"""Montagem do manifesto (lista de fileiras) do Comet. Separado de catalogs.py (que só responde as fileiras)."""
 +from comet.services.catalogs import (  # noqa: F401
 +    MOVIE_GENRE_OPTIONS,
@@ -9262,6 +9584,23 @@ index 0000000..95288d1
 +            "type": "series",
 +            "id": "comet_new",
 +            "name": "🆕 Lançamentos",
++            "extra": [
++                {"name": "skip", "isRequired": False},
++            ],
++        },
++        # 3b. chegou esta semana nos streamings (10/11)
++        {
++            "type": "movie",
++            "id": "comet_svnew",
++            "name": "🆕 Chegou esta semana nos streamings",
++            "extra": [
++                {"name": "skip", "isRequired": False},
++            ],
++        },
++        {
++            "type": "series",
++            "id": "comet_svnew",
++            "name": "🆕 Chegou esta semana nos streamings",
 +            "extra": [
 +                {"name": "skip", "isRequired": False},
 +            ],
@@ -9696,6 +10035,22 @@ index 0000000..95288d1
 +            },
 +            {
 +                "type": "movie",
++                "id": "comet_mood_short",
++                "name": "⏱️ Filmes curtos (até 1h30)",
++                "extra": [
++                    {"name": "skip", "isRequired": False},
++                ],
++            },
++            {
++                "type": "series",
++                "id": "comet_mood_weekend",
++                "name": "🗓️ Séries completas para o fim de semana",
++                "extra": [
++                    {"name": "skip", "isRequired": False},
++                ],
++            },
++            {
++                "type": "movie",
 +                "id": "comet_mood_family",
 +                "name": "👨‍👩‍👧 Sessão em família",
 +                "extra": [
@@ -9835,11 +10190,15 @@ index 0000000..95288d1
 +    ("series", "comet_trending"): "Séries em alta",
 +    ("movie", "comet_new"): "Filmes recém-lançados",
 +    ("series", "comet_new"): "Séries que acabaram de estrear",
++    ("movie", "comet_svnew"): "Filmes que chegaram esta semana",
++    ("series", "comet_svnew"): "Episódios novos desta semana nos streamings",
 +    ("movie", "comet_ready"): "Filmes dublados prontos para ver",
 +    ("series", "comet_ready"): "Séries dubladas prontas para ver",
 +    ("movie", "comet_lucky"): "Sorteio do dia · filme",
 +    ("series", "comet_lucky"): "Sorteio do dia · série",
 +    (None, "comet_tonight"): "Para hoje à noite",
++    (None, "comet_podcasts"): "Podcasts mais ouvidos",
++    (None, "comet_games"): "Filmes dos games",
 +    (None, "comet_moods"): "Para cada clima",
 +    (None, "comet_genres"): "Gêneros",
 +    ("movie", "comet_br"): "Cinema nacional",
@@ -9856,26 +10215,21 @@ index 0000000..95288d1
 +    (None, "comet_fut"): "Futebol hoje",
 +    (None, "comet_recap"): "Sua retrospectiva",
 +    (None, "comet_mood_binge"): "Séries para maratonar em um dia",
++    (None, "comet_mood_weekend"): "Séries completas para o fim de semana",
++    (None, "comet_mood_short"): "Filmes curtos, até 1h30",
 +    (None, "comet_xmas_new"): "Natal: filmes novos",
 +    (None, "comet_xmas_all"): "Natal: clássicos",
 +    ("series", "comet_streams"): "Séries nos streamings",
 +    ("movie", "comet_streams"): "Filmes nos streamings",
 +    (None, "comet_origs"): "Originais dos streamings",
-+    ("movie", "comet_sv_top10m"): "Top 10 filmes",
-+    ("series", "comet_sv_top10s"): "Top 10 séries",
-+    (None, "comet_sv_orig"): "Originais",
-+    (None, "comet_sv_hots"): "Séries em alta",
-+    (None, "comet_sv_hotm"): "Filmes em alta",
-+    (None, "comet_sv_newm"): "Novidades",
-+    (None, "comet_sv_bests"): "Séries aclamadas",
-+    (None, "comet_sv_bestm"): "Filmes aclamados",
++    # as fileiras dos streamings (comet_sv_*) já têm o nome limpo em streamings.TABS
 +}
 diff --git a/comet/services/catalogs.py b/comet/services/catalogs.py
 new file mode 100644
-index 0000000..e07db0f
+index 0000000..ab06352
 --- /dev/null
 +++ b/comet/services/catalogs.py
-@@ -0,0 +1,4178 @@
+@@ -0,0 +1,4326 @@
 +import asyncio
 +import datetime
 +import json
@@ -10327,6 +10681,33 @@ index 0000000..e07db0f
 +            params["sort_by"] = "first_air_date.desc"
 +        return path, params
 +
++    if catalog_id == "comet_svnew":
++        # chegou esta semana nos streamings do Brasil: filme com lançamento digital nos últimos
++        # 10 dias; série com episódio novo nos últimos 7 dias
++        all_providers = "|".join(
++            str(PROVIDERS[p][1]) for p in _get_providers_list() if p in PROVIDERS
++        )
++        params = {
++            "watch_region": region,
++            "with_watch_providers": all_providers,
++            "with_watch_monetization_types": "flatrate",
++            "language": language,
++            "page": page,
++            "sort_by": "popularity.desc",
++        }
++        if media_type == "movie":
++            params["region"] = region
++            params["with_release_type"] = "4"
++            params["release_date.gte"] = (today - datetime.timedelta(days=10)).isoformat()
++            params["release_date.lte"] = today_str
++            params["vote_count.gte"] = 3
++        else:
++            params["air_date.gte"] = (today - datetime.timedelta(days=7)).isoformat()
++            params["air_date.lte"] = today_str
++            params["without_genres"] = "10763,10764,10766,10767"
++            params["vote_count.gte"] = 10
++        return f"discover/{tmdb_type}", params
++
 +    if catalog_id == "comet_top":
 +        all_providers = "|".join(
 +            str(PROVIDERS[p][1]) for p in _get_providers_list() if p in PROVIDERS
@@ -10505,6 +10886,82 @@ index 0000000..e07db0f
 +        return set()
 +
 +
++_TV_INFO_CACHE: dict[int, tuple[float, dict | None]] = {}
++_MOVIE_COMPANIES_CACHE: dict[int, tuple[float, list[str]]] = {}
++
++
++async def _tv_info(tmdb, tid: int, sem) -> dict | None:
++    """Último episódio, temporadas e redes da série (cache de 12 h). Também alimenta o
++    _TV_LAST_EP_CACHE, que outras partes usam."""
++    now = time.time()
++    hit = _TV_INFO_CACHE.get(tid)
++    if hit is not None and now - hit[0] < 12 * 3600:
++        return hit[1]
++    info = None
++    async with sem:
++        try:
++            tv_data = await tmdb._get_json(f"tv/{tid}?language=pt-BR", f"tv {tid}")
++            if isinstance(tv_data, dict):
++                last_ep = tv_data.get("last_episode_to_air") if isinstance(tv_data.get("last_episode_to_air"), dict) else {}
++                info = {
++                    "air_date": str(last_ep.get("air_date") or "") or None,
++                    "season": int(last_ep.get("season_number") or 0),
++                    "seasons": {int(x.get("season_number") or 0): x.get("air_date")
++                                for x in (tv_data.get("seasons") or []) if isinstance(x, dict)},
++                    "networks": [int(n.get("id")) for n in (tv_data.get("networks") or [])
++                                 if isinstance(n, dict) and n.get("id")],
++                }
++        except Exception:
++            info = None
++    _TV_INFO_CACHE[tid] = (now, info)
++    _TV_LAST_EP_CACHE[tid] = (now, (info or {}).get("air_date"))
++    return info
++
++
++def _series_badge(info: dict | None, today: datetime.date) -> str | None:
++    """Selo da série, como na Netflix:
++    episódio de hoje/ontem -> "Novo episódio | Assista já"; temporada que estreou há até 30 dias ->
++    "Nova temporada" (ou "Novidade", se for a 1ª); episódio nos últimos 10 dias -> "Novo episódio"."""
++    if not info or not info.get("air_date"):
++        return None
++    try:
++        diff = (today - datetime.date.fromisoformat(info["air_date"])).days
++    except ValueError:
++        return None
++    if diff < -1 or diff > 30:
++        return None
++    if diff <= 1:
++        return "new_ep_now"
++    sn = info.get("season") or 0
++    start = (info.get("seasons") or {}).get(sn)
++    if start:
++        try:
++            sdiff = (today - datetime.date.fromisoformat(start)).days
++            if -1 <= sdiff <= 30:
++                return "new" if sn <= 1 else "new_season"
++        except ValueError:
++            pass
++    return "new_ep" if diff <= 10 else None
++
++
++async def _movie_companies(tmdb, tid: int, sem) -> list[str]:
++    now = time.time()
++    hit = _MOVIE_COMPANIES_CACHE.get(tid)
++    if hit is not None and now - hit[0] < 7 * 86400:
++        return hit[1]
++    names: list[str] = []
++    async with sem:
++        try:
++            data = await tmdb._get_json(f"movie/{tid}", f"movie {tid}")
++            if isinstance(data, dict):
++                names = [str(c.get("name") or "") for c in (data.get("production_companies") or [])
++                         if isinstance(c, dict)]
++        except Exception:
++            names = []
++    _MOVIE_COMPANIES_CACHE[tid] = (now, names)
++    return names
++
++
 +def _is_relevant_series(it: dict) -> bool:
 +    tid = it.get("id")
 +    if not tid:
@@ -10619,6 +11076,13 @@ index 0000000..e07db0f
 +    return sorted_tt
 +
 +
++def _with_dub(badge: str | None) -> str:
++    """Selo + "Dublado" quando há dublado pronto (ex.: "Novidade | Dublado")."""
++    if badge in ("new_ep", "new_season", "new", "top10"):
++        return f"{badge}_dub"
++    return badge or "dub"
++
++
 +async def _fetch_catalog_items(
 +    media_type: str, catalog_id: str, genre: str | None, skip: int, base_url: str = "", kids: bool = False
 +) -> list[dict]:
@@ -10657,6 +11121,17 @@ index 0000000..e07db0f
 +        for res in gather_res:
 +            if isinstance(res, dict) and isinstance(res.get("results"), list):
 +                raw_items.extend(res["results"])
++
++        if skip == 0 and catalog_id.startswith("svx_") and catalog_id.endswith(("_top10s", "_top10m")):
++            # Top 10 oficial, quando o serviço publica (Netflix); o TMDB completa se faltar
++            try:
++                from comet.services.official_top10 import official_results
++                _off = await official_results(catalog_id.split("_")[1], media_type, tmdb)
++                if len(_off) >= 5:
++                    _ids = {o.get("id") for o in _off}
++                    raw_items = _off + [r for r in raw_items if isinstance(r, dict) and r.get("id") not in _ids]
++            except Exception as _oe:
++                log_swallowed("catalogs.official_top10", _oe)
 +
 +        unique_raw_items = []
 +        seen_tmdb_ids = set()
@@ -10814,31 +11289,20 @@ index 0000000..e07db0f
 +                landscape_cache_updated = True
 +                return res
 +
-+        async def resolve_new_ep(tid: int) -> bool:
-+            now = time.time()
-+            cached = _TV_LAST_EP_CACHE.get(tid)
-+            if cached is not None and (now - cached[0]) < 12 * 3600:
-+                air_date = cached[1]
-+            else:
-+                air_date = None
-+                async with sem:
-+                    try:
-+                        tv_data = await tmdb._get_json(f"tv/{tid}?language=pt-BR", f"tv {tid}")
-+                        if isinstance(tv_data, dict):
-+                            last_ep = tv_data.get("last_episode_to_air")
-+                            if isinstance(last_ep, dict) and last_ep.get("air_date"):
-+                                air_date = str(last_ep["air_date"])
-+                        _TV_LAST_EP_CACHE[tid] = (now, air_date)
-+                    except Exception:
-+                        _TV_LAST_EP_CACHE[tid] = (now, None)
-+            if air_date:
-+                try:
-+                    ep_date = datetime.date.fromisoformat(air_date)
-+                    diff = (datetime.date.today() - ep_date).days
-+                    return -1 <= diff <= 10
-+                except ValueError:
-+                    pass
-+            return False
++        async def resolve_new_ep(tid: int) -> str | None:
++            return _series_badge(await _tv_info(tmdb, tid, sem), datetime.date.today())
++
++        # fileiras dos streamings: o logo do serviço só vai no card dos originais (como o "N")
++        svc_key = catalog_id.split("_")[1] if catalog_id.startswith("svx_") else None
++
++        async def resolve_orig(tid: int) -> bool:
++            from comet.services.streamings import is_original
++            if media_type == "series":
++                info = await _tv_info(tmdb, tid, sem)
++                return is_original(svc_key, "series", networks=(info or {}).get("networks") or [])
++            if not is_original(svc_key, "movie", companies=None):
++                return False  # serviço sem estúdio próprio conhecido: nem consulta
++            return is_original(svc_key, "movie", companies=await _movie_companies(tmdb, tid, sem))
 +
 +        async def resolve_item(item: dict):
 +            tid = item["id"]
@@ -10848,16 +11312,21 @@ index 0000000..e07db0f
 +            else:
 +                tasks.append(asyncio.sleep(0, result=None))
 +
-+            if needs_badges and media_type == "series" and _is_relevant_series(item):
++            if needs_badges and media_type == "series" and (_is_relevant_series(item) or svc_key):
 +                tasks.append(resolve_new_ep(tid))
 +            else:
-+                tasks.append(asyncio.sleep(0, result=False))
++                tasks.append(asyncio.sleep(0, result=None))
++            if svc_key:
++                tasks.append(resolve_orig(tid))
++            else:
++                tasks.append(asyncio.sleep(0, result=True))
 +
 +            res = await asyncio.gather(*tasks, return_exceptions=True)
 +            imdb_id = res[0] if isinstance(res[0], str) else None
 +            landscape_data = res[1] if isinstance(res[1], dict) else None
-+            is_new_ep = res[2] if isinstance(res[2], bool) else False
-+            return imdb_id, landscape_data, is_new_ep
++            is_new_ep = res[2] if isinstance(res[2], str) else None
++            is_orig = res[3] is True
++            return imdb_id, landscape_data, is_new_ep, is_orig
 +
 +        resolved_pairs = await asyncio.gather(
 +            *[resolve_item(it) for it in unique_raw_items],
@@ -10898,7 +11367,7 @@ index 0000000..e07db0f
 +        for it, pair in zip(unique_raw_items, resolved_pairs):
 +            if not isinstance(pair, tuple):
 +                continue
-+            imdb_id, landscape_data, is_new_ep = pair
++            imdb_id, landscape_data, is_new_ep, is_orig = pair
 +            if (
 +                not isinstance(imdb_id, str)
 +                or not imdb_id.startswith("tt")
@@ -10938,7 +11407,10 @@ index 0000000..e07db0f
 +            }
 +
 +            provider_id = item_providers.get(it.get("id"))
-+            if catalog_id == "comet_top10" and poster_path:
++            if svc_key and not is_orig:
++                provider_id = None
++            svc_top10 = catalog_id.startswith("svx_") and catalog_id.endswith(("_top10s", "_top10m"))
++            if (catalog_id == "comet_top10" or svc_top10) and poster_path:
 +                meta["_raw_poster_path"] = poster_path
 +                meta["_provider_id"] = provider_id
 +
@@ -10947,7 +11419,7 @@ index 0000000..e07db0f
 +                if catalog_id != "comet_top10" and imdb_id in top10_set:
 +                    badge = "top10"
 +                elif media_type == "series" and is_new_ep:
-+                    badge = "new_ep"
++                    badge = is_new_ep
 +                elif media_type == "movie":
 +                    rel_d_str = it.get("release_date")
 +                    if rel_d_str:
@@ -10958,8 +11430,21 @@ index 0000000..e07db0f
 +                                badge = "new"
 +                        except ValueError:
 +                            pass
-+                if not badge and catalog_id != "comet_ready" and imdb_id in ready_set:
-+                    badge = "dub"
++                if catalog_id != "comet_ready" and imdb_id in ready_set:
++                    badge = _with_dub(badge)
++
++            if svc_top10 and poster_path:
++                # card do Top 10 dos streamings (pôster em pé): o selo de baixo, como na Netflix
++                nf_badge = is_new_ep if media_type == "series" else None
++                if not nf_badge and media_type == "movie" and it.get("release_date"):
++                    try:
++                        _d = (today_date - datetime.date.fromisoformat(it["release_date"])).days
++                        nf_badge = "new" if -1 <= _d <= 45 else None
++                    except ValueError:
++                        pass
++                if imdb_id in ready_set:
++                    nf_badge = _with_dub(nf_badge)
++                meta["_nf_badge"] = nf_badge
 +
 +            q_str = _build_art_query(badge=badge, provider_id=provider_id)
 +            if is_landscape:
@@ -12196,31 +12681,8 @@ index 0000000..e07db0f
 +                landscape_cache_updated = True
 +                return res
 +
-+        async def check_new_ep(tid: int) -> bool:
-+            now = time.time()
-+            cached = _TV_LAST_EP_CACHE.get(tid)
-+            if cached is not None and (now - cached[0]) < 12 * 3600:
-+                air_date = cached[1]
-+            else:
-+                air_date = None
-+                async with sem:
-+                    try:
-+                        tv_data = await tmdb._get_json(f"tv/{tid}?language=pt-BR", f"tv {tid}")
-+                        if isinstance(tv_data, dict):
-+                            last_ep = tv_data.get("last_episode_to_air")
-+                            if isinstance(last_ep, dict) and last_ep.get("air_date"):
-+                                air_date = str(last_ep["air_date"])
-+                        _TV_LAST_EP_CACHE[tid] = (now, air_date)
-+                    except Exception:
-+                        _TV_LAST_EP_CACHE[tid] = (now, None)
-+            if air_date:
-+                try:
-+                    ep_date = datetime.date.fromisoformat(air_date)
-+                    diff = (today_date - ep_date).days
-+                    return -1 <= diff <= 10
-+                except ValueError:
-+                    pass
-+            return False
++        async def check_new_ep(tid: int) -> str | None:
++            return _series_badge(await _tv_info(tmdb, tid, sem), today_date)
 +
 +        async def process_ready_item(m: dict) -> dict:
 +            meta = dict(m)
@@ -12233,8 +12695,7 @@ index 0000000..e07db0f
 +            if imdb_id and imdb_id in top10_set:
 +                badge = "top10"
 +            elif media_type == "series":
-+                if await check_new_ep(tid):
-+                    badge = "new_ep"
++                badge = await check_new_ep(tid)
 +            elif media_type == "movie":
 +                rel_d_str = meta.get("_release_date")
 +                if rel_d_str:
@@ -13206,6 +13667,41 @@ index 0000000..e07db0f
 +
 +_TV_SHORT_SERIES_CACHE: dict[int, tuple[float, bool]] = {}
 +_ANIME_INFO_CACHE: dict[str, dict] = {}
++# animes com torrent PT no banco: analisar ~40 mil nomes leva ~13 s no A71, então o resultado
++# fica guardado 1 h e a análise segue em segundo plano mesmo se o pedido estourar o tempo
++_ANIME_PT_SET: tuple[float, set] = (0.0, set())
++_ANIME_PT_TASK: asyncio.Task | None = None
++
++
++async def _anime_pt_series() -> set:
++    global _ANIME_PT_TASK
++    if _ANIME_PT_SET[1] and time.time() - _ANIME_PT_SET[0] < 3600:
++        return _ANIME_PT_SET[1]
++
++    async def build() -> set:
++        global _ANIME_PT_SET
++        rows = await database.fetch_all("""
++            SELECT t.media_id, t.title, t.tracker
++            FROM torrents t
++            JOIN anime_ids a ON substr(t.media_id, 1, instr(t.media_id || ':', ':') - 1) = a.provider_id
++            WHERE a.provider = 'imdb'
++        """)
++        out: set = set()
++        for i, r in enumerate(rows):
++            p = RTN.parse(r["title"])
++            apply_ptbr_detection(p, r["title"], r["tracker"])
++            if "pt" in (getattr(p, "languages", None) or ()) and not is_cam_release(p):
++                out.add(r["media_id"].split(":")[0])
++            if i % 500 == 499:
++                await asyncio.sleep(0)  # não trava o servidor enquanto analisa
++        _ANIME_PT_SET = (time.time(), out)
++        return out
++
++    if _ANIME_PT_TASK is None or _ANIME_PT_TASK.done():
++        _ANIME_PT_TASK = asyncio.ensure_future(build())
++    if _ANIME_PT_SET[1]:
++        return _ANIME_PT_SET[1]  # vencido: devolve o anterior enquanto refaz
++    return await asyncio.shield(_ANIME_PT_TASK)
 +
 +WEEKDAYS_PT = {
 +    0: "Segunda-feira",
@@ -13302,6 +13798,23 @@ index 0000000..e07db0f
 +            params["with_runtime.lte"] = 115
 +            params["vote_average.gte"] = 6.8
 +            params["vote_count.gte"] = 800
++
++        elif catalog_id == "comet_mood_short":
++            # filmes curtos: de 1h a 1h30, bem avaliados
++            params["with_runtime.gte"] = 60
++            params["with_runtime.lte"] = 90
++            params["without_genres"] = "99,10770"
++            params["vote_average.gte"] = 6.8
++            params["vote_count.gte"] = 600
++
++        elif catalog_id == "comet_mood_weekend":
++            # séries completas (encerradas), episódios até 50 min, para ver num fim de semana
++            params["with_status"] = 3
++            params["with_type"] = 4
++            params["with_runtime.lte"] = 50
++            params["without_genres"] = "10763,10764,10766,10767,16"
++            params["vote_average.gte"] = 7.6
++            params["vote_count.gte"] = 400
 +
 +        elif catalog_id == "comet_mood_family":
 +            params["with_genres"] = "10751|16"
@@ -13536,19 +14049,8 @@ index 0000000..e07db0f
 +        tmdb = TMDBApi(session)
 +        sem = asyncio.Semaphore(25)
 +
-+        # 1. Fast load anime torrents with PT in DB using JOIN with anime_ids
-+        anime_pt_rows = await database.fetch_all("""
-+            SELECT t.media_id, t.title, t.tracker
-+            FROM torrents t
-+            JOIN anime_ids a ON substr(t.media_id, 1, instr(t.media_id || ':', ':') - 1) = a.provider_id
-+            WHERE a.provider = 'imdb'
-+        """)
-+        pt_series_set = set()
-+        for r in anime_pt_rows:
-+            p = RTN.parse(r["title"])
-+            apply_ptbr_detection(p, r["title"], r["tracker"])
-+            if "pt" in (getattr(p, "languages", None) or ()) and not is_cam_release(p):
-+                pt_series_set.add(r["media_id"].split(":")[0])
++        # 1. animes com torrent PT no banco (guardado 1 h, ver _anime_pt_series)
++        pt_series_set = await _anime_pt_series()
 +
 +        ready_series = await _get_ready_tt_list("series")
 +        ready_set = set(ready_series)
@@ -14295,10 +14797,10 @@ index 0000000..4c2b0a7
 +                break
 diff --git a/comet/services/direct_addons.py b/comet/services/direct_addons.py
 new file mode 100644
-index 0000000..b9eeda2
+index 0000000..270c5a5
 --- /dev/null
 +++ b/comet/services/direct_addons.py
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,667 @@
 +import asyncio
 +import random
 +import re
@@ -14329,6 +14831,142 @@ index 0000000..b9eeda2
 +
 +def get_last_direct_ratio() -> str:
 +    return _LAST_DIRECT_RATIO
++
++
++# ───────────── episódio de outro corte (ex.: novela turca recortada pela Netflix) ─────────────
++# Alguns links diretos seguem a numeração da Netflix (episódios de ~40 min) enquanto o
++# Nuvio/TMDB numera os episódios originais (~2 h). O "2x12" de um não é o "2x12" do outro.
++# Mede a duração do vídeo (ffprobe) e compara com a do episódio no TMDB; o resultado fica
++# guardado por 30 dias em data/direct_durations.json.
++_DUR_PATH = "data/direct_durations.json"
++_DUR_TTL = 30 * 86400
++_DUR: dict | None = None
++_DUR_INFLIGHT: dict[str, asyncio.Task] = {}
++_RT_CACHE: dict[tuple[str, int], tuple[float, dict]] = {}
++_RT_TTL = 7 * 86400
++
++
++def _dur_db() -> dict:
++    global _DUR
++    if _DUR is None:
++        try:
++            import json
++
++            with open(_DUR_PATH, encoding="utf-8") as fh:
++                _DUR = json.load(fh)
++        except Exception:
++            _DUR = {}
++    return _DUR
++
++
++def _dur_save() -> None:
++    try:
++        import json
++        import os
++
++        tmp = _DUR_PATH + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as fh:
++            json.dump(_dur_db(), fh)
++        os.replace(tmp, _DUR_PATH)
++    except Exception as e:
++        logger.debug(f"direct_durations: falha ao gravar: {e}")
++
++
++async def _tmdb_episode_runtime(imdb: str, season: int, episode: int) -> int | None:
++    key = (imdb, season)
++    hit = _RT_CACHE.get(key)
++    if hit and time.time() - hit[0] < _RT_TTL:
++        return hit[1].get(episode)
++    from comet.metadata.tmdb import DEFAULT_TMDB_READ_ACCESS_TOKEN
++
++    tok = getattr(settings, "TMDB_READ_ACCESS_TOKEN", None) or DEFAULT_TMDB_READ_ACCESS_TOKEN
++    base = "https://api.themoviedb.org/3"
++    async with httpx.AsyncClient(timeout=8, headers={"Authorization": f"Bearer {tok}"}) as c:
++        f = (await c.get(f"{base}/find/{imdb}", params={"external_source": "imdb_id"})).json()
++        tv = (f.get("tv_results") or [None])[0]
++        if not tv:
++            _RT_CACHE[key] = (time.time(), {})
++            return None
++        sd = (await c.get(f"{base}/tv/{tv['id']}/season/{season}")).json()
++    rts = {
++        int(e["episode_number"]): int(e["runtime"])
++        for e in sd.get("episodes") or []
++        if e.get("episode_number") and e.get("runtime")
++    }
++    _RT_CACHE[key] = (time.time(), rts)
++    return rts.get(episode)
++
++
++async def _probe_minutes(url: str) -> float | None:
++    try:
++        proc = await asyncio.create_subprocess_exec(
++            "ffprobe", "-v", "error", "-show_entries", "format=duration",
++            "-of", "default=nw=1:nk=1", url,
++            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
++        )
++        try:
++            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
++        except (asyncio.TimeoutError, TimeoutError):
++            proc.kill()
++            return None
++        return float(out.decode().strip()) / 60.0
++    except Exception:
++        return None
++
++
++async def _measure_cut(key: str, media_id: str, url: str) -> None:
++    try:
++        imdb, s, e = media_id.split(":")[:3]
++        rt = await _tmdb_episode_runtime(imdb, int(s), int(e))
++        if not rt:
++            return
++        dur = await _probe_minutes(url)
++        if not dur:
++            return
++        _dur_db()[key] = {"t": time.time(), "min": round(dur, 1), "rt": rt}
++        _dur_save()
++        if _is_other_cut(_dur_db()[key]):
++            logger.info(f"✂️ link direto de outro corte: {key} tem {dur:.0f} min, episódio {rt} min")
++    except Exception as ex:
++        logger.debug(f"direct_durations: {key}: {ex}")
++    finally:
++        _DUR_INFLIGHT.pop(key, None)
++
++
++def _is_other_cut(rec: dict | None) -> bool:
++    if not rec:
++        return False
++    dur, rt = rec.get("min") or 0, rec.get("rt") or 0
++    if not dur or not rt:
++        return False
++    # 40 min no lugar de 2 h (recorte) ou 2 h no lugar de 40 min (episódios juntados)
++    return (rt >= 50 and dur < rt * 0.6) or (dur >= 50 and dur > rt * 1.7)
++
++
++async def _cut_verdicts(media_id: str, firsts: dict[str, str], wait: float) -> dict[str, dict]:
++    """addon -> registro de duração (só os que já foram medidos)."""
++    db = _dur_db()
++    now = time.time()
++    out: dict[str, dict] = {}
++    pending = []
++    for curto, url in firsts.items():
++        key = f"{media_id}|{curto}"
++        rec = db.get(key)
++        if rec and now - rec.get("t", 0) < _DUR_TTL:
++            out[curto] = rec
++            continue
++        task = _DUR_INFLIGHT.get(key)
++        if task is None:
++            task = asyncio.create_task(_measure_cut(key, media_id, url))
++            _DUR_INFLIGHT[key] = task
++        pending.append((curto, key, task))
++    if pending and wait > 0:
++        # shield: se o tempo acabar, a medição continua e vale para a próxima abertura
++        await asyncio.wait([asyncio.shield(t) for _, _, t in pending], timeout=wait)
++        for curto, key, _ in pending:
++            if key in db:
++                out[curto] = db[key]
++    return out
 +
 +
 +def get_blocked_hosts() -> list[str]:
@@ -14688,6 +15326,17 @@ index 0000000..b9eeda2
 +
 +        raw_candidates.sort(key=_validation_priority)
 +
++        # episódio de outro corte: mede o 1º link dublado de cada addon junto com a validação
++        cut_task = None
++        if media_type == "series" and media_id.startswith("tt") and media_id.count(":") == 2:
++            firsts: dict[str, str] = {}
++            for s_dict, addon_name, u_str in raw_candidates:
++                t = f"{s_dict.get('name') or ''} {s_dict.get('title') or s_dict.get('description') or ''}".lower()
++                if addon_name not in firsts and any(kw in t for kw in PT_KEYWORDS):
++                    firsts[addon_name] = u_str
++            if firsts:
++                cut_task = asyncio.create_task(_cut_verdicts(media_id, firsts, wait=4.0))
++
 +        # Validate URLs in parallel (max 8 concurrent, total batch timeout 7.0s)
 +        sem = asyncio.Semaphore(8)
 +
@@ -14712,6 +15361,16 @@ index 0000000..b9eeda2
 +        _LAST_DIRECT_RATIO = f"{len(validated_candidates)}/{total_count}"
 +        logger.info(f"🌐 diretos: {len(validated_candidates)}/{total_count}")
 +
++        verdicts: dict[str, dict] = {}
++        cut_pending = False
++        if cut_task is not None:
++            try:
++                verdicts = await cut_task
++            except Exception:
++                verdicts = {}
++            # medição ainda em curso: não guarda esta resposta, a próxima abertura já sai certa
++            cut_pending = len(verdicts) < len(firsts)
++
 +        converted_items = []
 +        order_idx = 0
 +
@@ -14725,6 +15384,33 @@ index 0000000..b9eeda2
 +
 +            res = _extract_res(texto)
 +            res_rank = RES_RANKS.get(res, 4)
++
++            cut = verdicts.get(curto) if is_pt else None
++            if _is_other_cut(cut):
++                # não é este episódio: fica no fim da lista, avisado, e nunca vira ▶ Assistir
++                aviso = (
++                    f"⚠️ Outra divisão de episódios: o vídeo tem {cut['min']:.0f} min "
++                    f"e este episódio tem {cut['rt']} min (provável corte da Netflix). "
++                    "Não é este episódio."
++                )
++                converted_items.append((
++                    {
++                        "name": f"⚠️ {res or 'HD'}\nPT-BR · outro corte",
++                        "description": f"{aviso}\n🌐 Link direto ({curto})",
++                        "url": orig_url,
++                        "behaviorHints": {
++                            **(s.get("behaviorHints") if isinstance(s.get("behaviorHints"), dict) else {}),
++                            "bingeGroup": f"comet|direct|{curto}|cut",
++                            "filename": f"{curto}.direct.CUT",
++                        },
++                        "_is_pt": False,
++                        "_res": res or "HD",
++                        "_is_direct": True,
++                    },
++                    False, 9, order_idx,
++                ))
++                order_idx += 1
++                continue
 +
 +            if getattr(settings, "STREAM_LAYOUT", "clean") == "clean":
 +                res_label = res or "HD"
@@ -14772,7 +15458,7 @@ index 0000000..b9eeda2
 +        converted_items.sort(key=lambda x: (0 if x[1] else 1, x[2], x[3]))
 +        results = [item[0] for item in converted_items]
 +
-+        if results:
++        if results and not cut_pending:
 +            while len(_CACHE) >= _CACHE_MAX_SIZE:
 +                oldest_key = min(_CACHE.keys(), key=lambda k: _CACHE[k][0])
 +                _CACHE.pop(oldest_key, None)
@@ -15211,10 +15897,10 @@ index 0000000..8c82ff1
 +        await asyncio.sleep(300)
 diff --git a/comet/services/extra_rows.py b/comet/services/extra_rows.py
 new file mode 100644
-index 0000000..a7f7f13
+index 0000000..18830a1
 --- /dev/null
 +++ b/comet/services/extra_rows.py
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,112 @@
 +"""Fileiras extras (futebol, sessão da noite, Minha TV, retrospectiva).
 +
 +Cada módulo segue o mesmo protocolo (ROWS, row_visible, catalog_items, ID_PREFIX, get_meta, get_streams, router).
@@ -15234,6 +15920,8 @@ index 0000000..a7f7f13
 +    ("comet.services.football", "top"),
 +    ("comet.services.mytv", "top"),
 +    ("comet.services.recap", "end"),
++    ("comet.services.podcasts", "end"),
++    ("comet.services.games", "end"),
 +)
 +
 +
@@ -15433,7 +16121,7 @@ index 0000000..60fc299
 +        now = time.time()
 +        return {h for h, t in _load().get(media_key, {}).items() if now - t < TTL_S}
 diff --git a/comet/services/filtering.py b/comet/services/filtering.py
-index b844e5e..ead4c3d 100644
+index b844e5e..3c70937 100644
 --- a/comet/services/filtering.py
 +++ b/comet/services/filtering.py
 @@ -1,6 +1,7 @@
@@ -15444,7 +16132,7 @@ index b844e5e..ead4c3d 100644
  from threading import Event, Lock
  
  from pydantic import ValidationError
-@@ -12,6 +13,111 @@ from comet.utils.languages import alias_language
+@@ -12,6 +13,115 @@ from comet.utils.languages import alias_language
  from comet.utils.parsing import ensure_multi_language
  
  _TITLE_MATCH_CACHE_MAX_ENTRIES = 65_536
@@ -15543,6 +16231,10 @@ index b844e5e..ead4c3d 100644
 +
 +LOW_QUALITY_SOURCES = {"CAM", "TeleSync", "TeleCine", "SCR"}
 +
++# Trailer, teaser e featurette não são o filme nem o episódio (ex.: "The Odyssey (2026)
++# Official Teaser Trailer 4K.mkv" virava ▶ Assistir antes de o filme sair).
++_EXTRA_VIDEO_RE = re.compile(r"(?<![a-z])(?:trailers?|teasers?|featurettes?)(?![a-z])", re.I)
++
 +
 +def is_cam_release(parsed) -> bool:
 +    if parsed is None:
@@ -15556,7 +16248,7 @@ index b844e5e..ead4c3d 100644
  
  if settings.RTN_FILTER_DEBUG:
  
-@@ -89,6 +195,21 @@ def scrub(t: str):
+@@ -89,6 +199,21 @@ def scrub(t: str):
      return " ".join(normalize_title(t).split())
  
  
@@ -15578,16 +16270,17 @@ index b844e5e..ead4c3d 100644
  class TitleMatcher:
      """Prepared title/year matcher shared by live and persisted torrents."""
  
-@@ -96,6 +217,8 @@ class TitleMatcher:
+@@ -96,6 +221,9 @@ class TitleMatcher:
          "_matches_cache",
          "aliases",
          "aliases_normalized",
 +        "blocked_titles",
 +        "blocked_phrases",
++        "extra_word_in_title",
          "max_year",
          "min_year",
          "title",
-@@ -103,17 +226,46 @@ class TitleMatcher:
+@@ -103,17 +231,46 @@ class TitleMatcher:
          "year_end",
      )
  
@@ -15636,10 +16329,23 @@ index b844e5e..ead4c3d 100644
          )
  
          self.min_year = 0
-@@ -128,9 +280,43 @@ class TitleMatcher:
+@@ -128,9 +285,56 @@ class TitleMatcher:
                  self.min_year = year - 1
                  self.max_year = year + 1
  
++        # Trailer/teaser no nome só vale se a própria obra tem a palavra no título
++        # ("Trailer Park Boys"); senão é vídeo extra, não o filme/episódio.
++        self.extra_word_in_title = any(
++            _EXTRA_VIDEO_RE.search(t or "")
++            for t in (title, *(a for ts in self.aliases.values() for a in ts))
++        )
++
++    def extra_video_blocked(self, torrent_title: str) -> bool:
++        """O nome (do torrent ou do arquivo escolhido no pacote) é de trailer/teaser?"""
++        if self.extra_word_in_title or not torrent_title:
++            return False
++        return bool(_EXTRA_VIDEO_RE.search(torrent_title))
++
 +    def homonym_blocked(self, torrent_title: str) -> bool:
 +        """O nome (do torrent ou do arquivo escolhido no pacote) é da série homônima?
 +        Ano a partir da estreia da outra, título de episódio exclusivo dela, HDR em série antiga."""
@@ -15680,7 +16386,7 @@ index b844e5e..ead4c3d 100644
          return title_match(
              self.title, parsed_title, aliases=self.aliases
          ) or alternate_title_match(torrent_title, self.title, self.aliases)
-@@ -146,7 +332,7 @@ class TitleMatcher:
+@@ -146,7 +350,7 @@ class TitleMatcher:
          self, torrent_title: str, parsed_title: str, parsed_year: int | None
      ) -> bool:
          cache_key = (
@@ -15689,7 +16395,7 @@ index b844e5e..ead4c3d 100644
              parsed_title,
              parsed_year,
          )
-@@ -295,10 +481,19 @@ def _do_parse_and_cache(
+@@ -295,10 +499,19 @@ def _do_parse_and_cache(
  
  
  def filter_worker(
@@ -15711,7 +16417,18 @@ index b844e5e..ead4c3d 100644
      aliases = matcher.aliases
  
      country_aliases = {}
-@@ -355,6 +550,7 @@ def filter_worker(
+@@ -340,6 +553,10 @@ def filter_worker(
+             _log_exclusion(f"🚫 Rejected (Sample/Empty) | {torrent_title}")
+             continue
+ 
++        if matcher.extra_video_blocked(torrent_title):
++            _log_exclusion(f"🎞️ Rejected (Trailer/Teaser) | {torrent_title}")
++            continue
++
+         # temp fix while waiting for RTN to fix their parsing
+         try:
+             parsed = _parse_with_cache(torrent_title)
+@@ -355,6 +572,7 @@ def filter_worker(
                  )
                  parsed.languages.append(language)
  
@@ -16375,6 +17092,420 @@ index 0000000..a2c71e7
 +        return (st - datetime.now(timezone.utc)).total_seconds()
 +    except Exception:
 +        return -1
+diff --git a/comet/services/games.py b/comet/services/games.py
+new file mode 100644
+index 0000000..e188ad2
+--- /dev/null
++++ b/comet/services/games.py
+@@ -0,0 +1,408 @@
++"""🎮 Filmes dos games: as cutscenes de cada jogo montadas como filme, em sagas (uma por franquia).
++
++- Fileira `comet_games` (série): uma "série" por saga (God of War, Kingdom Hearts, The Last of Us...).
++  Cada jogo é um episódio, na ordem da história/lançamento.
++- Os vídeos são do YouTube (compilados "o filme do jogo" feitos por canais de games). Para cada jogo
++  o servidor procura (yt-dlp, `/opt/ytdlp`) uma versão **dublada** e uma **legendada** em PT-BR, com
++  pelo menos 45 min, e guarda a escolha por 14 dias (`data/games.json`).
++- Para tocar: o YouTube não toca no player desta Fire TV, então `/game/play/<id>.m3u8` pede ao yt-dlp o
++  HLS do vídeo (o mesmo do app do YouTube, com áudio e até 1080p, dá para avançar) e o repassa.
++  O link do YouTube vale para o IP de casa: fora de casa (4G) pode não abrir.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import re
++import time
++import unicodedata
++
++import aiohttp
++from fastapi import APIRouter
++from fastapi.responses import Response
++
++from comet.core.logger import log_swallowed, logger
++
++ID_PREFIX = "cometlive:game:"
++ROWS = [{"type": "series", "id": "comet_games", "name": "🎮 Filmes dos games"}]
++router = APIRouter(tags=["Stremio"])
++
++YTDLP = "/opt/ytdlp/bin/yt-dlp"
++STATE_PATH = "/opt/comet/data/games.json"
++_PICK_TTL = 14 * 86400
++_MIN_S = 45 * 60
++_PICK_V = 4  # muda quando a regra de escolha muda (refaz as escolhas guardadas)
++
++# saga: chave, nome, jogos [(nome do jogo, termos obrigatórios, termos proibidos)]
++# termos em minúsculas, sem acento; "ban" separa jogos com o mesmo nome base
++SAGAS: list[dict] = [
++    {"key": "gow", "name": "God of War", "games": [
++        ("God of War (2005)", ["god of war 1"], ["ragnarok", "ascension", "2018", "ii", "iii", " 2", " 3", "ps4", "chains", "ghost"],
++         "God of War 1"),
++        ("God of War II", ["god of war"], ["ragnarok", "ascension", "2018", "iii", " 3", "ps4"]),
++        ("God of War III", ["god of war"], ["ragnarok", "ascension", "2018", "ps4"]),
++        ("God of War: Ascension", ["ascension"], []),
++        ("God of War (2018)", ["god of war"], ["ragnarok", "ascension", "iii", "ii "]),
++        ("God of War Ragnarök", ["ragnarok"], ["valhalla"]),
++    ]},
++    {"key": "kh", "name": "Kingdom Hearts", "games": [
++        ("Kingdom Hearts", ["kingdom hearts"], ["ii", " 2", "iii", " 3", "chain", "days", "birth", "dream", "0.2", "coded", "melody"]),
++        ("Kingdom Hearts: Chain of Memories", ["chain of memories"], []),
++        ("Kingdom Hearts 358/2 Days", ["days"], []),
++        ("Kingdom Hearts II", ["kingdom hearts"], ["iii", " 3", "chain", "days", "birth", "dream", "0.2", "coded"]),
++        ("Kingdom Hearts Birth by Sleep", ["birth by sleep"], ["0.2", "fragmentary"]),
++        ("Kingdom Hearts Dream Drop Distance", ["dream drop"], []),
++        ("Kingdom Hearts 0.2 A Fragmentary Passage", ["fragmentary"], []),
++        ("Kingdom Hearts III", ["kingdom hearts"], ["chain", "days", "birth", "dream", "0.2", "coded", "re mind", "remind"]),
++    ]},
++    {"key": "tlou", "name": "The Last of Us", "games": [
++        ("The Last of Us Part I", ["last of us"], ["part ii", "parte ii", "part 2", "parte 2", "left behind", "serie", "hbo"]),
++        ("The Last of Us: Left Behind", ["left behind"], []),
++        ("The Last of Us Part II", ["last of us"], ["left behind", "serie", "hbo"]),
++    ]},
++    {"key": "uncharted", "name": "Uncharted", "games": [
++        ("Uncharted: Drake's Fortune", ["uncharted"], ["2", "3", "4", "among", "deception", "thief", "legacy", "filme 2022", "tom holland"]),
++        ("Uncharted 2: Among Thieves", ["uncharted"], ["drake's fortune", "deception", "thief's end", "legacy", "tom holland"]),
++        ("Uncharted 3: Drake's Deception", ["uncharted"], ["among", "thief's end", "legacy", "tom holland"]),
++        ("Uncharted 4: A Thief's End", ["uncharted"], ["among", "deception", "legacy", "tom holland"]),
++        ("Uncharted: The Lost Legacy", ["lost legacy"], []),
++    ]},
++    {"key": "ff7", "name": "Final Fantasy VII", "games": [
++        ("Crisis Core: Final Fantasy VII", ["crisis core"], []),
++        ("Final Fantasy VII Remake", ["remake"], ["rebirth", "crisis"]),
++        ("Final Fantasy VII Rebirth", ["rebirth"], []),
++    ]},
++    {"key": "re", "name": "Resident Evil", "games": [
++        ("Resident Evil 2 Remake", ["resident evil 2"], []),
++        ("Resident Evil 3 Remake", ["resident evil 3"], []),
++        ("Resident Evil 4 Remake", ["resident evil 4"], []),
++        ("Resident Evil 7: Biohazard", ["resident evil 7"], []),
++        ("Resident Evil Village", ["village"], []),
++    ]},
++    {"key": "spidey", "name": "Marvel's Spider-Man", "games": [
++        ("Marvel's Spider-Man (2018)", ["spider"], ["miles", " 2", "ii", "aranhaverso", "tom holland"]),
++        ("Marvel's Spider-Man: Miles Morales", ["miles morales"], ["aranhaverso", "spider-verse"]),
++        ("Marvel's Spider-Man 2", ["spider"], ["aranhaverso", "spider-verse", "tom holland", "2018"]),
++    ]},
++    {"key": "rdr", "name": "Red Dead Redemption", "games": [
++        ("Red Dead Redemption", ["red dead"], [" 2", "ii"]),
++        ("Red Dead Redemption 2", ["red dead"], []),
++    ]},
++    {"key": "batman", "name": "Batman Arkham", "games": [
++        ("Batman: Arkham Asylum", ["asylum"], []),
++        ("Batman: Arkham City", ["arkham city"], []),
++        ("Batman: Arkham Origins", ["arkham origins"], []),
++        ("Batman: Arkham Knight", ["arkham knight"], []),
++    ]},
++    {"key": "horizon", "name": "Horizon", "games": [
++        ("Horizon Zero Dawn", ["zero dawn"], []),
++        ("Horizon Forbidden West", ["forbidden west"], []),
++    ]},
++    {"key": "mgs", "name": "Metal Gear Solid", "games": [
++        ("Metal Gear Solid 3: Snake Eater", ["snake eater"], []),
++        ("Metal Gear Solid 4: Guns of the Patriots", ["guns of the patriots"], []),
++        ("Metal Gear Solid V: The Phantom Pain", ["phantom pain"], []),
++    ]},
++    {"key": "jedi", "name": "Star Wars Jedi", "games": [
++        ("Star Wars Jedi: Fallen Order", ["fallen order"], []),
++        ("Star Wars Jedi: Survivor", ["survivor"], []),
++    ]},
++    {"key": "mk", "name": "Mortal Kombat (modo história)", "games": [
++        ("Mortal Kombat X", ["mortal kombat x"], ["xl", "11"]),
++        ("Mortal Kombat 11", ["mortal kombat 11"], []),
++        ("Mortal Kombat 1", ["mortal kombat 1"], ["11", "mortal kombat 1 1"]),
++    ]},
++    {"key": "ghost", "name": "Ghost of Tsushima", "games": [
++        ("Ghost of Tsushima", ["tsushima"], []),
++        ("Ghost of Yōtei", ["yotei"], []),
++    ]},
++    {"key": "ds", "name": "Death Stranding", "games": [
++        ("Death Stranding", ["death stranding"], [" 2", "on the beach"]),
++        ("Death Stranding 2: On the Beach", ["death stranding 2"], []),
++    ]},
++]
++_BY_KEY = {s["key"]: s for s in SAGAS}
++
++_state: dict = {}
++_sem = asyncio.Semaphore(3)
++_hls: dict[str, tuple[float, str]] = {}
++_save_lock = asyncio.Lock()
++
++
++def _norm(s: str) -> str:
++    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
++    return " " + re.sub(r"[^a-z0-9':./ ]+", " ", s).strip() + " "
++
++
++def _load() -> dict:
++    if not _state:
++        try:
++            with open(STATE_PATH, encoding="utf-8") as f:
++                d = json.load(f)
++            if isinstance(d, dict):
++                _state.update(d)
++        except (OSError, ValueError):
++            pass
++    return _state
++
++
++async def _save() -> None:
++    async with _save_lock:
++        try:
++            with open(STATE_PATH + ".tmp", "w", encoding="utf-8") as f:
++                json.dump(_state, f, ensure_ascii=False)
++            os.replace(STATE_PATH + ".tmp", STATE_PATH)
++        except OSError as e:
++            log_swallowed("games._save", e)
++
++
++async def _run(*args: str, timeout: float = 40) -> str:
++    proc = await asyncio.create_subprocess_exec(
++        YTDLP, "--no-warnings", "--ignore-config", *args,
++        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
++    try:
++        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
++    except asyncio.TimeoutError:
++        try:
++            proc.kill()
++        except ProcessLookupError:
++            pass
++        return ""
++    return out.decode("utf-8", "replace")
++
++
++async def _search(query: str) -> list[dict]:
++    async with _sem:
++        out = await _run("--flat-playlist", "--print", "%(id)s\t%(duration)s\t%(title)s", f"ytsearch12:{query}")
++    res = []
++    for line in out.splitlines():
++        parts = line.split("\t", 2)
++        if len(parts) != 3 or not re.fullmatch(r"[A-Za-z0-9_-]{11}", parts[0]):
++            continue
++        try:
++            dur = int(float(parts[1]))
++        except ValueError:
++            continue
++        res.append({"id": parts[0], "dur": dur, "title": parts[2]})
++    return res
++
++
++def _pick(cands: list[dict], must: list[str], ban: list[str], lang: str,
++          used: set | None = None) -> dict | None:
++    good = []
++    for c in cands:
++        if used and c["id"] in used:  # o mesmo vídeo não serve para dois jogos da saga
++            continue
++        if re.search(r"#\s?\d|(epis[oó]dio|ep\.?|part[e]?)\s?\d+\s*/\s*\d+", c["title"], re.I):
++            continue  # pedaço de uma série de vídeos ("#03", "parte 2/5"), não o filme inteiro
++        t = _norm(c["title"])
++        if c["dur"] < _MIN_S or c["dur"] > 20 * 3600:
++            continue
++        if not all(_norm(m).strip() in t for m in must):
++            continue
++        if any(b in t for b in ban):
++            continue
++        is_sub = any(w in t for w in ("legendad", "legenda", "subtitle", " sub "))
++        if lang == "dub" and ("dublad" not in t or is_sub):
++            continue
++        if lang == "leg" and not is_sub:
++            continue
++        good.append(c)
++    return good[0] if good else None
++
++
++async def _game_pick(saga: str, idx: int) -> dict:
++    """{"dub": {...}|None, "leg": {...}|None} para o jogo (cache de 14 dias)."""
++    st = _load()
++    key = f"{saga}:{idx}"
++    hit = st.get(key)
++    if hit and time.time() - hit.get("ts", 0) < _PICK_TTL and hit.get("v") == _PICK_V:
++        return hit
++    game = _BY_KEY[saga]["games"][idx]
++    name, must, ban = game[:3]
++    base = game[3] if len(game) > 3 else re.sub(r"[():]", " ", name)
++    used = {c["id"] for k, v in st.items() if k.startswith(saga + ":") and k != key
++            and isinstance(v, dict) and v.get("v") == _PICK_V
++            for c in (v.get("dub"), v.get("leg")) if c}
++    dub = _pick(await _search(f"{base} filme completo dublado"), must, ban, "dub", used)
++    leg = _pick(await _search(f"{base} filme completo legendado pt-br"), must, ban, "leg", used)
++    if leg and dub and leg["id"] == dub["id"]:
++        leg = None
++    if not dub and not leg:  # sem PT: o filme original (com legendas do YouTube se houver)
++        leg = _pick(await _search(f"{base} all cutscenes full movie"), must, ban, "any", used)
++    got = {"ts": time.time(), "dub": dub, "leg": leg, "v": _PICK_V}
++    st[key] = got
++    await _save()
++    logger.info(f"🎮 {name}: dublado={'sim' if dub else 'não'} legendado={'sim' if leg else 'não'}")
++    return got
++
++
++def _thumb(vid: str) -> str:
++    return f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
++
++
++def _first_vid(saga: str) -> str | None:
++    st = _load()
++    for i in range(len(_BY_KEY[saga]["games"])):
++        p = st.get(f"{saga}:{i}") or {}
++        v = (p.get("dub") or p.get("leg") or {}).get("id")
++        if v:
++            return v
++    return None
++
++
++# ───────────────────────── protocolo das fileiras extras ─────────────────────────
++
++def row_visible(catalog_id: str) -> bool:
++    return os.path.exists(YTDLP)
++
++
++async def catalog_items(catalog_id: str, base_url: str) -> list[dict]:
++    if catalog_id != "comet_games":
++        return []
++    global _WARMED
++    if not _WARMED:  # escolhe os vídeos de todos os jogos em 2º plano (~2 min, 3 buscas por vez)
++        _WARMED = True
++
++        async def _warm_all():
++            for s in SAGAS:  # um jogo por vez dentro da saga: assim nenhum vídeo se repete
++                for i in range(len(s["games"])):
++                    try:
++                        await _game_pick(s["key"], i)
++                    except Exception as e:
++                        log_swallowed("games._warm_all", e)
++        task = asyncio.create_task(_warm_all())
++        _TASKS.add(task)
++        task.add_done_callback(_TASKS.discard)
++    out = []
++    for s in SAGAS:
++        vid = _first_vid(s["key"])
++        if not vid:  # 1ª vez: escolhe o 1º jogo da saga para ter capa (em 2º plano)
++            task = asyncio.create_task(_game_pick(s["key"], 0))
++            _TASKS.add(task)
++            task.add_done_callback(_TASKS.discard)
++        from urllib.parse import quote
++        from comet.core.models import settings
++        pub = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++        art = _thumb(vid) if vid else f"{pub}/art/radio.png?n=" + quote(s["name"])
++        out.append({"id": ID_PREFIX + s["key"], "type": "series", "name": f"Saga {s['name']}",
++                    "poster": art, "posterShape": "landscape", "background": art,
++                    "description": f"{len(s['games'])} jogos contados como filme (cutscenes), dublados ou legendados.",
++                    "genres": ["Games"]})
++    return out
++
++
++def _split(media_id: str) -> tuple[str | None, int | None]:
++    rest = media_id[len(ID_PREFIX):]
++    saga, _, n = rest.partition(":")
++    if saga not in _BY_KEY:
++        return None, None
++    try:
++        idx = int(n) if n else None
++    except ValueError:
++        idx = None
++    if idx is not None and not 0 <= idx < len(_BY_KEY[saga]["games"]):
++        idx = None
++    return saga, idx
++
++
++async def get_meta(media_id: str, base_url: str) -> dict | None:
++    saga, _ = _split(media_id)
++    if not saga:
++        return None
++    s = _BY_KEY[saga]
++    # 1ª abertura: cada jogo leva ~5 s para achar; o que não ficar pronto em 15 s continua em
++    # 2º plano (fica guardado) e aparece na próxima abertura
++    tasks = [asyncio.ensure_future(_game_pick(saga, i)) for i in range(len(s["games"]))]
++    for t in tasks:
++        _TASKS.add(t)
++        t.add_done_callback(_TASKS.discard)
++    await asyncio.wait(tasks, timeout=15)
++    picks = [t.result() if t.done() and not t.exception() else {} for t in tasks]
++    videos = []
++    for i, (game, p) in enumerate(zip(s["games"], picks)):
++        p = p if isinstance(p, dict) else {}
++        best = p.get("dub") or p.get("leg")
++        langs = " · ".join(x for x, k in (("Dublado", "dub"), ("Legendado", "leg")) if p.get(k))
++        videos.append({"id": f"{ID_PREFIX}{saga}:{i}", "title": game[0], "season": 1, "episode": i + 1,
++                       "thumbnail": _thumb(best["id"]) if best else None,
++                       "overview": (f"{langs} · {best['dur'] // 60} min · {best['title']}" if best
++                                    else "Procurando o filme deste jogo... abra de novo em 1 minuto."
++                                    if not p else "Ainda não achei este filme em português.")})
++    vid = _first_vid(saga)
++    art = _thumb(vid) if vid else None
++    return {"id": ID_PREFIX + saga, "type": "series", "name": f"Saga {s['name']}", "poster": art,
++            "posterShape": "landscape", "background": art,
++            "description": "As cutscenes de cada jogo montadas como filme, na ordem da saga. "
++                           "Vídeos do YouTube; dublado quando existe, senão legendado.",
++            "genres": ["Games"], "videos": videos}
++
++
++async def get_streams(media_id: str, base_url: str) -> list[dict]:
++    saga, idx = _split(media_id)
++    if saga is None or idx is None:
++        return []
++    p = await _game_pick(saga, idx)
++    out = []
++    for k, label in (("dub", "🎮 Dublado"), ("leg", "🎮 Legendado")):
++        c = p.get(k)
++        if c:
++            out.append({"name": label, "title": f"{c['title']}\n⏱️ {c['dur'] // 60} min · YouTube",
++                        "url": f"{base_url}/game/play/{c['id']}.m3u8",
++                        "behaviorHints": {"notWebReady": False}})
++    return out
++
++
++# ───────────────────────── tocar: HLS do YouTube ─────────────────────────
++
++async def _manifest(vid: str) -> str | None:
++    hit = _hls.get(vid)
++    if hit and time.time() - hit[0] < 3 * 3600:
++        return hit[1]
++    async with _sem:
++        url = (await _run("-f", "bv*[protocol^=m3u8]/b[protocol^=m3u8]", "--print", "manifest_url",
++                          f"https://www.youtube.com/watch?v={vid}", timeout=60)).strip().splitlines()
++    url = next((u for u in url if u.startswith("https://")), None)
++    if url:
++        _hls[vid] = (time.time(), url)
++        if len(_hls) > 200:
++            for k in sorted(_hls, key=lambda k: _hls[k][0])[:50]:
++                _hls.pop(k, None)
++    return url
++
++
++async def _play(vid: str):
++    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", vid or ""):
++        return Response("id inválido", status_code=404)
++    url = await _manifest(vid)
++    if not url:
++        logger.warning(f"🎮 YouTube {vid}: sem HLS")
++        return Response("indisponível", status_code=404)
++    try:
++        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
++            async with s.get(url) as r:
++                body = await r.read()
++                if r.status != 200:
++                    _hls.pop(vid, None)
++                    return Response("indisponível", status_code=502)
++    except Exception as e:
++        logger.warning(f"🎮 YouTube {vid}: manifesto falhou: {type(e).__name__}")
++        return Response("indisponível", status_code=502)
++    logger.info(f"🎮 tocando filme de game (YouTube {vid})")
++    return Response(body, media_type="application/vnd.apple.mpegurl",
++                    headers={"Cache-Control": "no-cache"})
++
++
++@router.get("/game/play/{vid}.m3u8")
++async def game_play(vid: str):
++    return await _play(vid)
++
++
++@router.get("/{b64config}/game/play/{vid}.m3u8")
++async def game_play_tok(b64config: str, vid: str):
++    return await _play(vid)
++
++
++_TASKS: set = set()
++_WARMED = False
 diff --git a/comet/services/guardian.py b/comet/services/guardian.py
 new file mode 100644
 index 0000000..a7ec0a7
@@ -22468,10 +23599,10 @@ index 0000000..aac7869
 +        await asyncio.sleep(1800)
 diff --git a/comet/services/nightly.py b/comet/services/nightly.py
 new file mode 100644
-index 0000000..87d2952
+index 0000000..a0a948e
 --- /dev/null
 +++ b/comet/services/nightly.py
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,729 @@
 +from __future__ import annotations
 +
 +import asyncio
@@ -22562,7 +23693,7 @@ index 0000000..87d2952
 +    return "🇧🇷" in text and "⚡" in text
 +
 +
-+async def _build_work_list(session: aiohttp.ClientSession) -> list[dict[str, Any]]:
++async def _build_work_list(session: aiohttp.ClientSession, history_only: bool = False) -> list[dict[str, Any]]:
 +    max_items = getattr(settings, "NIGHTLY_MAX_ITEMS", 120) or 120
 +    candidates: list[dict[str, Any]] = []
 +    seen_media_ids: set[str] = set()
@@ -22693,6 +23824,9 @@ index 0000000..87d2952
 +                        })
 +        except Exception as exc:
 +            logger.warning(f"🌙 Erro ao carregar histórico Stremio: {exc}")
++
++    if history_only:  # rodada do fim da tarde: só o próximo episódio das séries em andamento
++        return candidates[:max_items]
 +
 +    # b. Top 10 de hoje: os 10 filmes e o S1E1 das 5 primeiras séries
 +    try:
@@ -22858,7 +23992,7 @@ index 0000000..87d2952
 +    return candidates[:max_items]
 +
 +
-+async def run_nightly_cycle() -> dict[str, Any]:
++async def run_nightly_cycle(history_only: bool = False) -> dict[str, Any]:
 +    global _is_running
 +    if _is_running:
 +        return {"started": False, "status": "already running"}
@@ -22882,9 +24016,9 @@ index 0000000..87d2952
 +
 +        try:
 +            async with aiohttp.ClientSession(timeout=timeout) as session:
-+                work_list = await _build_work_list(session)
++                work_list = await _build_work_list(session, history_only)
 +                total_items = len(work_list)
-+                logger.info(f"🌙 Iniciando rodada da madrugada com {total_items} itens")
++                logger.info(f"{'🌆 Iniciando rodada do fim da tarde' if history_only else '🌙 Iniciando rodada da madrugada'} com {total_items} itens")
 +
 +                for idx, item in enumerate(work_list):
 +                    mem_avail = _get_mem_available_mb()
@@ -22972,7 +24106,7 @@ index 0000000..87d2952
 +                                body = f"{item['name']} T{item['season']}E{item['episode']}"
 +                                try:
 +                                    from comet.services.telegram_bot import send_telegram
-+                                    if await send_telegram(f"🇧🇷 Episódio dublado chegou: {body}\nJá dá pra assistir no Stremio."):
++                                    if await send_telegram(f"🇧🇷 Episódio dublado chegou: {body}\nJá dá pra assistir no Nuvio."):
 +                                        logger.info(f"📢 Aviso dublado enviado (Telegram): {body}")
 +                                except Exception as tg_err:
 +                                    logger.warning(f"Erro ao enviar Telegram: {tg_err}")
@@ -23033,6 +24167,8 @@ index 0000000..87d2952
 +
 +            # Notas/Oscar (OMDb): aquece as fileiras de prestígio e as principais, dentro do orçamento diário
 +            try:
++                if history_only:
++                    raise _SkipOmdb()
 +                from comet.services.omdb import warm as omdb_warm
 +                omdb_ids: list[str] = []
 +                for _t, _cid in (("movie", "comet_mood_oscar"), ("movie", "comet_mood_top"), ("movie", "comet_mood_classicdub"),
@@ -23048,12 +24184,20 @@ index 0000000..87d2952
 +                            omdb_ids.append(_i)
 +                n_omdb = await omdb_warm(omdb_ids, limit=300)
 +                logger.info(f"🌙 madrugada: notas OMDb aquecidas para {n_omdb} títulos")
++            except _SkipOmdb:
++                pass
 +            except Exception as omdb_err:
 +                logger.warning(f"🌙 madrugada: OMDb falhou: {type(omdb_err).__name__}")
 +
 +        finally:
 +            elapsed = time.time() - t0
 +            _is_running = False
++
++            if history_only:
++                logger.info(f"🌆 fim da tarde: {items_processed} episódios aquecidos, "
++                            f"{dub_ready_count} dublados prontos, {notified_count} avisos em {elapsed:.1f}s")
++                return {"started": True, "items": items_processed, "dub_ready": dub_ready_count,
++                        "notified": notified_count, "duration": elapsed}
 +
 +            try:
 +                _CATALOG_CACHE.clear()
@@ -23091,6 +24235,30 @@ index 0000000..87d2952
 +            }
 +
 +
++class _SkipOmdb(Exception):
++    pass
++
++
++async def _evening_loop():
++    """2ª rodada, às 17:30 (EVENING_WARM_HOUR/MINUTE): só o próximo episódio das séries em andamento,
++    para o play da noite já sair do cache (e o aviso de dublado chegar antes da hora de ver)."""
++    try:
++        while True:
++            now = datetime.datetime.now().astimezone()
++            target = now.replace(hour=int(getattr(settings, "EVENING_WARM_HOUR", 17) or 17),
++                                 minute=int(getattr(settings, "EVENING_WARM_MINUTE", 30) or 0),
++                                 second=0, microsecond=0)
++            if target <= now:
++                target += datetime.timedelta(days=1)
++            await asyncio.sleep((target - now).total_seconds())
++            if not is_nightly_running():
++                await run_nightly_cycle(history_only=True)
++    except asyncio.CancelledError:
++        pass
++    except Exception as exc:
++        logger.warning(f"🌆 Rodada do fim da tarde finalizada com erro: {exc}")
++
++
 +async def _startup_catchup_check():
 +    try:
 +        delay_s = float(os.getenv("NIGHTLY_STARTUP_DELAY", "1200"))
@@ -23122,6 +24290,9 @@ index 0000000..87d2952
 +        catchup_task = asyncio.create_task(_startup_catchup_check())
 +        _tasks.add(catchup_task)
 +        catchup_task.add_done_callback(_tasks.discard)
++        evening_task = asyncio.create_task(_evening_loop())
++        _tasks.add(evening_task)
++        evening_task.add_done_callback(_tasks.discard)
 +
 +        while True:
 +            now = datetime.datetime.now().astimezone()
@@ -23161,6 +24332,228 @@ index 0000000..87d2952
 +    _tasks.add(task)
 +    task.add_done_callback(_tasks.discard)
 +    return JSONResponse(content={"started": True}, status_code=200)
+diff --git a/comet/services/official_top10.py b/comet/services/official_top10.py
+new file mode 100644
+index 0000000..ac2aa7a
+--- /dev/null
++++ b/comet/services/official_top10.py
+@@ -0,0 +1,216 @@
++"""Top 10 oficial dos streamings, quando o serviço publica o dele.
++
++- **Netflix:** a própria Netflix publica o Top 10 de cada país, toda terça-feira, com a semana
++  de domingo a domingo (https://www.netflix.com/tudum/top10). O arquivo oficial
++  `all-weeks-countries.tsv` (~33 MB, todos os países e semanas) é baixado no máximo a cada 12 h;
++  só a semana mais recente do Brasil é guardada.
++- Os outros (Prime Video, Disney+, HBO Max, Apple TV+, Paramount+, Globoplay...) não publicam o
++  Top 10; para eles a fileira continua com o que está em alta no TMDB para aquele serviço.
++
++`official_results(svc, media_type, tmdb)` devolve os itens no formato dos resultados do TMDB
++(id, name/title, poster_path, backdrop_path...), na ordem do ranking.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import time
++
++import aiohttp
++
++from comet.core.logger import log_swallowed, logger
++
++NETFLIX_TSV = "https://www.netflix.com/tudum/top10/data/all-weeks-countries.tsv"
++STATE_PATH = "/opt/comet/data/official_top10.json"
++COUNTRY = "BR"
++REFRESH_S = 12 * 3600
++RETRY_S = 30 * 60
++
++_STATE: dict = {}
++_LOCK = asyncio.Lock()
++_LAST_TRY = 0.0
++
++
++def _load() -> dict:
++    if not _STATE:
++        try:
++            with open(STATE_PATH, encoding="utf-8") as f:
++                data = json.load(f)
++            if isinstance(data, dict):
++                _STATE.update(data)
++        except (OSError, ValueError):
++            pass
++    return _STATE
++
++
++def _save() -> None:
++    try:
++        with open(STATE_PATH + ".tmp", "w", encoding="utf-8") as f:
++            json.dump(_STATE, f, ensure_ascii=False)
++        os.replace(STATE_PATH + ".tmp", STATE_PATH)
++    except OSError as e:
++        log_swallowed("official_top10._save", e)
++
++
++async def _download_netflix() -> tuple[str, dict[str, list[str]]] | None:
++    """(semana, {"movie": [títulos], "series": [títulos]}) do Brasil, na ordem do ranking."""
++    tmp = STATE_PATH + ".tsv"
++    timeout = aiohttp.ClientTimeout(total=900, sock_read=120)
++    async with aiohttp.ClientSession(timeout=timeout) as session:
++        async with session.get(NETFLIX_TSV, headers={"User-Agent": "Mozilla/5.0"}) as resp:
++            if resp.status != 200:
++                logger.warning(f"Top 10 Netflix: HTTP {resp.status}")
++                return None
++            with open(tmp, "wb") as f:
++                async for chunk in resp.content.iter_chunked(1 << 20):
++                    f.write(chunk)
++
++    def _parse() -> tuple[list[str] | None, list[list[str]]]:
++        hdr, got = None, []
++        try:
++            with open(tmp, encoding="utf-8", errors="replace") as f:
++                for line in f:
++                    line = line.rstrip("\r\n")
++                    if hdr is None:
++                        hdr = line.split("\t")
++                    elif f"\t{COUNTRY}\t" in line:
++                        got.append(line.split("\t"))
++        finally:
++            try:
++                os.unlink(tmp)
++            except OSError:
++                pass
++        return hdr, got
++
++    header, rows = await asyncio.to_thread(_parse)
++    if not header or not rows:
++        return None
++    ix = {k: i for i, k in enumerate(header)}
++    week = max(r[ix["week"]] for r in rows)
++    out: dict[str, list[tuple[int, str]]] = {"movie": [], "series": []}
++    for r in rows:
++        if r[ix["week"]] != week:
++            continue
++        kind = "movie" if r[ix["category"]].startswith("Film") else "series"
++        out[kind].append((int(r[ix["weekly_rank"]]), r[ix["show_title"]]))
++    ranked: dict[str, list[str]] = {}
++    for kind, lst in out.items():
++        names: list[str] = []
++        for _rank, title in sorted(lst):
++            if title not in names:  # temporadas da mesma série: fica a melhor posição
++                names.append(title)
++        ranked[kind] = names
++    return week, ranked
++
++
++def _norm(s: str) -> str:
++    return "".join(ch for ch in (s or "").casefold() if ch.isalnum())
++
++
++async def _match(tmdb, kind: str, title: str) -> dict | None:
++    """Resultado do TMDB (em pt-BR) para o título em inglês da Netflix."""
++    path = "tv" if kind == "series" else "movie"
++    from urllib.parse import quote
++    data = await tmdb._get_json(f"search/{path}?query={quote(title)}&language=en-US&page=1",
++                                f"top10 netflix {title}")
++    results = [r for r in (data or {}).get("results") or [] if isinstance(r, dict) and r.get("id")]
++    if not results:
++        return None
++    key = _norm(title)
++    names = ("name", "original_name") if kind == "series" else ("title", "original_title")
++    exact = [r for r in results if any(_norm(r.get(n) or "") == key for n in names)]
++    pool = sorted(exact or results[:3], key=lambda r: -(r.get("popularity") or 0))[:6]
++    best = pool[0]
++    if len(pool) > 1:
++        # homônimos ("The One", "Heist"): fica o que está na Netflix do Brasil
++        for r in pool:
++            wp = await tmdb._get_json(f"{path}/{r['id']}/watch/providers", f"top10 netflix wp {r['id']}")
++            br = ((wp or {}).get("results") or {}).get(COUNTRY) or {}
++            if any(p.get("provider_id") == 8 for p in br.get("flatrate") or []):
++                best = r
++                break
++    det = await tmdb._get_json(f"{path}/{best['id']}?language=pt-BR", f"top10 netflix det {best['id']}")
++    if not isinstance(det, dict) or not det.get("id"):
++        return best
++    keep = ("id", "name", "original_name", "title", "original_title", "poster_path", "backdrop_path",
++            "overview", "vote_average", "vote_count", "popularity", "first_air_date", "release_date",
++            "original_language", "genre_ids")
++    det["genre_ids"] = [g.get("id") for g in det.get("genres") or [] if isinstance(g, dict)]
++    return {k: det.get(k) for k in keep if det.get(k) is not None}
++
++
++async def refresh_netflix(tmdb=None, force: bool = False) -> bool:
++    global _LAST_TRY
++    st = _load()
++    cur = st.get("netflix") or {}
++    now = time.time()
++    if not force and (now - cur.get("fetched", 0) < REFRESH_S or now - _LAST_TRY < RETRY_S):
++        return bool(cur)
++    async with _LOCK:
++        cur = st.get("netflix") or {}
++        if not force and now - cur.get("fetched", 0) < REFRESH_S:
++            return True
++        _LAST_TRY = time.time()
++        try:
++            got = await _download_netflix()
++        except Exception as e:
++            logger.warning(f"Top 10 Netflix: download falhou: {type(e).__name__}: {e}")
++            return bool(cur)
++        if not got:
++            return bool(cur)
++        week, ranked = got
++        own_session = None
++        if tmdb is None:
++            from comet.metadata.tmdb import TMDBApi
++            own_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
++            tmdb = TMDBApi(own_session)
++        try:
++            cache = cur.get("match") or {}
++            items: dict[str, list[dict]] = {}
++            for kind, titles in ranked.items():
++                lst = []
++                for t in titles[:10]:
++                    ck = f"{kind}:{t}"
++                    m = cache.get(ck)
++                    if not m:
++                        m = await _match(tmdb, kind, t)
++                        if m:
++                            cache[ck] = m
++                    if m:
++                        lst.append(m)
++                items[kind] = lst
++        finally:
++            if own_session is not None:
++                await own_session.close()
++        # o cache de títulos fica só com os da semana atual e das recentes (no máximo 200)
++        if len(cache) > 200:
++            cache = dict(list(cache.items())[-200:])
++        st["netflix"] = {"week": week, "fetched": time.time(), "titles": ranked,
++                         "movie": items.get("movie") or [], "series": items.get("series") or [],
++                         "match": cache}
++        _save()
++        logger.info(f"🔟 Top 10 oficial Netflix (semana {week}): "
++                    f"{len(items.get('movie') or [])} filmes, {len(items.get('series') or [])} séries")
++        return True
++
++
++async def official_results(svc: str, media_type: str, tmdb=None) -> list[dict]:
++    """Ranking oficial (formato TMDB) ou [] quando o serviço não publica o Top 10."""
++    if svc != "netflix":
++        return []
++    st = _load()
++    cur = st.get("netflix") or {}
++    if time.time() - cur.get("fetched", 0) >= REFRESH_S:
++        # atualiza em 2º plano: o pedido do catálogo não espera o download de 33 MB
++        task = asyncio.create_task(refresh_netflix())
++        _TASKS.add(task)
++        task.add_done_callback(_TASKS.discard)
++    return list(cur.get(media_type) or [])
++
++
++def week_of(svc: str) -> str | None:
++    return ((_load().get(svc) or {}).get("week")) if svc == "netflix" else None
++
++
++_TASKS: set = set()
 diff --git a/comet/services/omdb.py b/comet/services/omdb.py
 new file mode 100644
 index 0000000..8d81cdd
@@ -23371,7 +24764,7 @@ index 0000000..8d81cdd
 +        await asyncio.sleep(0.3)
 +    return done
 diff --git a/comet/services/orchestration.py b/comet/services/orchestration.py
-index aa43646..7ffa273 100644
+index aa43646..6bcfebc 100644
 --- a/comet/services/orchestration.py
 +++ b/comet/services/orchestration.py
 @@ -1,5 +1,9 @@
@@ -23554,7 +24947,7 @@ index aa43646..7ffa273 100644
                  "fileIndex": torrent["fileIndex"],
                  "title": torrent["title"],
                  "seeders": torrent["seeders"],
-@@ -180,6 +272,130 @@ class TorrentManager:
+@@ -180,6 +272,140 @@ class TorrentManager:
                  "parsed": torrent["parsed"],
                  "updatedAt": self.live_result_timestamp,
              }
@@ -23586,15 +24979,19 @@ index aa43646..7ffa273 100644
 +        """Depois da consulta ao debrid, `title` é o nome do ARQUIVO escolhido dentro do
 +        pacote. Um pacote sem ano no nome ("Doctor Who S01 1080p") pode trazer o arquivo
 +        "Doctor.Who.2023.S01E05": aqui ele sai da lista da série homônima."""
-+        if not self.title_matcher.blocked_phrases:
-+            return 0
-+        bad = [
-+            info_hash
-+            for info_hash, torrent in self.torrents.items()
-+            if self.title_matcher.homonym_blocked(torrent.get("title") or "")
-+        ]
++        # Também tira o arquivo de trailer/teaser: vale para o que já estava no cache
++        # antes do filtro de trailer do filter_worker.
++        tm = self.title_matcher
++        bad, extras = [], []
++        for info_hash, torrent in self.torrents.items():
++            name = torrent.get("title") or ""
++            if tm.blocked_phrases and tm.homonym_blocked(name):
++                bad.append(info_hash)
++            elif tm.extra_video_blocked(name):
++                extras.append(info_hash)
 +        names = [str(self.torrents[h].get("title") or "")[:70] for h in bad[:4]]
-+        for info_hash in bad:
++        extra_names = [str(self.torrents[h].get("title") or "")[:70] for h in extras[:4]]
++        for info_hash in bad + extras:
 +            del self.torrents[info_hash]
 +        if bad:
 +            logger.log(
@@ -23602,7 +24999,13 @@ index aa43646..7ffa273 100644
 +                f"🧬 Homônimos: {len(bad)} arquivos de outra série com o mesmo nome "
 +                f"removidos ({self.media_id}): {' | '.join(names)}",
 +            )
-+        return len(bad)
++        if extras:
++            logger.log(
++                "FILTER",
++                f"🎞️ Trailers: {len(extras)} arquivos de trailer/teaser removidos "
++                f"({self.media_id}): {' | '.join(extra_names)}",
++            )
++        return len(bad) + len(extras)
 +
 +    def _has_enough_for_answer(self) -> bool:
 +        """Já dá para responder? Precisa de ao menos um resultado em português, para o
@@ -23685,7 +25088,7 @@ index aa43646..7ffa273 100644
  
      async def _fetch_cached_rows(self, media_id: str):
          where_clause, params = build_torrent_cache_where(
-@@ -204,7 +420,18 @@ class TorrentManager:
+@@ -204,7 +430,18 @@ class TorrentManager:
          )
          for cache_media_id, cache_rows in zip(self.cache_media_ids, cache_row_groups):
              if cache_rows and cache_media_id == self.media_only_id:
@@ -23705,7 +25108,7 @@ index aa43646..7ffa273 100644
              rows.extend(cache_rows)
  
          if rows:
-@@ -244,8 +471,14 @@ class TorrentManager:
+@@ -244,8 +481,14 @@ class TorrentManager:
                      f"Skipping torrent cache row with invalid parsed data: {row['info_hash']}"
                  )
                  continue
@@ -23720,7 +25123,7 @@ index aa43646..7ffa273 100644
              target_season = self.search_season
              if (
                  target_season is not None
-@@ -286,11 +519,27 @@ class TorrentManager:
+@@ -286,11 +529,27 @@ class TorrentManager:
          parsed_episodes = parsed.episodes or [None]
  
          if self.reject_unknown_episode_files and self.search_episode is not None:
@@ -23753,7 +25156,7 @@ index aa43646..7ffa273 100644
  
          episode = None if len(parsed_episodes) > 1 else parsed_episodes[0]
          info_hash = torrent["infoHash"]
-@@ -383,6 +632,7 @@ class TorrentManager:
+@@ -383,6 +642,7 @@ class TorrentManager:
                  self.media_type,
                  self.aliases,
                  self.remove_adult_content,
@@ -23761,6 +25164,346 @@ index aa43646..7ffa273 100644
              )
              for i in range(0, len(new_torrents), chunk_size)
          ]
+diff --git a/comet/services/podcasts.py b/comet/services/podcasts.py
+new file mode 100644
+index 0000000..e4f2d6a
+--- /dev/null
++++ b/comet/services/podcasts.py
+@@ -0,0 +1,334 @@
++"""🎙️ Podcasts: os mais ouvidos do Brasil (Apple Podcasts), episódios tocando como a rádio.
++
++- Fileira `comet_podcasts` (série): o ranking de podcasts do Brasil da Apple
++  (rss.applemarketingtools.com, sem chave), atualizado a cada 6 h. Filtro por gênero.
++- Cada podcast é uma "série" (`cometlive:pod:<id da Apple>`): os episódios vêm do RSS do próprio
++  podcast (endereço via itunes.apple.com/lookup), os mais novos primeiro, numa temporada só.
++- Episódio (`cometlive:pod:<id>:<hash do guid>`): a 1ª fonte é vídeo (capa parada + áudio,
++  ffmpeg no A71, como a rádio), porque o player do Nuvio espera um quadro de vídeo; a 2ª é o
++  áudio direto. O vídeo é ao vivo (sem avançar/voltar); para pular trechos, use a 2ª fonte.
++"""
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import html
++import os
++import re
++import time
++import xml.etree.ElementTree as ET
++
++import aiohttp
++from fastapi import APIRouter, Request
++
++from comet.core.logger import log_swallowed, logger
++
++ID_PREFIX = "cometlive:pod:"
++ROWS = [{"type": "series", "id": "comet_podcasts", "name": "🎙️ Podcasts mais ouvidos"}]
++router = APIRouter(tags=["Stremio"])
++
++_CHART = "https://rss.applemarketingtools.com/api/v2/br/podcasts/top/{n}/podcasts.json"
++_LOOKUP = "https://itunes.apple.com/lookup?id={pid}&entity=podcast&country=BR"
++_UA = {"User-Agent": "Mozilla/5.0 (NuvioComet podcasts)"}
++_CHART_TTL = 6 * 3600
++_FEED_TTL = 2 * 3600
++_MAX_EPISODES = 120
++
++_chart: dict = {"ts": 0.0, "items": []}
++_feeds: dict[str, tuple[float, dict]] = {}
++_feed_urls: dict[str, str] = {}
++_lock = asyncio.Lock()
++_ITUNES = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
++
++
++def _art(url: str, size: int = 600) -> str:
++    return re.sub(r"/\d+x\d+(bb)?\.(jpg|png|webp)$", f"/{size}x{size}bb.jpg", url or "")
++
++
++async def _get(session: aiohttp.ClientSession, url: str, as_json: bool = True):
++    async with session.get(url, headers=_UA, allow_redirects=True) as r:
++        if r.status != 200:
++            return None
++        return await (r.json(content_type=None) if as_json else r.read())
++
++
++async def _load_chart() -> list[dict]:
++    if _chart["items"] and time.time() - _chart["ts"] < _CHART_TTL:
++        return _chart["items"]
++    async with _lock:
++        if _chart["items"] and time.time() - _chart["ts"] < _CHART_TTL:
++            return _chart["items"]
++        try:
++            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
++                data = await _get(s, _CHART.format(n=100))
++            items = []
++            for r in ((data or {}).get("feed") or {}).get("results") or []:
++                if not r.get("id"):
++                    continue
++                items.append({"id": str(r["id"]), "name": r.get("name") or "",
++                              "author": r.get("artistName") or "",
++                              "art": _art(r.get("artworkUrl100") or ""),
++                              "genres": [g.get("name") for g in r.get("genres") or []
++                                         if g.get("name") and g.get("name") != "Podcasts"]})
++            if items:
++                _chart.update(ts=time.time(), items=items)
++                logger.info(f"🎙️ podcasts: {len(items)} no ranking do Brasil")
++        except Exception as e:
++            logger.warning(f"🎙️ podcasts: ranking falhou: {type(e).__name__}: {e}")
++            _chart["ts"] = time.time() - _CHART_TTL + 600  # tenta de novo em 10 min
++    return _chart["items"]
++
++
++def genres() -> list[str]:
++    seen: list[str] = []
++    for it in _chart["items"]:
++        for g in it["genres"]:
++            if g not in seen:
++                seen.append(g)
++    return seen
++
++
++def _gh(guid: str) -> str:
++    return hashlib.sha1(guid.encode("utf-8", "replace")).hexdigest()[:12]
++
++
++def _text(el, tag: str) -> str:
++    x = el.find(tag)
++    return (x.text or "").strip() if x is not None and x.text else ""
++
++
++def _clean(desc: str) -> str:
++    desc = re.sub(r"<[^>]+>", " ", desc or "")
++    return re.sub(r"\s+", " ", html.unescape(desc)).strip()[:600]
++
++
++def _dur(v: str) -> int:
++    """itunes:duration (segundos ou HH:MM:SS) em minutos."""
++    try:
++        parts = [int(p) for p in (v or "").split(":") if p.strip() != ""]
++    except ValueError:
++        return 0
++    sec = 0
++    for p in parts:
++        sec = sec * 60 + p
++    return sec // 60 if len(parts) > 1 or sec > 300 else sec
++
++
++def _parse_feed(raw: bytes, pid: str, fallback: dict) -> dict:
++    root = ET.fromstring(raw)
++    ch = root.find("channel")
++    if ch is None:
++        raise ValueError("RSS sem channel")
++    img = ch.find(f"{_ITUNES}image")
++    art = (img.get("href") if img is not None else "") or _text(ch, "image/url") or fallback.get("art", "")
++    eps = []
++    for it in ch.findall("item")[:_MAX_EPISODES]:
++        enc = it.find("enclosure")
++        url = enc.get("url") if enc is not None else ""
++        if not url:
++            continue
++        guid = _text(it, "guid") or url
++        eimg = it.find(f"{_ITUNES}image")
++        eps.append({"gh": _gh(guid), "title": _text(it, "title") or "Episódio", "url": url,
++                    "date": _text(it, "pubDate"), "desc": _clean(_text(it, "description")),
++                    "min": _dur(_text(it, f"{_ITUNES}duration")),
++                    "art": (eimg.get("href") if eimg is not None else "") or art})
++    return {"id": pid, "name": _text(ch, "title") or fallback.get("name", ""),
++            "author": _text(ch, f"{_ITUNES}author") or fallback.get("author", ""),
++            "desc": _clean(_text(ch, "description")), "art": art, "episodes": eps}
++
++
++async def _feed(pid: str) -> dict | None:
++    hit = _feeds.get(pid)
++    if hit and time.time() - hit[0] < _FEED_TTL:
++        return hit[1]
++    chart = {it["id"]: it for it in await _load_chart()}
++    try:
++        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
++            url = _feed_urls.get(pid)
++            if not url:
++                data = await _get(s, _LOOKUP.format(pid=pid))
++                res = (data or {}).get("results") or []
++                url = res[0].get("feedUrl") if res else None
++                if not url:
++                    return hit[1] if hit else None
++                _feed_urls[pid] = url
++            raw = await _get(s, url, as_json=False)
++        if not raw:
++            return hit[1] if hit else None
++        feed = await asyncio.to_thread(_parse_feed, raw, pid, chart.get(pid) or {})
++        _feeds[pid] = (time.time(), feed)
++        if len(_feeds) > 60:
++            for k in sorted(_feeds, key=lambda k: _feeds[k][0])[:20]:
++                _feeds.pop(k, None)
++        return feed
++    except Exception as e:
++        logger.warning(f"🎙️ podcast {pid}: RSS falhou: {type(e).__name__}: {e}")
++        return hit[1] if hit else None
++
++
++# ───────────────────────── protocolo das fileiras extras ─────────────────────────
++
++def row_visible(catalog_id: str) -> bool:
++    return True
++
++
++async def catalog_items(catalog_id: str, base_url: str, genre: str | None = None) -> list[dict]:
++    if catalog_id != "comet_podcasts":
++        return []
++    items = await _load_chart()
++    if genre:
++        items = [it for it in items if genre in it["genres"]]
++    return [{"id": ID_PREFIX + it["id"], "type": "series", "name": it["name"],
++             "poster": it["art"], "posterShape": "square", "background": it["art"],
++             "description": f"{it['author']}" + (f" · {', '.join(it['genres'][:2])}" if it["genres"] else ""),
++             "genres": it["genres"][:3]}
++            for it in items]
++
++
++def _split(media_id: str) -> tuple[str, str | None]:
++    rest = media_id[len(ID_PREFIX):]
++    pid, _, gh = rest.partition(":")
++    if not pid.isdigit():
++        pid = "0"
++    if gh and not re.fullmatch(r"[0-9a-f]{12}", gh):
++        gh = None
++    return pid, (gh or None)
++
++
++def _iso(date: str) -> str | None:
++    from email.utils import parsedate_to_datetime
++    try:
++        return parsedate_to_datetime(date).isoformat()
++    except Exception:
++        return None
++
++
++async def get_meta(media_id: str, base_url: str) -> dict | None:
++    pid, _gh_ = _split(media_id)
++    feed = await _feed(pid)
++    if not feed:
++        return None
++    n = len(feed["episodes"])
++    videos = []
++    for i, ep in enumerate(feed["episodes"]):
++        videos.append({"id": f"{ID_PREFIX}{pid}:{ep['gh']}", "title": ep["title"], "season": 1,
++                       "episode": n - i, "released": _iso(ep["date"]), "thumbnail": ep["art"],
++                       "overview": ep["desc"] + (f" ({ep['min']} min)" if ep["min"] else "")})
++    return {"id": ID_PREFIX + pid, "type": "series", "name": feed["name"], "poster": feed["art"],
++            "posterShape": "square", "background": feed["art"], "logo": None,
++            "description": (feed["author"] + " · " if feed["author"] else "") + feed["desc"],
++            "genres": ["Podcast"], "videos": videos}
++
++
++async def get_streams(media_id: str, base_url: str) -> list[dict]:
++    pid, gh = _split(media_id)
++    feed = await _feed(pid)
++    if not feed:
++        return []
++    eps = feed["episodes"]
++    ep = next((e for e in eps if e["gh"] == gh), None) if gh else (eps[0] if eps else None)
++    if not ep:
++        return []
++    dur = f" · {ep['min']} min" if ep["min"] else ""
++    return [
++        {"name": "▶ Assistir\n🎙️ Podcast", "title": f"{ep['title']}{dur}\n🖼️ capa + áudio (sem avançar)",
++         "url": f"{base_url}/podcast/{pid}/{ep['gh']}/tv.ts", "behaviorHints": {"notWebReady": False}},
++        {"name": "🎧 Só áudio", "title": f"{ep['title']}{dur}\nÁudio direto (dá para avançar)",
++         "url": ep["url"], "behaviorHints": {"notWebReady": False}},
++    ]
++
++
++# ───────────────────────── vídeo: capa parada + áudio ─────────────────────────
++
++async def _cover_file(pid: str, url: str) -> str | None:
++    path = f"/tmp/comet_pod_{pid}.jpg"
++    if os.path.exists(path) and os.path.getsize(path) > 1000:
++        return path
++    try:
++        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
++            data = await _get(s, url, as_json=False)
++        if data:
++            with open(path, "wb") as f:
++                f.write(data)
++            return path
++    except Exception as e:
++        log_swallowed("podcasts._cover_file", e)
++    return None
++
++
++async def _video(pid: str, gh: str, request: Request):
++    from fastapi.responses import Response, StreamingResponse
++    from comet.services import radio
++
++    if not pid.isdigit() or not re.fullmatch(r"[0-9a-f]{12}", gh or ""):
++        return Response("indisponível", status_code=404)
++    feed = await _feed(pid)
++    ep = next((e for e in (feed or {}).get("episodes") or [] if e["gh"] == gh), None)
++    ff = radio._ffmpeg_path()
++    if not ep or not ff:
++        return Response("indisponível", status_code=404)
++    cover = await _cover_file(pid, feed["art"])
++    if not cover:
++        return Response("sem capa", status_code=404)
++    for p in [p for p in radio._VIDEO_PROCS if p.returncode is not None]:
++        radio._VIDEO_PROCS.remove(p)
++    while len(radio._VIDEO_PROCS) >= radio._VIDEO_MAX:
++        old = radio._VIDEO_PROCS.pop(0)
++        try:
++            old.kill()
++        except ProcessLookupError:
++            pass
++    proc = await asyncio.create_subprocess_exec(
++        ff, "-hide_banner", "-loglevel", "error", "-nostdin",
++        "-loop", "1", "-framerate", "1", "-i", cover,
++        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
++        "-user_agent", "Mozilla/5.0", "-i", ep["url"],
++        "-map", "0:v", "-map", "1:a", "-shortest",
++        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-pix_fmt", "yuv420p",
++        "-vf", "scale=512:512", "-r", "1", "-g", "2",
++        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
++        "-f", "mpegts", "-muxdelay", "0", "pipe:1",
++        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
++        preexec_fn=radio._lower_oom,
++    )
++    radio._VIDEO_PROCS.append(proc)
++    logger.info(f"🎙️🎬 podcast em vídeo: {feed['name']} · {ep['title'][:60]} (pid {proc.pid})")
++
++    async def body():
++        try:
++            while True:
++                if await request.is_disconnected():
++                    break
++                try:
++                    chunk = await asyncio.wait_for(proc.stdout.read(32768), timeout=45)
++                except asyncio.TimeoutError:
++                    break
++                if not chunk:
++                    break
++                yield chunk
++        finally:
++            if proc.returncode is None:
++                try:
++                    proc.kill()
++                except ProcessLookupError:
++                    pass
++            try:
++                await asyncio.wait_for(proc.wait(), 5)
++            except Exception as _e:
++                log_swallowed("podcasts.body", _e)
++            if proc in radio._VIDEO_PROCS:
++                radio._VIDEO_PROCS.remove(proc)
++
++    return StreamingResponse(body(), media_type="video/mp2t",
++                             headers={"Cache-Control": "no-cache, no-store", "X-Accel-Buffering": "no"})
++
++
++@router.get("/podcast/{pid}/{gh}/tv.ts")
++async def podcast_video(pid: str, gh: str, request: Request):
++    return await _video(pid, gh, request)
++
++
++@router.get("/{b64config}/podcast/{pid}/{gh}/tv.ts")
++async def podcast_video_tok(b64config: str, pid: str, gh: str, request: Request):
++    return await _video(pid, gh, request)
 diff --git a/comet/services/prefetch.py b/comet/services/prefetch.py
 new file mode 100644
 index 0000000..e9e666f
@@ -27179,10 +28922,10 @@ index 0000000..f4dc693
 +    return meta, True
 diff --git a/comet/services/row_groups.py b/comet/services/row_groups.py
 new file mode 100644
-index 0000000..40a7877
+index 0000000..a67e356
 --- /dev/null
 +++ b/comet/services/row_groups.py
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,165 @@
 +"""Fileiras agrupadas: junta fileiras parecidas numa só, com filtro.
 +
 +Antes a tela inicial tinha 88 fileiras (7 streamings x 3, 9 de clima, 9 de gênero...).
@@ -27207,6 +28950,7 @@ index 0000000..40a7877
 +                ("😭 Para chorar", "comet_mood_cry"),
 +                ("🤯 Plot twist", "comet_mood_twist"),
 +                ("😌 Comédia leve", "comet_mood_light"),
++                ("⏱️ Filmes curtos", "comet_mood_short"),
 +                ("👨‍👩‍👧 Sessão em família", "comet_mood_family"),
 +                ("🌙 Suspense à noite", "comet_mood_night"),
 +                ("🏆 Oscar de Melhor Filme", "comet_mood_oscar"),
@@ -28475,21 +30219,24 @@ index 0000000..efec780
 +    }
 diff --git a/comet/services/streamings.py b/comet/services/streamings.py
 new file mode 100644
-index 0000000..2790e80
+index 0000000..c042dec
 --- /dev/null
 +++ b/comet/services/streamings.py
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,1475 @@
 +"""Streamings no estilo Disney+: uma coleção do Nuvio com uma pasta por serviço.
 +
 +Na tela inicial do Nuvio aparece, fixada no topo, a fileira "Streamings" com um bloco por serviço
-+(Netflix, Prime Video, Disney+...). Com foco num bloco, o destaque gigante do topo vira o fundo,
-+o logo e o vídeo daquele serviço. Ao abrir, a página do serviço tem abas: Top 10, Originais, Em alta,
-+Novidades e Aclamados. Tudo é servido pelo Comet:
++(Netflix, Prime Video, Disney+...). Com foco num bloco, o destaque do topo mostra o fundo e o logo
++daquele serviço (imagem parada: o vídeo tomava a tela inteira e escondia as fileiras). Ao abrir, a
++página do serviço é igual à tela inicial (modo FOLLOW_LAYOUT do Nuvio): fileiras uma embaixo da outra
++no estilo da Netflix: Top 10 de séries e de filmes (número vazado + pôster), Anime, Ficção,
++Comédia, Drama, Originais, Romance, Ação, Suspense, Terror, Família, brasileiros, Aclamados...
++Tudo é servido pelo Comet:
 +
 +- catálogos `comet_sv_<aba>` (um por aba e tipo, o serviço vai no `genre`), fora da tela inicial
 +  (`showInHome: false`), que leem o TMDB por serviço no Brasil;
 +- a coleção pronta em `/<link>/nuvio/colecoes.json` (o Nuvio importa por link);
-+- as artes em `/art/svc/...`: bloco, brilho animado no foco, fundo do destaque, logo e vídeo.
++- as artes em `/art/svc/...`: bloco, fundo do destaque e logo (foco e vídeo ficaram de fora em 10/11).
 +"""
 +from __future__ import annotations
 +
@@ -28536,25 +30283,100 @@ index 0000000..2790e80
 +]
 +BY_KEY = {s["key"]: s for s in SERVICES}
 +BY_NAME = {s["name"].lower(): s for s in SERVICES}
++_BY_NORM = {re.sub(r"[^a-z0-9]", "", s["name"].lower()): s for s in SERVICES}
 +
-+# aba -> (tipo, nome no manifesto). A ordem é a das abas na página do serviço.
++# aba -> (tipo, nome no manifesto). A ordem é a das fileiras na página do serviço, como na Netflix
++# (10/11/2026): Top 10 lá em cima, pessoais e gêneros no meio, alternando séries e filmes.
 +TABS: list[tuple[str, str, str]] = [
-+    ("top10s", "series", "🏆 Top 10 séries"),
-+    ("top10m", "movie", "🏆 Top 10 filmes"),
-+    ("orig", "series", "✨ Originais"),
-+    ("hots", "series", "🔥 Séries em alta"),
-+    ("hotm", "movie", "🍿 Filmes em alta"),
-+    ("newm", "movie", "🆕 Novidades"),
-+    ("bests", "series", "💎 Séries aclamadas"),
-+    ("bestm", "movie", "💎 Filmes aclamados"),
++    ("top10s", "series", "Brasil: top 10 em séries hoje"),
++    ("conts", "series", "Continuar assistindo"),
++    ("anime", "series", "Anime"),
++    ("picks", "series", "Principais escolhas do dia para você"),
++    ("scifis", "series", "Ficção científica e fantasia"),
++    ("comedys", "series", "Para ver e relaxar"),
++    ("dramas", "series", "Séries emocionantes"),
++    ("newm", "movie", "Novidades"),
++    ("hots", "series", "Viciantes desde o primeiro episódio"),
++    ("becs", "series", "Porque você viu"),
++    ("top10m", "movie", "Brasil: top 10 em filmes hoje"),
++    ("romm", "movie", "Romances para suspirar"),
++    ("mylists", "series", "Minha lista"),
++    ("orig", "series", "Produções originais"),
++    ("shorts", "series", "Episódios curtinhos para dar uma risada"),
++    ("kdramas", "series", "Dramas coreanos"),
++    ("teens", "series", "Dramas adolescentes"),
++    ("famm", "movie", "Títulos para toda a família"),
++    ("contm", "movie", "Filmes que você começou"),
++    ("becm", "movie", "Porque você viu"),
++    ("hotm", "movie", "Filmes em alta"),
++    ("actm", "movie", "Ação e aventura"),
++    ("crimes", "series", "Crime e mistério"),
++    ("truecrime", "series", "Crimes reais"),
++    ("thrm", "movie", "Suspense de tirar o fôlego"),
++    ("mystm", "movie", "Mistérios para desvendar"),
++    ("horm", "movie", "Terror"),
++    ("usseries", "series", "Séries dos EUA"),
++    ("jps", "series", "Séries japonesas"),
++    ("latins", "series", "Séries em espanhol"),
++    ("brs", "series", "Séries brasileiras"),
++    ("brm", "movie", "Filmes brasileiros"),
++    ("comm", "movie", "Comédias para rir"),
++    ("scifim", "movie", "Filmes de ficção científica"),
++    ("fantm", "movie", "Fantasia e magia"),
++    ("warm", "movie", "Filmes de guerra"),
++    ("animem", "movie", "Filmes de anime"),
++    ("kidss", "series", "Para as crianças"),
++    ("quickm", "movie", "Com pressa? Filmes de até 90 minutos"),
++    ("docs", "series", "Séries documentais"),
++    ("docm", "movie", "Documentários"),
++    ("mylistm", "movie", "Filmes da minha lista"),
++    ("classicm", "movie", "Clássicos do cinema"),
++    ("bests", "series", "Séries aclamadas pela crítica"),
++    ("bestm", "movie", "Filmes aclamados pela crítica"),
 +]
++# fileiras de gênero: filtro extra do TMDB (com o serviço e a região, por popularidade).
++# "-without_genres" soma ao filtro padrão das séries (sem jornal, reality, novela e talk show).
++_GENRE_TABS: dict[str, dict[str, str]] = {
++    "anime": {"with_genres": "16", "with_original_language": "ja"},
++    "scifis": {"with_genres": "10765"},
++    "comedys": {"with_genres": "35"},
++    "dramas": {"with_genres": "18"},
++    "romm": {"with_genres": "10749"},
++    "shorts": {"with_genres": "35", "with_runtime.lte": "30", "-without_genres": "16"},
++    "kdramas": {"with_genres": "18", "with_original_language": "ko"},
++    "teens": {"with_genres": "18", "with_keywords": "6270|10683"},
++    "famm": {"with_genres": "10751"},
++    "actm": {"with_genres": "28|12"},
++    "crimes": {"with_genres": "80|9648"},
++    "truecrime": {"with_genres": "99,80"},
++    "thrm": {"with_genres": "53"},
++    "mystm": {"with_genres": "9648"},
++    "horm": {"with_genres": "27"},
++    "usseries": {"with_origin_country": "US"},
++    "jps": {"with_origin_country": "JP", "-without_genres": "16"},
++    "latins": {"with_original_language": "es"},
++    "brs": {"with_origin_country": "BR"},
++    "brm": {"with_origin_country": "BR"},
++    "comm": {"with_genres": "35"},
++    "scifim": {"with_genres": "878"},
++    "fantm": {"with_genres": "14"},
++    "warm": {"with_genres": "10752"},
++    "animem": {"with_genres": "16", "with_original_language": "ja"},
++    "kidss": {"with_genres": "10762"},
++    "quickm": {"with_runtime.lte": "90", "with_runtime.gte": "60"},
++    "docs": {"with_genres": "99"},
++    "docm": {"with_genres": "99"},
++    "classicm": {"primary_release_date.lte": "1999-12-31", "vote_count.gte": "800"},
++}
++# fileiras pessoais (biblioteca do Stremio + Trakt, filtrada pelo serviço)
++_PERSONAL_TABS = {"conts", "contm", "picks", "becs", "becm", "mylists", "mylistm"}
 +_TAB_TYPE = {t[0]: t[1] for t in TABS}
 +CATALOG_PREFIX = "comet_sv_"
 +COLLECTION_ID = "comet_streamings"
 +FORYOU_ID = "foryou"
 +
 +DATA_DIR = "/opt/comet/data/svc_art"
-+_ART_VERSION = "5"  # muda a URL das artes quando o desenho muda (o Nuvio guarda em cache)
++_ART_VERSION = "7"  # muda a URL das artes quando o desenho muda (o Nuvio guarda em cache)
 +
 +
 +def manifest_catalogs() -> list[dict]:
@@ -28564,17 +30386,53 @@ index 0000000..2790e80
 +    for tab, ctype, name in TABS:
 +        opts = orig_names if tab == "orig" else names
 +        extra = [{"name": "genre", "isRequired": False, "options": opts}]
-+        if not tab.startswith("top10"):
++        if tab in ("becs", "becm"):
++            name = because_title(ctype)
++        if not tab.startswith("top10") and tab not in _PERSONAL_TABS:
 +            extra.append({"name": "skip", "isRequired": False})
 +        out.append({"type": ctype, "id": CATALOG_PREFIX + tab, "name": name, "extra": extra,
 +                    "showInHome": False})
 +    return out
 +
 +
++# estúdios dos filmes originais (as séries vêm pela rede, em "networks")
++_ORIG_COMPANIES: dict[str, tuple[str, ...]] = {
++    "netflix": ("netflix",),
++    "prime": ("amazon studios", "amazon mgm studios", "amazon content services"),
++    "apple": ("apple studios", "apple original films", "apple tv+"),
++    "disney": ("disney+",),
++    "max": ("hbo max", "max original"),
++    "paramount": ("paramount+",),
++    "globoplay": ("globoplay",),
++    "crunchyroll": ("crunchyroll",),
++}
++
++
++def is_original(key: str | None, media_type: str, networks: list | None = None,
++                companies: list | None = None) -> bool:
++    """O título é original do serviço? (o logo do serviço só vai no card dos originais).
++    Para filme sem `companies`, responde se o serviço tem estúdio conhecido (vale consultar)."""
++    svc = BY_KEY.get(key or "")
++    if not svc:
++        return False
++    if media_type == "series":
++        own = {int(x) for x in (svc.get("networks") or "").split("|") if x}
++        return bool(own & {int(n) for n in (networks or [])})
++    names = _ORIG_COMPANIES.get(svc["key"])
++    if not names:
++        return False
++    if companies is None:
++        return True
++    low = [str(c).strip().lower() for c in companies]
++    return any(c == n or c.startswith(n + " ") for c in low for n in names)
++
++
 +def _service_from_genre(genre: str | None) -> dict | None:
 +    if not genre:
 +        return None
-+    return BY_NAME.get(genre.strip().lower()) or BY_KEY.get(genre.strip().lower())
++    g = genre.strip().lower()
++    # sem pontuação: "apple tv" (o "+" virou espaço em algum ponto) ainda é o Apple TV+
++    return BY_NAME.get(g) or BY_KEY.get(g) or _BY_NORM.get(re.sub(r"[^a-z0-9]", "", g))
 +
 +
 +def tmdb_query(catalog_id: str, media_type: str, language: str, region: str, page: int,
@@ -28584,7 +30442,7 @@ index 0000000..2790e80
 +    if not m:
 +        return None
 +    svc, tab = BY_KEY.get(m.group(1)), m.group(2)
-+    if not svc or _TAB_TYPE.get(tab) != media_type:
++    if not svc or _TAB_TYPE.get(tab) != media_type or tab in _PERSONAL_TABS:
 +        return None
 +    tv = media_type == "series"
 +    kind = "tv" if tv else "movie"
@@ -28622,6 +30480,17 @@ index 0000000..2790e80
 +    elif tab.startswith("best"):
 +        p["sort_by"] = "vote_average.desc"
 +        p["vote_count.gte"] = 300 if tv else 1500
++    elif tab in _GENRE_TABS:
++        p["sort_by"] = "popularity.desc"
++        p["vote_count.gte"] = 20 if tv else 40
++        for k, v in _GENRE_TABS[tab].items():
++            if k == "-without_genres":
++                if tv:
++                    p["without_genres"] = p["without_genres"] + "," + v
++                else:
++                    p["without_genres"] = v
++            else:
++                p[k] = v
 +    else:
 +        return None
 +    if svc["key"] in ("mubi", "pluto"):  # catálogos pequenos: não exigir tantos votos
@@ -28629,6 +30498,7 @@ index 0000000..2790e80
 +    return f"discover/{kind}", p
 +
 +
++_SEEN_PER_ROW = 12  # títulos visíveis de cada fileira (os que não podem repetir mais abaixo)
 +_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
 +_CACHE_TTL = 3 * 3600
 +_POSTER_RE = re.compile(r"/([A-Za-z0-9_-]{10,}\.(?:jpg|jpeg|png|webp))")
@@ -28648,24 +30518,80 @@ index 0000000..2790e80
 +        skip = 0
 +    if tab.startswith("top10") and skip:
 +        return []
++    if tab in _PERSONAL_TABS:
++        if skip:
++            return []
++        return await _personal_row(svc, tab, media_type, base_url)
 +    metas = await _raw_items(svc, tab, media_type, skip, base_url)
 +    if tab.startswith("top10"):
 +        metas = metas[:10]
++    elif not skip:
++        # a pasta mostra todas as fileiras juntas: cada uma sem os títulos que já apareceram
++        seen = await _seen_above(svc, tab, media_type, base_url)
++        metas = await _dedup(svc, tab, media_type, metas, seen, base_url)
 +    out = []
 +    for idx, meta in enumerate(metas, start=1):
 +        meta = dict(meta)
++        raw_poster = meta.pop("_raw_poster_path", None)
++        pid = meta.pop("_provider_id", None)
++        nf_badge = meta.pop("_nf_badge", None)
++        land = _land_url(meta, base_url)
++        bg = _backdrop_file(meta)
 +        if tab.startswith("top10"):
-+            art = rank_url(base_url, svc["key"], idx, meta)
++            art = top10_url(base_url, idx, raw_poster, nf_badge, pid) or land
 +        else:
-+            art = _land_url(meta, base_url)
++            art = land
 +        if art:
-+            # na grade da pasta o Nuvio usa `background` primeiro: arte com logo (e número no Top 10)
-+            meta["poster"] = art
++            # card: arte com logo (e número no Top 10); `poster` fica sem o número
++            meta["poster"] = land or art
 +            meta["landscapePoster"] = art
-+            meta["background"] = art
 +            meta["posterShape"] = "landscape"
++        if bg:
++            # fundo da tela enquanto navega: a cena limpa em resolução cheia, não o card esticado
++            meta["background"] = _TMDB_ORIG + bg
 +        out.append(meta)
 +    return out
++
++
++_INFLIGHT: dict[tuple, asyncio.Future] = {}
++_FETCH_SEM: asyncio.Semaphore | None = None
++
++
++async def _dedup(svc: dict, tab: str, media_type: str, metas: list[dict], seen: set,
++                 base_url: str) -> list[dict]:
++    """A fileira como aparece: sem os títulos vistos acima; sobrando pouco, completa com a
++    página seguinte (e, se nem assim, fica como veio)."""
++    rest = [m for m in metas if m.get("id") not in seen]
++    if len(rest) < 12 and len(metas) >= 30:
++        more = await _raw_items(svc, tab, media_type, len(metas), base_url)
++        have = {m.get("id") for m in rest}
++        rest += [m for m in more if m.get("id") not in seen and m.get("id") not in have]
++    return rest if len(rest) >= 6 else metas
++
++
++async def _seen_above(svc: dict, tab: str, media_type: str, base_url: str) -> set:
++    """Títulos visíveis nas fileiras acima (mesmo tipo, fora as pessoais), calculados em ordem,
++    do jeito que aparecem na tela. O Top 10 do tipo entra sempre, mesmo quando fica mais abaixo."""
++    top = "top10s" if media_type == "series" else "top10m"
++    seen: set = set()
++    try:
++        seen.update(m.get("id") for m in (await _raw_items(svc, top, media_type, 0, base_url))[:10])
++    except Exception as e:
++        log_swallowed("streamings._seen_above", e)
++    for t, mt, _n in TABS:
++        if t == tab:
++            break
++        if (mt != media_type or t == top or t in _PERSONAL_TABS
++                or (t == "orig" and not svc.get("networks"))):
++            continue
++        try:
++            raw = await _raw_items(svc, t, mt, 0, base_url)
++            shown = raw[:10] if t.startswith("top10") else await _dedup(svc, t, mt, raw, seen, base_url)
++        except Exception as e:
++            log_swallowed("streamings._seen_above", e)
++            continue
++        seen.update(m.get("id") for m in shown[:_SEEN_PER_ROW])
++    return seen
 +
 +
 +async def _raw_items(svc: dict, tab: str, media_type: str, skip: int, base_url: str) -> list[dict]:
@@ -28673,13 +30599,40 @@ index 0000000..2790e80
 +    hit = _CACHE.get(key)
 +    if hit and time.time() - hit[0] < _CACHE_TTL:
 +        return hit[1]
++    fut = _INFLIGHT.get(key)
++    if fut is not None:
++        return await asyncio.shield(fut)
++    fut = asyncio.get_running_loop().create_future()
++    _INFLIGHT[key] = fut
++    try:
++        metas = await _raw_items_fetch(svc, tab, media_type, skip, base_url, key)
++        fut.set_result(metas)
++        return metas
++    except asyncio.CancelledError:
++        fut.cancel()
++        raise
++    except Exception as e:
++        fut.set_exception(e)
++        fut.exception()  # marca como lida (sem "exception was never retrieved")
++        raise
++    finally:
++        _INFLIGHT.pop(key, None)
++
++
++async def _raw_items_fetch(svc: dict, tab: str, media_type: str, skip: int, base_url: str,
++                           key: tuple) -> list[dict]:
++    global _FETCH_SEM
 +    from comet.services import catalogs as _cat
-+    metas = await _cat._fetch_catalog_items(media_type, f"svx_{svc['key']}_{tab}", None, skip,
-+                                            base_url=base_url)
++    if _FETCH_SEM is None:
++        _FETCH_SEM = asyncio.Semaphore(4)  # a pasta pede ~45 fileiras juntas: sem estourar o TMDB
++    async with _FETCH_SEM:
++        metas = await _cat._fetch_catalog_items(media_type, f"svx_{svc['key']}_{tab}", None, skip,
++                                                base_url=base_url)
 +    if metas:
-+        _CACHE[key] = (time.time(), metas)
-+        if len(_CACHE) > 400:
-+            for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[:100]:
++        # com poucos itens (limite de consultas do TMDB), tenta de novo em 10 min
++        _CACHE[key] = (time.time() - (0 if len(metas) >= 15 else _CACHE_TTL - 600), metas)
++        if len(_CACHE) > 1500:
++            for k in sorted(_CACHE, key=lambda k: _CACHE[k][0])[:300]:
 +                _CACHE.pop(k, None)
 +    return metas
 +
@@ -28697,27 +30650,160 @@ index 0000000..2790e80
 +    return None
 +
 +
++def _unwrap(url: str) -> str:
++    """Endereço sem as camadas de codificação (a capa "ao vivo" embrulha o card em `?u=`)."""
++    from urllib.parse import unquote
++    prev = None
++    while url and url != prev:
++        prev, url = url, unquote(url)
++    return url
++
++
 +def _land_url(meta: dict, base_url: str) -> str | None:
-+    """Arte horizontal com logo do título (a /art/land do Comet), se o item já tiver uma."""
++    """Arte horizontal com logo do título (a /art/land do Comet), se o item já tiver uma.
++    Vale também quando a capa "ao vivo" (barra de progresso, faixa de status) embrulha o card."""
 +    p = meta.get("poster") or ""
 +    if "/art/land/" in p:
++        return p
++    if "/art/live." in p and "/art/land/" in _unwrap(p):
 +        return p
 +    return None
 +
 +
-+def rank_url(base_url: str, key: str, idx: int, meta: dict) -> str | None:
-+    from urllib.parse import quote
-+    bf = _backdrop_file(meta)
-+    if not bf:
++# fileiras montadas por outros módulos que chegavam sem o logo do serviço e sem a etiqueta
++_ENRICH_ROWS = {"comet_week", "comet_dubready", "comet_mylist", "comet_tonight", "comet_xmas_new",
++                "comet_svnew"}
++_ENRICH_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
++_ENRICH_TTL = 6 * 3600
++_ENRICH_TASKS: set = set()
++
++
++def _needs_land(meta: dict) -> bool:
++    p = _unwrap(str(meta.get("poster") or ""))
++    return "/art/land/" not in p or not re.search(r"[?&]p=\d", p)
++
++
++async def _enrich_batch(items: list[tuple[str, str]], base_url: str) -> None:
++    import aiohttp
++    from comet.metadata.tmdb import TMDBApi
++    from comet.services import stremio_library as lib
++
++    sem = asyncio.Semaphore(6)
++    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
++        tmdb = TMDBApi(session)
++
++        async def one(media_type: str, imdb: str) -> None:
++            poster = None
++            try:
++                found = await lib._resolve_find_imdb(tmdb, imdb, media_type)
++                if found and found.get("_tmdb_id"):
++                    m = await lib._build_landscape_meta(
++                        tmdb=tmdb, media_type=media_type, imdb_id=imdb,
++                        name=found.get("name") or "", poster_path=found.get("_poster_path"),
++                        backdrop_path=found.get("_backdrop_path"), overview="", year="",
++                        rating_str="", tmdb_id=found["_tmdb_id"], base_url=base_url, sem=sem)
++                    if "/art/land/" in str(m.get("poster") or ""):
++                        poster = m["poster"]
++            except Exception as e:
++                log_swallowed("streamings.land_enrich", e)
++            _ENRICH_CACHE[(media_type, imdb)] = (time.time(), poster)
++
++        await asyncio.gather(*[one(t, i) for t, i in items], return_exceptions=True)
++
++
++async def land_enrich(metas: list, catalog_id: str, base_url: str, wait: float = 8.0) -> list:
++    """Troca a capa pelo card com logo do título, logo do serviço e etiqueta (como nas fileiras
++    do TMDB). O que não ficar pronto em `wait` segundos continua em 2º plano e entra no próximo pedido."""
++    if catalog_id not in _ENRICH_ROWS or not metas:
++        return metas
++    now = time.time()
++    todo: list[tuple[str, str]] = []
++    for m in metas:
++        if not isinstance(m, dict) or not _needs_land(m):
++            continue
++        imdb = str(m.get("id") or "").split(":")[0]
++        mtype = "series" if m.get("type") in ("series", "tv") else "movie"
++        if not imdb.startswith("tt"):
++            continue
++        hit = _ENRICH_CACHE.get((mtype, imdb))
++        if (not hit or now - hit[0] > _ENRICH_TTL) and (mtype, imdb) not in todo:
++            todo.append((mtype, imdb))
++    if todo:
++        task = asyncio.create_task(_enrich_batch(todo, base_url))
++        _ENRICH_TASKS.add(task)
++        task.add_done_callback(_ENRICH_TASKS.discard)
++        try:
++            await asyncio.wait_for(asyncio.shield(task), wait)
++        except asyncio.TimeoutError:
++            pass
++    out = []
++    for m in metas:
++        if isinstance(m, dict) and _needs_land(m):
++            imdb = str(m.get("id") or "").split(":")[0]
++            mtype = "series" if m.get("type") in ("series", "tv") else "movie"
++            hit = _ENRICH_CACHE.get((mtype, imdb))
++            if hit and hit[1]:
++                m = dict(m)
++                orig = str(m.get("poster") or "")
++                pm = re.search(r"[?&]p=(\d+)", hit[1])
++                if "/art/land/" in orig and "/art/live." not in orig:
++                    # já era o card com logo (e talvez com etiqueta): só falta o logo do serviço
++                    if pm:
++                        m["poster"] = orig + ("&" if "?" in orig else "?") + f"p={pm.group(1)}"
++                else:
++                    m["poster"] = hit[1]
++                m["posterShape"] = "landscape"
++        out.append(m)
++    return out
++
++
++def top10_url(base_url: str, idx: int, poster_path: str | None, badge: str | None = None,
++              provider_id: int | None = None) -> str | None:
++    """Card 16:9 do Top 10 no estilo Netflix (`/art/top10w`, em comet/services/artwork.py)."""
++    if not poster_path or not 1 <= idx <= 10:
 +        return None
-+    src = quote(f"/art/land/{bf}", safe="")
-+    return f"{base_url}/art/svc/rank/{key}-{idx}.jpg?v={_ART_VERSION}&s={src}"
++    q = [f"b={badge}"] if badge in ("new_ep", "new_ep_now", "new_season", "new", "dub", "new_ep_dub",
++                                    "new_season_dub", "new_dub") else []
++    if provider_id:
++        q.append(f"p={provider_id}")
++    return f"{base_url}/art/top10w/{idx}/{poster_path.lstrip('/')}" + ("?" + "&".join(q) if q else "")
++
++
++# muda quando o desenho do card muda: o Nuvio guarda a imagem pelo endereço e, sem isso,
++# continua mostrando o card antigo
++_CARD_V = "4"
++
++
++_TMDB_ORIG = "https://image.tmdb.org/t/p/original/"
++
++
++def _hi_background(meta: dict) -> None:
++    """Fundo em resolução cheia: o card (`/art/...`) esticado vira a cena do TMDB e o
++    tamanho w1280 vira original."""
++    bg = meta.get("background")
++    if not isinstance(bg, str) or not bg:
++        return
++    if "/art/" in bg:
++        f = _backdrop_file(meta)
++        if f:
++            meta["background"] = _TMDB_ORIG + f
++    elif "image.tmdb.org/t/p/w1280/" in bg or "image.tmdb.org/t/p/w780/" in bg:
++        meta["background"] = _TMDB_ORIG + bg.rsplit("/", 1)[1]
++
++
++def _card_v(url: str) -> str:
++    if ("/art/land/" not in url and "/art/live." not in url) or "&v=" in url or "?v=" in url:
++        return url
++    return url + ("&" if "?" in url else "?") + "v=" + _CARD_V
++
++
++_TOP10_POSTER_RE = re.compile(r"/art/top10/(\d+)/([A-Za-z0-9_-]+\.(?:jpg|png))(?:\?p=(\d+))?")
 +
 +
 +def nuvio_cards(metas: list[dict], catalog_id: str, base_url: str) -> list[dict]:
 +    """Saída de qualquer catálogo para o Nuvio. O card horizontal do app usa `landscapePoster`;
 +    sem ele, mostra o fundo cru (sem logo). Aqui: a arte com logo vira `landscapePoster`, e o
-+    Top 10 de hoje ganha o card com o número gigante."""
++    Top 10 de hoje ganha o card da Netflix (número vazado + pôster em pé)."""
 +    out = []
 +    for idx, m in enumerate(metas or [], start=1):
 +        if not isinstance(m, dict):
@@ -28725,15 +30811,262 @@ index 0000000..2790e80
 +            continue
 +        m = dict(m)
 +        if catalog_id == "comet_top10" and idx <= 10:
-+            art = rank_url(base_url, "top", idx, m)
++            mm = _TOP10_POSTER_RE.search(m.get("poster") or "")
++            art = top10_url(base_url, int(mm.group(1)), mm.group(2), None,
++                            int(mm.group(3)) if mm.group(3) else None) if mm else None
 +            if art:
 +                m["landscapePoster"] = art
 +        elif not m.get("landscapePoster"):
 +            art = _land_url(m, base_url)
 +            if art:
 +                m["landscapePoster"] = art
++        if isinstance(m.get("landscapePoster"), str):
++            m["landscapePoster"] = _card_v(m["landscapePoster"])
++        _hi_background(m)
 +        out.append(m)
 +    return out
++
++
++# ───────────────────────── fileiras pessoais ─────────────────────────
++# Continuar assistindo, Minha lista, Principais escolhas e "Porque você viu X", só com o que está
++# no serviço (TMDB, onde assistir no Brasil). A biblioteca é a do Stremio + Trakt (stremio_library).
++_PROV_CACHE: dict[tuple[str, int], tuple[float, set]] = {}
++_PROV_TTL = 3 * 86400
++_PERSONAL_CACHE: dict[tuple, tuple[float, list[dict]]] = {}
++_PERSONAL_TTL = 15 * 60
++_BECAUSE: dict[str, dict] = {}
++_BECAUSE_FILE = os.path.join(DATA_DIR, "because.json")
++
++
++def _load_because() -> None:
++    if _BECAUSE:
++        return
++    try:
++        import json
++        with open(_BECAUSE_FILE, encoding="utf-8") as f:
++            data = json.load(f)
++        if isinstance(data, dict):
++            _BECAUSE.update({k: v for k, v in data.items() if isinstance(v, dict)})
++    except (OSError, ValueError):
++        pass
++
++
++def because_title(media_type: str) -> str:
++    """Nome da fileira "Porque você viu <título>" (o título é trocado uma vez por dia)."""
++    _load_because()
++    name = (_BECAUSE.get(media_type) or {}).get("name")
++    if name:
++        return f"Porque você viu {name}"
++    return "Porque você viu esta série" if media_type == "series" else "Porque você viu este filme"
++
++
++def _save_because() -> None:
++    try:
++        import json
++        os.makedirs(DATA_DIR, exist_ok=True)
++        with open(_BECAUSE_FILE + ".tmp", "w", encoding="utf-8") as f:
++            json.dump(_BECAUSE, f, ensure_ascii=False)
++        os.replace(_BECAUSE_FILE + ".tmp", _BECAUSE_FILE)
++    except OSError:
++        pass
++
++
++def _ts(v) -> float:
++    if not v:
++        return 0.0
++    if isinstance(v, (int, float)):
++        return float(v) / (1000.0 if v > 1e11 else 1.0)
++    try:
++        return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
++    except ValueError:
++        return 0.0
++
++
++def _watched(library: list[dict], media_type: str) -> list[dict]:
++    items = [it for it in library if it.get("type") == media_type and str(it.get("_id") or "").startswith("tt")
++             and (it.get("state") or {}).get("lastWatched")]
++    items.sort(key=lambda it: _ts((it.get("state") or {}).get("lastWatched")), reverse=True)
++    return items
++
++
++async def _providers(tmdb, kind: str, tid: int, sem) -> set:
++    key = (kind, tid)
++    hit = _PROV_CACHE.get(key)
++    if hit and time.time() - hit[0] < _PROV_TTL:
++        return hit[1]
++    ids: set = set()
++    async with sem:
++        try:
++            data = await tmdb._get_json(f"{kind}/{tid}/watch/providers", f"providers {tid}")
++            br = ((data or {}).get("results") or {}).get("BR") or {}
++            for group in ("flatrate", "ads", "free"):
++                ids.update(int(x.get("provider_id")) for x in (br.get(group) or []) if x.get("provider_id"))
++        except Exception as e:
++            log_swallowed("streamings._providers", e)
++    _PROV_CACHE[key] = (time.time(), ids)
++    if len(_PROV_CACHE) > 6000:
++        for k in sorted(_PROV_CACHE, key=lambda k: _PROV_CACHE[k][0])[:1000]:
++            _PROV_CACHE.pop(k, None)
++    return ids
++
++
++def _on_service(svc: dict, ids: set) -> bool:
++    pid = svc["provider"]
++    return pid in ids or (pid == 1899 and 384 in ids)
++
++
++async def _personal_row(svc: dict, tab: str, media_type: str, base_url: str) -> list[dict]:
++    key = (svc["key"], tab, media_type, base_url)
++    hit = _PERSONAL_CACHE.get(key)
++    if hit and time.time() - hit[0] < _PERSONAL_TTL:
++        return hit[1]
++    auth = getattr(settings, "STREMIO_AUTH_KEY", None)
++    if not auth:
++        return []
++    try:
++        metas = await _personal_build(svc, tab, media_type, base_url, auth)
++    except Exception as e:
++        log_swallowed("streamings._personal_row", e)
++        metas = []
++    _PERSONAL_CACHE[key] = (time.time(), metas)
++    return metas
++
++
++async def _personal_build(svc: dict, tab: str, media_type: str, base_url: str, auth: str) -> list[dict]:
++    import aiohttp
++    from comet.metadata.tmdb import TMDBApi
++    from comet.services import stremio_library as lib
++
++    library = await lib.get_stremio_library(auth) or []
++    kind = "tv" if media_type == "series" else "movie"
++    sem = asyncio.Semaphore(8)
++    now = time.time()
++    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
++        tmdb = TMDBApi(session)
++
++        async def from_library(items: list[dict], limit: int) -> list[dict]:
++            async def one(it):
++                found = await lib._resolve_find_imdb(tmdb, it["_id"], media_type)
++                if not found or not found.get("_tmdb_id"):
++                    return None
++                if not _on_service(svc, await _providers(tmdb, kind, found["_tmdb_id"], sem)):
++                    return None
++                return await lib._build_landscape_meta(
++                    tmdb=tmdb, media_type=media_type, imdb_id=it["_id"],
++                    name=found.get("name") or it.get("name") or "",
++                    poster_path=found.get("_poster_path"), backdrop_path=found.get("_backdrop_path"),
++                    overview=found.get("description") or "", year=found.get("releaseInfo") or "",
++                    rating_str=found.get("imdbRating") or "", tmdb_id=found["_tmdb_id"],
++                    base_url=base_url, sem=sem)
++            got = await asyncio.gather(*[one(it) for it in items[:60]], return_exceptions=True)
++            return [m for m in got if isinstance(m, dict)][:limit]
++
++        async def from_recs(seeds: list[dict], exclude: set, limit: int) -> list[dict]:
++            seed_ids = []
++            for it in seeds:
++                found = await lib._resolve_find_imdb(tmdb, it["_id"], media_type)
++                if found and found.get("_tmdb_id"):
++                    seed_ids.append(found["_tmdb_id"])
++            cands: list[dict] = []
++            seen_c: set = set()
++            for tid in seed_ids:
++                for path in (f"{kind}/{tid}/recommendations?language=pt-BR",
++                             f"{kind}/{tid}/similar?language=pt-BR"):
++                    try:
++                        data = await tmdb._get_json(path, f"rec {tid}")
++                    except Exception:
++                        data = None
++                    for c in (data or {}).get("results") or []:
++                        if c.get("id") and c["id"] not in seen_c:
++                            seen_c.add(c["id"])
++                            cands.append(c)
++            cands = cands[:80]
++            flags = await asyncio.gather(*[_providers(tmdb, kind, c["id"], sem) for c in cands],
++                                         return_exceptions=True)
++            cands = [c for c, f in zip(cands, flags) if isinstance(f, set) and _on_service(svc, f)]
++
++            async def one(c):
++                imdb = await lib._resolve_imdb_id(tmdb, media_type, c["id"], sem=sem)
++                if not imdb or not imdb.startswith("tt") or imdb in exclude:
++                    return None
++                date = (c.get("first_air_date") if kind == "tv" else c.get("release_date")) or ""
++                va = c.get("vote_average")
++                return await lib._build_landscape_meta(
++                    tmdb=tmdb, media_type=media_type, imdb_id=imdb,
++                    name=c.get("name") or c.get("title") or c.get("original_name") or c.get("original_title") or "",
++                    poster_path=c.get("poster_path"), backdrop_path=c.get("backdrop_path"),
++                    overview=c.get("overview") or "", year=date[:4],
++                    rating_str=f"{float(va):.1f}" if va else "", tmdb_id=c["id"], base_url=base_url, sem=sem)
++            got = await asyncio.gather(*[one(c) for c in cands[:40]], return_exceptions=True)
++            out, ids = [], set()
++            for m in got:
++                if isinstance(m, dict) and m["id"] not in ids:
++                    ids.add(m["id"])
++                    out.append(m)
++            return out[:limit]
++
++        lib_ids = {str(it.get("_id")) for it in library}
++        watched = _watched(library, media_type)
++        if tab in ("conts", "contm"):
++            recent = []
++            for it in watched:
++                st = it.get("state") or {}
++                if now - _ts(st.get("lastWatched")) > 90 * 86400:
++                    continue
++                if media_type == "movie":
++                    off, dur = float(st.get("timeOffset") or 0), float(st.get("duration") or 0)
++                    if not off or (dur and off / dur > 0.92):
++                        continue
++                recent.append(it)
++            return await from_library(recent, 20)
++        if tab in ("mylists", "mylistm"):
++            saved = [it for it in library if it.get("type") == media_type
++                     and str(it.get("_id") or "").startswith("tt")
++                     and not it.get("removed") and not it.get("temp")]
++            saved.sort(key=lambda it: _ts(it.get("_mtime")), reverse=True)
++            return await from_library(saved, 30)
++        ref = _because_ref(media_type, watched)
++        if tab in ("becs", "becm"):
++            if not ref:
++                return []
++            return await from_recs([{"_id": ref["id"]}], lib_ids, 20)
++        if tab == "picks":
++            seeds = [it for it in watched if it["_id"] != (ref or {}).get("id")][:6]
++            bec = await _personal_row(svc, "becs" if media_type == "series" else "becm", media_type, base_url)
++            return await from_recs(seeds, lib_ids | {m["id"] for m in bec}, 20)
++    return []
++
++
++def _because_ref(media_type: str, watched: list[dict]) -> dict | None:
++    """Título do "Porque você viu": o guardado do dia ou, sem ele, o último assistido."""
++    _load_because()
++    ref = _BECAUSE.get(media_type)
++    if not ref and watched and watched[0].get("name"):
++        ref = {"id": watched[0]["_id"], "name": watched[0]["name"]}
++        _BECAUSE[media_type] = ref
++        _save_because()
++    return ref
++
++
++def refresh_because() -> None:
++    """Uma vez por dia: o "Porque você viu" passa a usar o último título assistido."""
++    async def run():
++        auth = getattr(settings, "STREMIO_AUTH_KEY", None)
++        if not auth:
++            return
++        from comet.services import stremio_library as lib
++        library = await lib.get_stremio_library(auth) or []
++        changed = False
++        for mt in ("series", "movie"):
++            w = _watched(library, mt)
++            if w and w[0].get("name") and (_BECAUSE.get(mt) or {}).get("id") != w[0]["_id"]:
++                _BECAUSE[mt] = {"id": w[0]["_id"], "name": w[0]["name"]}
++                changed = True
++        if changed:
++            _save_because()
++            for k in [k for k in _PERSONAL_CACHE if k[1] in ("becs", "becm", "picks")]:
++                _PERSONAL_CACHE.pop(k, None)
++    return run()
 +
 +
 +# ───────────────────────── coleção do Nuvio ─────────────────────────
@@ -28750,10 +31083,8 @@ index 0000000..2790e80
 +    folders.append({
 +        "id": FORYOU_ID, "title": "Para Você",
 +        "coverImageUrl": _art(base, "tile", FORYOU_ID, "jpg"),
-+        "focusGifUrl": _art(base, "focus", FORYOU_ID, "webp"), "focusGifEnabled": True,
-+        "tileShape": "LANDSCAPE", "hideTitle": True,
++        "focusGifEnabled": False, "tileShape": "LANDSCAPE", "hideTitle": True,
 +        "heroBackdropUrl": _art(base, "hero", FORYOU_ID, "jpg"),
-+        "heroVideoUrl": _art(base, "video", FORYOU_ID, "mp4"),
 +        "titleLogoUrl": _art(base, "logo", FORYOU_ID, "png"),
 +        "sources": [
 +            {"provider": "addon", "addonId": addon_id, "type": "movie", "catalogId": "comet_foryou"},
@@ -28774,17 +31105,17 @@ index 0000000..2790e80
 +        folders.append({
 +            "id": s["key"], "title": s["name"],
 +            "coverImageUrl": _art(base, "tile", s["key"], "jpg"),
-+            "focusGifUrl": _art(base, "focus", s["key"], "webp"), "focusGifEnabled": True,
-+            "tileShape": "LANDSCAPE", "hideTitle": True,
++            "focusGifEnabled": False, "tileShape": "LANDSCAPE", "hideTitle": True,
 +            "heroBackdropUrl": _art(base, "hero", s["key"], "jpg"),
-+            "heroVideoUrl": _art(base, "video", s["key"], "mp4"),
 +            "titleLogoUrl": _art(base, "logo", s["key"], "png"),
 +            "sources": sources,
 +        })
 +    return [{
 +        "id": COLLECTION_ID, "title": "Streamings",
 +        "backdropImageUrl": _art(base, "hero", FORYOU_ID, "jpg"),
-+        "pinToTop": True, "focusGlowEnabled": True, "viewMode": "TABBED_GRID",
++        "pinToTop": True, "focusGlowEnabled": True,
++        # FOLLOW_LAYOUT: a pasta abre como a tela inicial (fileiras com destaque), sem abas no topo
++        "viewMode": "FOLLOW_LAYOUT",
 +        "showAllTab": False, "folders": folders,
 +    }]
 +
@@ -29195,8 +31526,8 @@ index 0000000..2790e80
 +                                             key == FORYOU_ID)
 +            data = await asyncio.to_thread(_webp_anim, frames, 20, 72)
 +        elif kind == "hero":
-+            scenes = await _scenes(key, 1)
-+            data = _jpeg(await asyncio.to_thread(_compose_hero, svc, scenes), 86)
++            scenes = await _scenes(key, 1, "original")  # 1920x1080 sem esticar uma imagem menor
++            data = _jpeg(await asyncio.to_thread(_compose_hero, svc, scenes), 90)
 +        elif kind == "video":
 +            data = await _make_video(svc, key)
 +        else:
@@ -29265,17 +31596,50 @@ index 0000000..2790e80
 +            pass
 +
 +
++async def _warm_rows() -> None:
++    """Deixa as fileiras de todos os serviços no cache (a pasta abre ~24 fileiras de uma vez)."""
++    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
++    for sv in SERVICES:
++        for tab, mt, _name in TABS:
++            if tab == "orig" and not sv.get("networks"):
++                continue
++            started = time.monotonic()
++            try:
++                await get_catalog(mt, CATALOG_PREFIX + tab, {"genre": sv["key"]}, base)
++            except Exception as e:
++                log_swallowed("streamings._warm_rows", e)
++            # devagar: são ~450 fileiras e o A71 continua atendendo a TV (pausa >= o tempo gasto)
++            await asyncio.sleep(max(1.5, time.monotonic() - started))
++
++
++def _drop_unused_art() -> None:
++    """Apaga o brilho de foco e o vídeo antigos: a coleção não usa mais (10/11/2026)."""
++    try:
++        for f in os.listdir(DATA_DIR):
++            if f.startswith(("focus_", "video_", "rank_")):
++                os.unlink(os.path.join(DATA_DIR, f))
++    except OSError:
++        pass
++
++
 +async def warm_all() -> None:
 +    """Gera tudo em 2º plano (uma vez por dia): o 1º foco na TV já encontra as artes prontas."""
 +    keys = [FORYOU_ID] + [s["key"] for s in SERVICES]
-+    for kind in ("logo", "tile", "focus", "hero", "video"):
++    _drop_unused_art()
++    for kind in ("logo", "tile", "hero"):
 +        for key in keys:
 +            try:
 +                await make_art(kind, key)
 +            except Exception as e:
 +                log_swallowed("streamings.warm_all", e)
 +            await asyncio.sleep(0.2)
-+    await _warm_ranks()
++    _cleanup_ranks()
++    try:
++        _load_because()
++        await refresh_because()
++    except Exception as e:
++        log_swallowed("streamings.refresh_because", e)
++    await _warm_rows()
 +
 +
 +_warm_task: asyncio.Task | None = None
@@ -29305,73 +31669,6 @@ index 0000000..2790e80
 +_MEDIA = {"jpg": "image/jpeg", "gif": "image/gif", "png": "image/png", "mp4": "video/mp4", "webp": "image/webp"}
 +
 +
-+def _compose_rank(svc: dict, rank: int, art, w=960, h=540):
-+    """Card do Top 10: número gigante com contorno à esquerda, a arte do título à direita."""
-+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
-+    c1, c2 = svc["c1"], svc["c2"]
-+    base = _lin_gradient((w, h), tuple(min(255, int(v * 1.4)) for v in c1), (0, 0, 0), horizontal=True).convert("RGBA")
-+    base.alpha_composite(_radial((w, h), (w * 0.2, h * 0.75), w * 0.45, c2, 0.55))
-+    # arte à direita, sumindo para a esquerda
-+    aw = int(w * 0.66)
-+    a = art.convert("RGB")
-+    sc = max(aw / a.width, h / a.height)
-+    a = a.resize((int(a.width * sc) + 1, int(a.height * sc) + 1), Image.LANCZOS)
-+    a = a.crop(((a.width - aw) // 2, (a.height - h) // 2, (a.width - aw) // 2 + aw, (a.height - h) // 2 + h))
-+    fade = _lin_gradient((aw, h), (0, 0, 0), (255, 255, 255), horizontal=True).convert("L")
-+    fade = fade.point(lambda v: min(255, int(v * 2.2)))
-+    layer = a.convert("RGBA")
-+    layer.putalpha(fade)
-+    base.alpha_composite(layer, (w - aw, 0))
-+    # número
-+    font = ImageFont.truetype(_FONT_BOLD, int(h * (0.95 if rank < 10 else 0.78)))
-+    try:
-+        font.set_variation_by_name("Black")
-+    except Exception:
-+        pass
-+    txt = str(rank)
-+    l, t, r, b = font.getbbox(txt)
-+    tw, th = r - l, b - t
-+    x = int(w * 0.20 - tw / 2) - l
-+    y = int(h - th - h * 0.04) - t
-+    mask = Image.new("L", (w, h), 0)
-+    ImageDraw.Draw(mask).text((x, y), txt, font=font, fill=255)
-+    outline = mask.filter(ImageFilter.MaxFilter(9))
-+    glow = Image.new("RGBA", (w, h), c2 + (0,))
-+    glow.putalpha(outline.filter(ImageFilter.GaussianBlur(14)).point(lambda v: int(v * 0.7)))
-+    base.alpha_composite(glow)
-+    ring = Image.new("RGBA", (w, h), (255, 255, 255, 0))
-+    ring.putalpha(outline)
-+    base.alpha_composite(ring)
-+    fill = _lin_gradient((w, h), (28, 28, 34), (0, 0, 0)).convert("RGBA")
-+    fill.putalpha(mask)
-+    base.alpha_composite(fill)
-+    d = ImageDraw.Draw(base)
-+    d.rounded_rectangle((1, 1, w - 2, h - 2), radius=24, outline=(255, 255, 255, 40), width=2)
-+    return base.convert("RGB")
-+
-+
-+async def _ensure_rank(svc: dict, rank: int, src: str) -> str:
-+    import aiohttp
-+    from PIL import Image
-+    os.makedirs(DATA_DIR, exist_ok=True)
-+    key = re.sub(r"[^A-Za-z0-9]", "", src)[-60:]
-+    path = os.path.join(DATA_DIR, f"rank_{svc['key']}_{rank}_{key}_v{_ART_VERSION}.jpg")
-+    if os.path.exists(path):
-+        return path
-+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as sess:
-+        async with sess.get(f"http://127.0.0.1:8000{src}") as r:
-+            if r.status != 200:
-+                raise HTTPException(status_code=404)
-+            raw = await r.read()
-+    art = Image.open(io.BytesIO(raw))
-+    img = await asyncio.to_thread(_compose_rank, svc, rank, art)
-+    data = _jpeg(img.resize((640, 360), Image.LANCZOS), 88)
-+    with open(path + ".tmp", "wb") as f:
-+        f.write(data)
-+    os.replace(path + ".tmp", path)
-+    return path
-+
-+
 +def _cleanup_ranks() -> None:
 +    try:
 +        now = time.time()
@@ -29381,36 +31678,6 @@ index 0000000..2790e80
 +                os.unlink(fp)
 +    except OSError:
 +        pass
-+
-+
-+async def _warm_ranks() -> None:
-+    from urllib.parse import parse_qs, urlparse
-+    base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/")
-+    for s in SERVICES:
-+        for tab, mt in (("top10s", "series"), ("top10m", "movie")):
-+            try:
-+                metas = await get_catalog(mt, CATALOG_PREFIX + tab, {"genre": s["key"]}, base)
-+            except Exception as e:
-+                log_swallowed("streamings._warm_ranks", e)
-+                continue
-+            for i, m in enumerate(metas, start=1):
-+                q = parse_qs(urlparse(m.get("landscapePoster") or "").query).get("s")
-+                if q:
-+                    try:
-+                        await _ensure_rank(s, i, q[0])
-+                    except Exception as e:
-+                        log_swallowed("streamings._warm_ranks", e)
-+    _cleanup_ranks()
-+
-+
-+@router.get("/art/svc/rank/{name}")
-+async def svc_rank(name: str, s: str):
-+    """Arte do Top 10 (número + fundo do título). `s` = caminho /art/land/<fundo> do Comet."""
-+    m = re.fullmatch(r"([a-z0-9]+)-(\d{1,2})\.jpg", name)
-+    if not m or not s.startswith("/art/land/") or ".." in s:
-+        raise HTTPException(status_code=404)
-+    path = await _ensure_rank(_svc(m.group(1)), int(m.group(2)), s)
-+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
 +
 +
 +@router.get("/art/svc/{kind}/{name}")
@@ -29433,10 +31700,10 @@ index 0000000..2790e80
 +    return JSONResponse(build_collections(base), headers={"Cache-Control": "no-store"})
 diff --git a/comet/services/stremio_library.py b/comet/services/stremio_library.py
 new file mode 100644
-index 0000000..1c8a121
+index 0000000..7e66adf
 --- /dev/null
 +++ b/comet/services/stremio_library.py
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,588 @@
 +"""
 +Stremio library service for personal catalogs:
 +- Minha lista (comet_mylist)
@@ -29460,6 +31727,8 @@ index 0000000..1c8a121
 +    _resolve_find_imdb,
 +    _resolve_imdb_id,
 +    _resolve_landscape_data,
++    _series_badge,
++    _tv_info,
 +)
 +
 +STREMIO_DATASTORE_URL = "https://api.strem.io/api/datastoreGet"
@@ -29552,6 +31821,9 @@ index 0000000..1c8a121
 +    return items
 +
 +
++_BADGE_SEM = asyncio.Semaphore(4)
++
++
 +async def _build_landscape_meta(
 +    tmdb: TMDBApi,
 +    media_type: str,
@@ -29585,6 +31857,20 @@ index 0000000..1c8a121
 +        )
 +        backdrop_file = (ls_data.get("backdrop") if ls_data else None) or backdrop_path
 +        logo_file = ls_data.get("logo") if ls_data else None
++        # como nas outras fileiras: logo do streaming onde o título está e selo da série
++        if provider_id is None:
++            try:
++                from comet.services.artwork import resolve_single_watch_provider
++                provider_id = await resolve_single_watch_provider(
++                    "movie" if media_type == "movie" else "tv", tmdb_id, None, tmdb)
++            except Exception as e:
++                log_swallowed("stremio_library.provider", e)
++        if badge is None and media_type == "series":
++            try:
++                badge = _series_badge(await _tv_info(tmdb, tmdb_id, sem or _BADGE_SEM),
++                                      datetime.date.today())
++            except Exception as e:
++                log_swallowed("stremio_library.badge", e)
 +        params = []
 +        if badge:
 +            params.append(f"b={badge}")
@@ -32308,7 +34594,7 @@ index 0000000..7efbb11
 +        await asyncio.sleep(6 * 3600)
 diff --git a/comet/services/telegram_bot.py b/comet/services/telegram_bot.py
 new file mode 100644
-index 0000000..61eec2d
+index 0000000..b4adff3
 --- /dev/null
 +++ b/comet/services/telegram_bot.py
 @@ -0,0 +1,470 @@
@@ -32596,7 +34882,7 @@ index 0000000..61eec2d
 +            return f"😕 {label}: nenhuma fonte encontrada agora."
 +        pt, other = _summary(streams)
 +        if pt:
-+            return f"✅ {label} já está pronto dublado:\n{pt}\nÉ só abrir no Stremio."
++            return f"✅ {label} já está pronto dublado:\n{pt}\nÉ só abrir no Nuvio."
 +        choice = _pick_predownload(streams)
 +        if choice:
 +            st = await _trigger_download(s, choice)
@@ -33145,10 +35431,10 @@ index 0000000..8f1de3d
 +    return [line + (f" · erro: {_last_error}" if _last_error else "")]
 diff --git a/comet/services/warmup.py b/comet/services/warmup.py
 new file mode 100644
-index 0000000..dc477e6
+index 0000000..cab14ce
 --- /dev/null
 +++ b/comet/services/warmup.py
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,117 @@
 +import asyncio
 +import os
 +import time
@@ -33237,7 +35523,18 @@ index 0000000..dc477e6
 +                raise
 +
 +
++async def _warm_anime_pt() -> None:
++    """Prepara a lista de animes dublados logo depois de ligar (a análise leva ~13 s)."""
++    try:
++        await asyncio.sleep(20)
++        from comet.services.catalogs import _anime_pt_series
++        await _anime_pt_series()
++    except Exception as e:
++        logger.debug(f"aquecimento dos animes dublados falhou: {e}")
++
++
 +async def start_catalog_warmup():
++    asyncio.ensure_future(_warm_anime_pt())
 +    try:
 +        initial_delay_raw = os.getenv("WARMUP_INITIAL_DELAY", "300")
 +        try:
@@ -33580,7 +35877,7 @@ index 0000000..709d6f1
 +    }
 diff --git a/comet/services/wishlist.py b/comet/services/wishlist.py
 new file mode 100644
-index 0000000..93c4ba9
+index 0000000..1cdae3c
 --- /dev/null
 +++ b/comet/services/wishlist.py
 @@ -0,0 +1,602 @@
@@ -33936,7 +36233,7 @@ index 0000000..93c4ba9
 +                ready = _pt_ready(streams)
 +                if ready:
 +                    await _set_status(r["id"], "pronto", note=sid, done=True)
-+                    await send_telegram(f"⚡ Chegou dublado: {label}\n{ready}\nÉ só abrir no Stremio.")
++                    await send_telegram(f"⚡ Chegou dublado: {label}\n{ready}\nÉ só abrir no Nuvio.")
 +                    counts["ready"] += 1
 +                    continue
 +                if r["status"] == "baixando":   # download já pedido (uma vez só): só espera ficar ⚡
@@ -34087,7 +36384,7 @@ index 0000000..93c4ba9
 +        if ready:
 +            await database.execute("UPDATE radar SET status = 'avisado', notified_at = :t WHERE imdb = :i",
 +                                   {"t": _now(), "i": r["imdb"]})
-+            await send_fn(f"🎬 Saiu do cinema e já tem dublado: {r['title']}\n{ready}\nÉ só abrir no Stremio.")
++            await send_fn(f"🎬 Saiu do cinema e já tem dublado: {r['title']}\n{ready}\nÉ só abrir no Nuvio.")
 +            notified += 1
 +    return notified
 +

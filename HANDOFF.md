@@ -1,6 +1,6 @@
 # HANDOFF: NuvioComet (Comet do A71 para o app Nuvio)
 
-*Última atualização: 09/11/2026 (horário de Brasília)*
+*Última atualização: 18/11/2026 (horário de Brasília)*
 
 Este é o documento de passagem: regras, estado verificado e próximos passos.
 - O histórico completo da fase Stremio (itens 1 a 35, medições, decisões) está em `docs/historico/HANDOFF-stremio.md`. Consulte quando precisar de detalhe antigo.
@@ -69,12 +69,40 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 - **Busca progressiva (09/11, `orchestration._scrape_progressive`):** na 1ª busca de um título, a resposta sai com o que chegou em 6 s, se já houver resultado em PT. Sem PT, espera todas as fontes, como antes. O que chega depois (Prowlarr, que leva de 5 a 25 s, e MediaFusion) é filtrado à parte e vai para o cache, então a próxima abertura já vem completa. Para ajustar: `PROGRESSIVE_SOFT_S` (0 desliga) e `PROGRESSIVE_MIN_RESULTS`, como variáveis de ambiente do processo. 1ª busca medida: de 12 a 15 s (antes até 30 s), dos quais uns 4 s são a consulta ao TorBox/RD.
 - **Homônimos pelo arquivo (09/11):** depois da consulta ao debrid, o nome do **arquivo** escolhido dentro do pacote também passa pelas regras de homônimo (`TitleMatcher.homonym_blocked`, `TorrentManager.drop_homonym_files`). Os títulos de episódio da homônima valem também sem o número da parte ("World War Three (2)" → "world war three"). Um trecho que também aparece num título nosso só bloqueia pelo SxxEyy ("the daleks" × "evolution of the daleks"). Ainda passam pacotes **não baixados** sem ano e sem título de episódio no nome ("Doctor Who S01 1080p"): pelo nome não dá para saber de qual série são.
 - **Streamings no estilo Disney+ (09/11, `comet/services/streamings.py`):** uma **Coleção** do Nuvio, "Streamings", fixada no topo da tela inicial, com 11 pastas: Para Você, Netflix, Prime Video, Disney+, HBO Max, Apple TV+, Paramount+, Globoplay, Crunchyroll, MUBI e Pluto TV.
-  - **Na tela inicial (Moderna):** cada pasta é um bloco 16:9 de vidro na cor da marca com o logo oficial (TMDB). Com foco, o bloco ganha um brilho que passa (GIF), e o destaque do topo vira o **vídeo** daquele serviço: os títulos em alta passando com zoom lento, ~17 s, gerado com ffmpeg. Depois do vídeo fica o fundo do título em alta, com o logo do serviço.
-  - **Dentro da pasta:** abas 🏆 Top 10 séries, 🏆 Top 10 filmes (cards com o número gigante, estilo Netflix), ✨ Originais (pela rede: Netflix, Prime, Disney+, Max, Apple, Paramount+, Globoplay e Crunchyroll), 🔥 Séries em alta, 🍿 Filmes em alta, 🆕 Novidades, 💎 Séries aclamadas e 💎 Filmes aclamados. A aba aparece como "🏆 Top 10 séries · Netflix" porque o Nuvio junta o nome do catálogo com o filtro.
+  - **Na tela inicial (Moderna):** cada pasta é um bloco 16:9 de vidro na cor da marca com o logo oficial (TMDB). Com foco, o destaque do topo mostra uma **imagem parada** em alta resolução (fundo do título em alta + logo do serviço).
+    - **10/11:** saíram o brilho animado do foco e o **vídeo** do destaque. O vídeo do Nuvio toma a tela inteira, escondendo as fileiras, e tremia (zoom do ffmpeg). Não volte com `heroVideoUrl` nem `focusGifUrl`.
+  - **Dentro da pasta (10/11):** abre **como a tela inicial**, em fileiras com destaque no topo (`viewMode: FOLLOW_LAYOUT`), sem abas. São **45 fileiras no modelo da página da Netflix** (`streamings.TABS`, referência: `Área de Transferência (1).png`):
+    - **Top 10:** "Brasil: top 10 em séries hoje" e "em filmes hoje".
+    - **Pessoais** (`_PERSONAL_TABS`): Continuar assistindo, Principais escolhas do dia para você, "Porque você viu <título>" (série e filme), Minha lista, Filmes que você começou e Filmes da minha lista.
+      - Usam a biblioteca do Stremio + Trakt e só mostram o que está no serviço ("onde assistir" do TMDB no Brasil, cache de 3 dias).
+      - O título do "Porque você viu" fica em `data/svc_art/because.json` e muda uma vez por dia, no aquecimento. O nome da fileira vem do manifesto, que o Nuvio só relê ao abrir o app.
+    - **Gêneros** (`_GENRE_TABS`, TMDB do serviço no Brasil): Anime, Ficção, Para ver e relaxar, Séries emocionantes, Romances, Episódios curtinhos, Dramas coreanos, Dramas adolescentes, Família, Ação, Crime e mistério, Crimes reais, Suspense, Mistérios, Terror, Séries dos EUA/japonesas/em espanhol/brasileiras, Filmes brasileiros, Comédias, Ficção científica, Fantasia, Guerra, Filmes de anime, Para as crianças, "Com pressa?", Documentários, Clássicos e os Aclamados pela crítica.
+    - **Sem repetir títulos:** cada fileira tira os 12 primeiros das fileiras de cima, do jeito que aparecem na tela, e o Top 10 do mesmo tipo (`_seen_above`/`_dedup`). Se sobrar pouco, completa com a página seguinte. As pessoais podem repetir, como na Netflix.
+    - Fileira vazia (ex.: MUBI sem animes) não aparece no Nuvio.
+    - **Carga:** no máximo 4 fileiras buscadas no TMDB ao mesmo tempo (`_FETCH_SEM`). Fileira incompleta (limite do TMDB) fica só 10 min no cache. `_warm_rows` aquece as ~450 fileiras devagar, com pausa entre elas, depois de cada reinício e às 05:10. Sem a pausa, o "Animes dublados" estourou o tempo limite de 15 s na regressão.
+  - **Cards no estilo Netflix (10/11, `comet/services/artwork.py`, valem para todas as fileiras):**
+    - **Top 10** (dos serviços e o "Top 10 de hoje" da tela inicial): `/art/top10w/<n>/<pôster>?b=&p=`, card 16:9 com o número gigante só no contorno cinza e o pôster em pé por cima da ponta, com o logo do serviço e a etiqueta embaixo. Substituiu o número dourado (`/art/svc/rank`, removido).
+    - **Card horizontal** (`/art/land`, chave de cache `landv4`): cena mais viva, logo do título embaixo à esquerda, logo do serviço pequeno no canto de cima à esquerda e o quadradinho vermelho "TOP 10" no canto de cima à direita. O Nuvio guarda a imagem pelo endereço: ao mudar o desenho, suba também `_CARD_V` em `streamings.py` (vai como `&v=` no `landscapePoster`), senão a TV continua com o card antigo.
+    - **Etiqueta** no pé, ao centro: "Novo episódio | Assista já" (episódio de hoje ou ontem), "Nova temporada" (temporada estreou há até 30 dias), "Novidade" (série ou filme novo), "Novo episódio" (até 10 dias) e "Dublado" (branco). Regra das séries: `catalogs._series_badge`, com os dados de `_tv_info`.
+    - **Fundo da tela (10/11, `streamings._hi_background`):** o `background` de todo card é a cena do TMDB em tamanho `original`, nunca o card (`/art/...`) e nunca `w1280`. Antes a pasta usava o próprio card esticado como fundo (no Top 10, o número + pôster) e a tela inicial ficava em 1280 px; só a página do título vinha em 4K.
+    - **Fileiras pessoais da tela inicial** (Para você, Minha lista, Novos episódios, Acabou de chegar dublado; `stremio_library._build_landscape_meta`): sem serviço informado, perguntam ao TMDB onde o título passa (`resolve_single_watch_provider`) e calculam a etiqueta da série (`_series_badge`). Antes saíam sem logo e sem etiqueta.
+    - **Logo do serviço só nos originais**, nas pastas: séries pela rede do TMDB e filmes pelo estúdio (`streamings.is_original`, `_ORIG_COMPANIES`). Na tela inicial o logo continua mostrando onde o título passa.
   - **Catálogos:** `comet_sv_<aba>` (8 no manifesto, com `showInHome: false`; o serviço vai no `genre`). Sem serviço, usam a Netflix. As fileiras "📺 Nos streamings" e "⭐ Originais dos streamings" saíram da tela inicial (`showInHome: false`) e continuam no Explorar.
-  - **Artes:** `/art/svc/{tile|focus|hero|logo|video}/<serviço>.<ext>` e `/art/svc/rank/<serviço>-<n>.jpg`, em `data/svc_art/`. São refeitas todo dia às 05:10 (o fundo e o vídeo seguem o que está em alta). Fonte Montserrat (OFL) em `data/fonts/`. Para trocar o desenho, suba `_ART_VERSION`.
+  - **Artes:** `/art/svc/{tile|hero|logo}/<serviço>.<ext>` (`focus` e `video` ainda respondem, mas não são mais gerados nem usados) e `/art/svc/rank/<serviço>-<n>.jpg`, em `data/svc_art/`. São refeitas todo dia às 05:10 (o fundo e o vídeo seguem o que está em alta). Fonte Montserrat (OFL) em `data/fonts/`. Para trocar o desenho, suba `_ART_VERSION` (7 desde 10/11).
   - **Coleção:** `GET /nuvio/colecoes.json`, sem token (só tem links das artes e o id do addon). Para instalar na TV, veja `config/nuvio-ajustes.md` ("Coleções").
+- **Top 10 oficial da Netflix (10/11, `official_top10.py`):** a pasta da Netflix usa o Top 10 que a própria Netflix publica para o Brasil (arquivo `all-weeks-countries.tsv`, ~33 MB, semanal, sai às terças). É baixado no máximo a cada 12 h, em 2º plano (leva ~3 min no A71), e cada título é casado com o TMDB conferindo se está na Netflix BR (homônimos como "The One"). Estado em `data/official_top10.json`.
+  - Os outros serviços **não publicam** Top 10: Prime, Disney+, Max, Apple, Paramount+ e Globoplay continuam com "em alta no TMDB para aquele serviço". O FlixPatrol junta todos, mas bloqueia acesso automático (403) e a API dele é paga.
+- **Cards em todas as fileiras (10/11, `streamings.land_enrich`):** Estreias da semana, Acabou de chegar dublado, Minha lista, Para hoje à noite, Natal novos e "Chegou esta semana" ganham o card com logo do título, logo do serviço e etiqueta (cache de 6 h; o que não fica pronto em 8 s entra no próximo pedido). `_land_url` reconhece o card embrulhado pela capa "ao vivo" (`/art/live.jpg?u=`).
+- **Selo + Dublado (10/11):** quando há dublado pronto, o selo vira "Novidade | Dublado", "Novo episódio | Dublado", "Nova temporada | Dublado" ou TOP 10 no canto + "Dublado" embaixo (`catalogs._with_dub`, `artwork.VALID_BADGES`). Antes o "Dublado" só aparecia sem outro selo.
+- **Fileiras novas (10/11):** "Chegou esta semana nos streamings" (`comet_svnew`: filme com lançamento digital no BR há até 10 dias; série com episódio nos últimos 7 dias), "Filmes curtos (até 1h30)" (`comet_mood_short`, dentro do "Para cada clima") e "Séries completas para o fim de semana" (`comet_mood_weekend`: encerradas, episódios até 50 min).
+- **Podcasts (10/11, `podcasts.py`):** fileira "Podcasts mais ouvidos" com o ranking do Brasil da Apple (sem chave, 6 h). Cada podcast é uma série (`cometlive:pod:<id>`); episódios do RSS do próprio podcast. 1ª fonte: vídeo com a capa + áudio (ffmpeg, como a rádio, sem avançar); 2ª: o áudio direto (dá para avançar).
+- **Filmes dos games (10/11, `games.py`):** fileira "Filmes dos games": 15 sagas (God of War, Kingdom Hearts, The Last of Us, Uncharted, FF VII, Resident Evil, Spider-Man, Red Dead, Batman Arkham, Horizon, Metal Gear, Star Wars Jedi, Mortal Kombat, Ghost of Tsushima, Death Stranding), cada jogo um episódio. Vídeos do YouTube achados pelo `yt-dlp` (venv separado em `/opt/ytdlp`; atualizar com `/opt/ytdlp/bin/pip install -U yt-dlp` se parar): uma versão **dublada** e uma **legendada**, com pelo menos 45 min, sem repetir vídeo na saga. Escolhas em `data/games.json` (14 dias; `_PICK_V` refaz). Para tocar, `/game/play/<id>.m3u8` repassa o HLS do YouTube (até 1080p, dá para avançar). O link vale para o IP de casa: no 4G pode não abrir. Para pôr outro jogo/saga: lista `SAGAS`.
+- **Link de convidado (10/11):** `GUEST_LINK_TOKEN` no `.env`. Para outro perfil do Nuvio (cada perfil tem seus addons): tudo igual, menos as fileiras pessoais (`GUEST_HIDDEN_CATALOGS`). Já existia o link infantil (`KIDS_LINK_TOKEN`). Os plays do convidado ainda contam no "gosto" e na "fonte que falhou".
+- **Rodada do fim da tarde (10/11, `nightly._evening_loop`):** às 17:30, só o próximo episódio das séries em andamento (cache do debrid vale 1 dia), para o play da noite sair do cache e o aviso de dublado no Telegram chegar antes. Log `🌆`. Os avisos agora dizem "no Nuvio".
+- **Minha TV e fileiras extras:** a 1ª fonte também ganha "▶ Assistir" (toca sozinha).
 - **Rádio:** a 1ª opção é vídeo (`/radio/<id>/tv.ts`: capa parada + áudio, ffmpeg), porque o player do Nuvio espera um quadro de vídeo.
+- **Rádio e TV ao vivo tocam direto (10/11):** a 1ª opção de todo `cometlive:` (Pluto, rádio, Minha TV) ganha "▶ Assistir" no nome (`stream.py`), para casar com o regex do Nuvio, como nos filmes.
+- **Animes dublados (10/11):** a lista de animes com torrent PT no banco (análise de ~42 mil nomes, ~13 s no A71) fica guardada 1 h (`catalogs._anime_pt_series`). A análise começa 20 s depois de ligar (`warmup._warm_anime_pt`) e continua mesmo se um pedido estourar os 15 s. Antes a fileira vinha vazia a cada reinício.
 - **Fileiras:** 47 catálogos (42 na tela inicial), agrupadas (`row_groups.py`). Inclui:
   - fileiras pessoais;
   - Sua semana, Minha TV, futebol e retrospectiva;
@@ -127,6 +155,27 @@ Mudanças de 09/11:
     - **Pendente pequeno:** 10 `database is locked` (DEBUG) num mesmo segundo em `subtitles._persist_pt_filename`, durante a regressão junto com a geração das artes. Não afeta o uso.
     - **Pegadinha da TV:** no Addons do Nuvio, um OK na lista de instalados liga/desliga o addon. Na instalação, o Comet foi desligado sem querer e religado em seguida. Confira a chave do Comet: **verde = ligado**.
 
+### 10/11/2026
+13. **Streamings mais limpos** (Seção 3): bloco sem vídeo nem animação no foco, destaque parado em alta resolução, pasta do serviço em fileiras como a tela inicial e sem repetir o Top 10. Coleção reinstalada na TV pelo "Gerenciar pelo celular" e conferida na TV. `REGRESS OK` (52 pass, 1 warn).
+15. **Leva de novidades (noite de 10/11, `docs/tarefas/A.md`):** Top 10 oficial da Netflix, cards com logo/etiqueta nas fileiras que faltavam, selo "Novidade | Dublado", "Chegou esta semana nos streamings", filmes curtos, séries para o fim de semana, podcasts, filmes dos games, link de convidado e rodada das 17:30 (tudo na Seção 3). Já existiam e ficaram como estavam: logos e gêneros das rádios/TV, pré-busca do próximo episódio (`prefetch`) e aviso de dublado no Telegram.
+14. **Página dos streamings igual à da Netflix** (Seção 3): 45 fileiras por serviço (pessoais incluídas), Top 10 com número vazado + pôster, etiquetas da Netflix, logo só nos originais e sem títulos repetidos entre as fileiras. `REGRESS OK` (52 pass, 1 warn; manifesto com 92 catálogos).
+    - Fora do alcance do servidor: card do Top 10 mais estreito, como o da Netflix (o Nuvio usa um formato só por fileira), fileiras que misturam filmes e séries (cada catálogo é de um tipo só) e o nome do episódio embaixo do card.
+
+### 17/11/2026
+16. **Trailer não vira filme** (`filtering.TitleMatcher.extra_video_blocked`): torrent ou arquivo com "trailer", "teaser" ou "featurette" no nome sai da lista, salvo se a palavra estiver no título da obra ("Trailer Park Boys"). Vale no `filter_worker` (busca nova) e no `drop_homonym_files` (arquivo escolhido depois do debrid, inclusive o que já estava no cache). Antes, "A Odisseia" tocava "Official Teaser Trailer 4K.mkv" como ▶ Assistir. `REGRESS OK` (52 pass, 1 warn). Patch: 88 arquivos.
+17. **Nuvio no projetor** (Horlat T9N, `192.168.3.64:5555`, Android 12, armeabi-v7a): NuvioTV 1.1.0 instalado e logado no Nuvio Sync. Ajustes em `config/nuvio-ajustes.md` ("Projetor").
+
+### 17/11/2026 (`docs/tarefas/B.md`)
+18. **Pacote BR com episódio errado:** nomes `Nome.04.21.720p` (TT.EE) e "Episódio NN" agora são lidos (`stremthru.br_episode_hint`). Play sem `media_id` usa o `ep_key`, e temporada+episódio sempre exigem o arquivo certo. Antes, o 2 Broke Girls T4 dublado abria o primeiro arquivo do pacote.
+19. **Outro corte de episódios (Netflix):** link direto e torrent sondado com duração muito diferente da do episódio no TMDB (ex.: Meu Nome é Farah, 42 min × 129 min) ficam fora do ▶ Assistir e dos atalhos, com o aviso "⚠️ Outra divisão de episódios". Medições em `data/direct_durations.json`.
+20. **Streamings com "+" no nome** (Apple TV+, Disney+, Paramount+) caíam na Netflix: o `parse_qs` trocava o `+` por espaço. Consertado em `catalog.py` e `streamings._service_from_genre`.
+21. **Dublado escondido em "Multi-Audio" (anime da Crunchyroll):** sem dublado confirmado, o Comet sonda até 2 releases Multi-Audio/MULTi/Dual; achando PT-BR, a próxima abertura já mostra 🇧🇷 (Diários de uma Apotecária T2). NCOP/NCED/trailer não viram atalho nem ▶ Assistir.
+    - `REGRESS OK` (52 pass, 1 warn). Patch: 88 arquivos.
+
+### 18/11/2026 (revisão geral)
+22. **Conferido ao vivo:** `REGRESS OK` (52 pass, 1 warn: "Minha lista · filmes" vazia porque a lista do Trakt só tem uma série). Patch do PC idêntico ao do A71. Smoke OK de hora em hora. Play real com o episódio e o dublado certos: Apotecária 2x1/2x12/2x24 e 2 Broke Girls 4x21/4x22/2x5, vídeo em até 2,8 s. NuvioTV 1.1.0 é a última versão estável (1.2.0 ainda beta).
+    - Pequenos, em aberto: na 1ª abertura a linha 🔊 pode sair incompleta até a sondagem terminar; a busca falha em 2 de 32 frases ("anime de ninja", "filme de dinossauro").
+
 ---
 
 ## 5. Pendências e próximos passos
@@ -135,7 +184,9 @@ Mudanças de 09/11:
 |---|---|---|
 | 1 | **1ª busca ainda leva de 12 a 15 s.** Uns 6 s vêm do corte da busca progressiva, para esperar o BrSites, que traz os dublados BR em 5,5 a 6 s. Outros ~4 s são a consulta ao TorBox/RD. O autoplay do Nuvio espera 3 s, então numa 1ª busca ainda pode cair na lista. Ideia: aquecer antes os episódios prováveis (próximo da série em andamento), como o `prefetch` já faz | Claude |
 | 2 | Pacotes de homônimos **não baixados** sem ano nem título de episódio no nome (Seção 3) | — |
-| 3 | Ideias sem dono: podcasts, pedido por foto | — |
+| 3 | Ideias sem dono: pedido por foto | — |
+| 4 | Top 10 real dos outros streamings (só a Netflix publica). Fonte possível: API paga do FlixPatrol | usuário decide |
+| 5 | Perfis na TV: criar o perfil de convidado no Nuvio e instalar nele o link de convidado | usuário |
 
 ---
 

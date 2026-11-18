@@ -527,8 +527,60 @@ def t_unit_streamings() -> tuple[str, str]:
     folders = col[0]["folders"]
     assert col[0]["pinToTop"] and folders[0]["id"] == "foryou" and len(folders) == len(sv.SERVICES) + 1
     nf = next(f for f in folders if f["id"] == "netflix")
-    assert nf["tileShape"] == "LANDSCAPE" and nf["heroVideoUrl"].endswith(".mp4?v=" + sv._ART_VERSION)
-    assert [s["catalogId"] for s in nf["sources"]][:3] == ["comet_sv_top10s", "comet_sv_top10m", "comet_sv_orig"]
+    assert nf["tileShape"] == "LANDSCAPE" and nf["heroBackdropUrl"].endswith(".jpg?v=" + sv._ART_VERSION)
+    # 10/11: o vídeo do destaque tomava a tela inteira; a pasta abre em fileiras, como a tela inicial
+    assert all("heroVideoUrl" not in f and not f["focusGifEnabled"] for f in folders)
+    assert col[0]["viewMode"] == "FOLLOW_LAYOUT"
+    assert sv._PERSONAL_TABS <= {t for t, _m, _n in sv.TABS}
+    # 10/11: fileiras como na Netflix (Top 10, gêneros, originais...), Top 10 com número vazado + pôster
+    assert [s["catalogId"] for s in nf["sources"]][:3] == ["comet_sv_top10s", "comet_sv_conts", "comet_sv_anime"]
+    assert len(nf["sources"]) == len(sv.TABS) >= 40
+    assert sv.tmdb_query("svx_netflix_mylists", "series", "pt-BR", "BR", 1, today) is None, "pessoal fora do TMDB"
+    p, q = sv.tmdb_query("svx_netflix_jps", "series", "pt-BR", "BR", 1, today)
+    assert q["without_genres"].endswith(",16") and q["with_origin_country"] == "JP"
+    # logo do serviço só nos originais
+    assert sv.is_original("netflix", "series", networks=[213]) and not sv.is_original("netflix", "series", networks=[49])
+    assert sv.is_original("netflix", "movie", companies=["Netflix", "X"])
+    assert not sv.is_original("netflix", "movie", companies=["Warner Bros. Pictures"])
+    assert not sv.is_original("mubi", "movie", companies=None), "sem estúdio conhecido: nem consulta"
+    # selos da série, como na Netflix
+    from comet.services.catalogs import _series_badge
+    d = _dt.date(2026, 11, 10)
+    info = {"air_date": "2026-11-10", "season": 2, "seasons": {2: "2026-11-10"}}
+    assert _series_badge(info, d) == "new_ep_now"
+    assert _series_badge({**info, "air_date": "2026-11-05", "seasons": {2: "2026-10-20"}}, d) == "new_season"
+    assert _series_badge({**info, "air_date": "2026-11-05", "season": 1, "seasons": {1: "2026-10-20"}}, d) == "new"
+    assert _series_badge({**info, "air_date": "2026-11-05", "seasons": {2: "2025-01-01"}}, d) == "new_ep"
+    assert _series_badge({**info, "air_date": "2026-09-01"}, d) is None
+    p, q = sv.tmdb_query("svx_netflix_kdramas", "series", "pt-BR", "BR", 1, today)
+    assert q["with_original_language"] == "ko" and q["with_watch_providers"] == 8
+    assert sv.top10_url("https://x", 3, "/abc.jpg", "new_ep", 8) == "https://x/art/top10w/3/abc.jpg?b=new_ep&p=8"
+    assert sv.top10_url("https://x", 11, "/abc.jpg") is None
+    # card novo = endereço novo (o Nuvio guarda a imagem pelo endereço)
+    assert sv._card_v("https://x/art/land/a.jpg?b=new") == "https://x/art/land/a.jpg?b=new&v=" + sv._CARD_V
+    assert sv._card_v("https://x/art/land/a.jpg") == "https://x/art/land/a.jpg?v=" + sv._CARD_V
+    assert sv._card_v("https://x/art/top10w/1/a.jpg") == "https://x/art/top10w/1/a.jpg"
+    # fundo da tela em resolução cheia, nunca o card esticado
+    _m = {"poster": "https://x/art/land/bk.jpg/lg.png?b=new", "background": "https://x/art/top10w/1/p.jpg"}
+    sv._hi_background(_m)
+    assert _m["background"] == "https://image.tmdb.org/t/p/original/bk.jpg", _m
+    _m = {"background": "https://image.tmdb.org/t/p/w1280/bk.jpg"}
+    sv._hi_background(_m)
+    assert _m["background"] == "https://image.tmdb.org/t/p/original/bk.jpg", _m
+    # 10/11: card embrulhado pela capa "ao vivo" ainda conta como card com logo
+    _w = "https://x/art/live.jpg?u=https%3A%2F%2Fx%2Fart%2Fland%2Fa.jpg%3Fb%3Dnew"
+    assert sv._land_url({"poster": _w}, "https://x") == _w
+    assert sv._needs_land({"poster": "https://x/art/land/a.jpg?b=new"})
+    assert not sv._needs_land({"poster": "https://x/art/land/a.jpg?b=new&p=8"})
+    # selo combinado com "Dublado"
+    from comet.services.catalogs import _with_dub
+    from comet.services.artwork import VALID_BADGES
+    assert _with_dub("new") == "new_dub" and _with_dub(None) == "dub" and _with_dub("new_ep_now") == "new_ep_now"
+    assert {"new_dub", "new_ep_dub", "new_season_dub", "top10_dub"} <= VALID_BADGES
+    # link de convidado: sem as fileiras pessoais
+    from comet.core.config_validation import GUEST_HIDDEN_CATALOGS, is_guest_request
+    assert "comet_foryou" in GUEST_HIDDEN_CATALOGS and not is_guest_request(None)
+    assert all(not any(ch in name for ch in "🏆✨🔥🍿🆕💎") for _t, _m, name in sv.TABS)
     assert all(s["genre"] == "Netflix" for s in nf["sources"])
     return "PASS", f"{len(cats)} abas fora da home, {len(folders)} pastas, consultas TMDB por serviço OK"
 
@@ -713,6 +765,10 @@ def t_catalogos(token: str, baseline_data: dict, current_baseline: dict, save_ba
             if cat_id in ("comet_tonight", "comet_fut", "comet_recap", "comet_mytv"):
                 if count == 0 and cat_id in ("comet_mytv", "comet_recap"):
                     warns.append(f"{cat_id} vazio")
+                continue
+            # fileiras pessoais dos streamings (só o que está no serviço): podem ter poucos ou nenhum
+            if cat_id.startswith("comet_sv_") and cat_id[len("comet_sv_"):] in (
+                    "conts", "contm", "picks", "becs", "becm", "mylists", "mylistm"):
                 continue
             if cat_id == "comet_previewtest":
                 if count != 4:
@@ -1628,6 +1684,12 @@ def t_fileiras_novas(token: str) -> tuple[str, str]:
         ("movie", "comet_mood_oscar", 15),
         ("movie", "comet_mood_top", 15),
         ("movie", "comet_mood_classicdub", 15),
+        ("movie", "comet_mood_short", 10),
+        ("series", "comet_mood_weekend", 10),
+        ("movie", "comet_svnew", 3),
+        ("series", "comet_svnew", 10),
+        ("series", "comet_podcasts", 20),
+        ("series", "comet_games", 10),
     ]
     with get_client(timeout=35.0) as client:
         counts = {}
