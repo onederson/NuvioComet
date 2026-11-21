@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COMET_PATCHES = REPO_ROOT / "comet-patches"
@@ -366,6 +366,157 @@ class TestOfflineLibrary(unittest.TestCase):
 
         reloaded = offline_library._load_index(self.index_path)
         self.assertNotIn("tt1845307:5:1", reloaded.get("items", {}))
+
+    # 7. _ChunkedFileHasher bate exatamente com _hash_file_pieces
+    def test_chunked_file_hasher(self):
+        p = os.path.join(self.temp_dir.name, "sample.bin")
+        data = os.urandom(1200 * 1024)  # > 2 peças de 512 KB
+        w = offline_library._ChunkedFileHasher(p)
+        for off in range(0, len(data), 100 * 1024):
+            w.write_batch(data[off:off + 100 * 1024])
+        total, pieces = w.finish()
+        ref_total, ref_pieces = offline_library._hash_file_pieces(p)
+        self.assertEqual(total, len(data))
+        self.assertEqual(total, ref_total)
+        self.assertEqual(pieces, ref_pieces)
+
+    # 8. HLS timeout proporcional, timeout real, cancelamento e fallback para proc.kill()
+    def test_hls_timeout_and_cancel(self):
+        self.assertGreaterEqual(offline_library._hls_timeout_seconds("movie", None), 2400.0)
+        self.assertGreaterEqual(offline_library._hls_timeout_seconds("movie", 180), 3240.0)
+        self.assertGreaterEqual(offline_library._hls_timeout_seconds("series", 45), 900.0)
+
+        class FakeProc:
+            def __init__(self, ignore_terminate: bool = False):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                self.ignore_terminate = ignore_terminate
+                self._ev = asyncio.Event()
+
+            def terminate(self):
+                self.terminated = True
+                if not self.ignore_terminate:
+                    self.returncode = -15
+                    self._ev.set()
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+                self._ev.set()
+
+            async def wait(self):
+                await self._ev.wait()
+                return self.returncode
+
+        async def run_cancel():
+            proc = FakeProc()
+            offline_library._CANCEL_FLAG = True
+            st = await offline_library._wait_hls_proc(proc, timeout_s=60.0, poll_s=0.02)
+            return st, proc.terminated
+
+        st, terminated = asyncio.run(run_cancel())
+        self.assertEqual(st, "cancelled")
+        self.assertTrue(terminated)
+        offline_library._CANCEL_FLAG = False
+
+        # Caso timeout real + processo que ignora SIGTERM e exige SIGKILL
+        async def run_timeout_kill():
+            proc = FakeProc(ignore_terminate=True)
+            st_to = await offline_library._wait_hls_proc(proc, timeout_s=0.03, poll_s=0.01, term_wait_s=0.02)
+            return st_to, proc.terminated, proc.killed
+
+        st_to, term_to, killed_to = asyncio.run(run_timeout_kill())
+        self.assertEqual(st_to, "timeout")
+        self.assertTrue(term_to)
+        self.assertTrue(killed_to)
+
+    # 9. build_local_stream sem b64config não retorna URL quebrada com 'local'
+    def test_build_local_stream_requires_valid_token(self):
+        video_file = os.path.join(self.offline_dir, "movie.mp4")
+        with open(video_file, "wb") as f:
+            f.write(b"1" * 1024)
+        offline_library._save_index(
+            {"items": {"tt0133093": {"path": video_file, "filename": "movie.mp4", "size": 1024, "height": 1080, "dubbed": True}}},
+            self.index_path,
+        )
+        with patch.object(offline_library, "_get_internal_token", return_value=None):
+            self.assertIsNone(offline_library.build_local_stream("tt0133093", None, "https://x.test", self.index_path))
+        with patch.object(offline_library, "_get_internal_token", return_value="real_tok"):
+            st = offline_library.build_local_stream("tt0133093", None, "https://x.test", self.index_path)
+            self.assertIsNotNone(st)
+            self.assertIn("/offline/real_tok/tt0133093/movie.mp4", st["url"])
+
+    # 10. _worker_loop para imediatamente em low_disk e separa falhas de não encontrados
+    def test_worker_low_disk_and_failure_counts(self):
+        sent = []
+
+        async def fake_send(msg: str) -> bool:
+            sent.append(msg)
+            return True
+
+        # Caso A: low_disk interrompe a fila imediatamente
+        async def fake_dl_low(client, item):
+            return {"status": "low_disk", "media_id": item["media_id"], "free_gb": 11.2}
+
+        offline_library._JOB_QUEUE.append({
+            "title": "Show LowDisk",
+            "items": [
+                {"media_id": "tt1:1:1", "season": 1, "episode": 1},
+                {"media_id": "tt1:1:2", "season": 1, "episode": 2},
+            ],
+        })
+        offline_library._JOB_QUEUE.append({"title": "Outro Job", "items": [{"media_id": "tt2"}]})
+        with patch.object(offline_library, "_download_item", side_effect=fake_dl_low), \
+             patch.object(offline_library, "send_telegram", side_effect=fake_send):
+            asyncio.run(offline_library._worker_loop())
+
+        self.assertEqual(len(offline_library._JOB_QUEUE), 0)
+        self.assertTrue(any("pouco espaço livre" in m for m in sent))
+        self.assertTrue(any("Outros pedidos removidos da fila (1): Outro Job" in m for m in sent))
+        self.assertFalse(any("Não encontrados" in m for m in sent))
+
+        # Caso B: separa falhas de não encontrados
+        sent.clear()
+        statuses = iter([
+            {"status": "not_found", "media_id": "tt1:1:1"},
+            {"status": "timeout", "media_id": "tt1:1:2"},
+        ])
+
+        async def fake_dl_mix(client, item):
+            return next(statuses)
+
+        offline_library._JOB_QUEUE.append({
+            "title": "Show Mix",
+            "items": [
+                {"media_id": "tt1:1:1", "season": 1, "episode": 1},
+                {"media_id": "tt1:1:2", "season": 1, "episode": 2},
+            ],
+        })
+        with patch.object(offline_library, "_download_item", side_effect=fake_dl_mix), \
+             patch.object(offline_library, "send_telegram", side_effect=fake_send), \
+             patch.object(asyncio, "sleep", new_callable=AsyncMock):
+            asyncio.run(offline_library._worker_loop())
+
+        self.assertTrue(any("Não encontrados: 1" in m and "Falhas (erro/timeout/validação): 1" in m for m in sent))
+
+    # 11. inject_local_into_streams insere o local em 1º e rebaixa '▶ Assistir' online sem sumir com ele
+    def test_inject_local_into_streams(self):
+        notice = {"name": "ℹ️ Aviso", "description": "Aviso sem URL"}
+        online_best = {"name": "▶ Assistir\n1080p", "description": "TorBox · 1,2 GB", "url": "https://tb/1"}
+        online_orig = {"name": "🎧 Original\n1080p", "description": "Inglês", "url": "https://tb/2"}
+        local_st = {"name": "▶ Assistir\n💾 720p", "description": "Local no A71", "url": "https://a71/offline/1"}
+
+        merged = offline_library.inject_local_into_streams([notice, online_best, online_orig], local_st)
+        self.assertEqual(len(merged), 4)
+        self.assertEqual(merged[0]["name"], "ℹ️ Aviso")
+        self.assertEqual(merged[1]["name"], "▶ Assistir\n💾 720p")
+        self.assertEqual(merged[1]["url"], "https://a71/offline/1")
+        # A melhor fonte online continua na lista logo abaixo (índice 2), sem prefixo '▶ Assistir'
+        self.assertEqual(merged[2]["url"], "https://tb/1")
+        self.assertNotIn("Assistir", merged[2]["name"])
+        self.assertIn("1080p", merged[2]["name"])
+        self.assertEqual(merged[3]["url"], "https://tb/2")
 
 
 if __name__ == "__main__":

@@ -672,7 +672,9 @@ def build_local_stream(
     if not entry:
         return None
 
-    token = b64config or "local"
+    token = (b64config or "").strip() or _get_internal_token(fallback=None)
+    if not token:
+        return None
     filename = entry.get("filename") or os.path.basename(entry.get("path", ""))
     url = f"{base_url.rstrip('/')}/offline/{token}/{media_id}/{filename}"
 
@@ -720,6 +722,25 @@ def build_local_stream(
     }
 
 
+def inject_local_into_streams(streams: list[dict], local_stream: dict | None) -> list[dict]:
+    """Insere o stream local em 1º (após avisos) e remove apenas o prefixo '▶ Assistir' das fontes online."""
+    if local_stream is None:
+        return list(streams)
+    out = [dict(s) for s in streams]
+    ins = 0
+    while ins < len(out) and not (
+        out[ins].get("url") or out[ins].get("infoHash") or out[ins].get("externalUrl")
+    ):
+        ins += 1
+    for i in range(ins, len(out)):
+        nm = str(out[i].get("name") or "")
+        if nm.startswith("▶"):
+            demoted = re.sub(r"^▶\s*Assistir\s*\n?", "", nm).strip()
+            out[i] = {**out[i], "name": f"☁️ {demoted}" if demoted else "☁️ Online"}
+    out.insert(ins, local_stream)
+    return out
+
+
 def has_enough_disk_space(path: str, min_free_gb: float = MIN_FREE_GB) -> tuple[bool, float]:
     p = Path(path).resolve()
     while not p.exists() and p.parent != p:
@@ -747,7 +768,7 @@ if router is not None:
         return FileResponse(filepath, media_type=mime, filename=entry.get("filename", filename))
 
 
-def _get_internal_token() -> str:
+def _get_internal_token(fallback: str | None = "local") -> str | None:
     for name in ("NUVIO_LINK_TOKEN", "PERSONAL_LINK_TOKEN"):
         val = getattr(settings, name, None) if settings is not None else None
         if not val:
@@ -773,7 +794,87 @@ def _get_internal_token() -> str:
         for name in ("NUVIO_LINK_TOKEN", "PERSONAL_LINK_TOKEN"):
             if name in found:
                 return found[name]
-    return "local"
+    return fallback
+
+
+class _ChunkedFileHasher:
+    """Grava arquivo em disco e calcula hashes SHA-1 por peça fora do event loop."""
+
+    def __init__(self, path: str, piece_length: int = PIECE_LENGTH):
+        self.path = path
+        self.piece_length = piece_length
+        self.total = 0
+        self._pieces = bytearray()
+        self._buf = bytearray()
+        self._fh = open(path, "wb")
+
+    def write_batch(self, data: bytes) -> int:
+        if not data:
+            return self.total
+        self._fh.write(data)
+        self.total += len(data)
+        self._buf.extend(data)
+        pl = self.piece_length
+        while len(self._buf) >= pl:
+            self._pieces.extend(hashlib.sha1(memoryview(self._buf)[:pl]).digest())
+            del self._buf[:pl]
+        return self.total
+
+    def finish(self) -> tuple[int, bytes]:
+        try:
+            if self._buf:
+                self._pieces.extend(hashlib.sha1(self._buf).digest())
+                self._buf.clear()
+        finally:
+            self.close()
+        return self.total, bytes(self._pieces)
+
+    def close(self) -> None:
+        if self._fh and not self._fh.closed:
+            self._fh.close()
+
+
+def _hls_timeout_seconds(media_type: str, expected_runtime_min: int | None) -> float:
+    if media_type == "movie":
+        return max(2400.0, float(expected_runtime_min or 150) * 18.0)
+    return max(900.0, float(expected_runtime_min or 45) * 18.0)
+
+
+async def _terminate_proc(proc: Any, term_wait_s: float = 5.0) -> None:
+    if getattr(proc, "returncode", None) is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=term_wait_s)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _wait_hls_proc(proc: Any, timeout_s: float, poll_s: float = 2.0, term_wait_s: float = 5.0) -> str:
+    """Aguarda ffmpeg em laço curto, respeitando _CANCEL_FLAG e timeout proporcional."""
+    deadline = time.monotonic() + timeout_s
+    while proc.returncode is None:
+        if _CANCEL_FLAG:
+            await _terminate_proc(proc, term_wait_s=term_wait_s)
+            return "cancelled"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await _terminate_proc(proc, term_wait_s=term_wait_s)
+            return "timeout"
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=min(poll_s, remaining))
+        except (asyncio.TimeoutError, TimeoutError):
+            continue
+    return "ok" if proc.returncode == 0 else "ffmpeg_failed"
 
 
 def _is_episode_covered(covered_set: set[tuple[int, int]], season: int | None, episode: int | None) -> bool:
@@ -882,47 +983,52 @@ async def _download_item(client: httpx.AsyncClient, job_item: dict) -> dict:
                 part_path,
             )
             try:
-                await asyncio.wait_for(proc.wait(), timeout=600.0)
-            except (asyncio.TimeoutError, TimeoutError):
-                proc.kill()
+                hls_timeout = _hls_timeout_seconds(media_type, expected_runtime_min)
+                hls_status = await _wait_hls_proc(proc, hls_timeout)
+            finally:
+                await _terminate_proc(proc)
+            if hls_status != "ok":
                 if os.path.exists(part_path):
                     os.unlink(part_path)
-                return {"status": "timeout", "media_id": media_id}
+                return {"status": hls_status, "media_id": media_id}
 
-            if proc.returncode != 0 or not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
+            if not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
                 if os.path.exists(part_path):
                     os.unlink(part_path)
                 return {"status": "ffmpeg_failed", "media_id": media_id}
 
-            total_size, pieces = _hash_file_pieces(part_path)
+            total_size, pieces = await asyncio.to_thread(_hash_file_pieces, part_path, PIECE_LENGTH)
         else:
-            pieces_acc = bytearray()
-            cur_piece = bytearray()
+            writer = _ChunkedFileHasher(part_path, PIECE_LENGTH)
+            pending = bytearray()
             headers = {"User-Agent": PLAYER_UA}
             dl_timeout = httpx.Timeout(20.0, read=90.0)
-            async with httpx.AsyncClient(timeout=dl_timeout, follow_redirects=True, verify=False) as dl_client:
-                async with dl_client.stream("GET", cand_url, headers=headers) as resp:
-                    resp.raise_for_status()
-                    final_resp_url = str(resp.url)
-                    resp_ct = str(resp.headers.get("content-type") or "").lower()
-                    with open(part_path, "wb") as f:
+            try:
+                async with httpx.AsyncClient(timeout=dl_timeout, follow_redirects=True, verify=False) as dl_client:
+                    async with dl_client.stream("GET", cand_url, headers=headers) as resp:
+                        resp.raise_for_status()
+                        final_resp_url = str(resp.url)
+                        resp_ct = str(resp.headers.get("content-type") or "").lower()
                         async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
                             if _CANCEL_FLAG:
-                                f.close()
+                                await asyncio.to_thread(writer.close)
                                 if os.path.exists(part_path):
                                     os.unlink(part_path)
                                 return {"status": "cancelled", "media_id": media_id}
-                            f.write(chunk)
-                            total_size += len(chunk)
-                            cur_piece.extend(chunk)
-                            while len(cur_piece) >= PIECE_LENGTH:
-                                p_slice = cur_piece[:PIECE_LENGTH]
-                                pieces_acc.extend(hashlib.sha1(p_slice).digest())
-                                del cur_piece[:PIECE_LENGTH]
-
-            if cur_piece:
-                pieces_acc.extend(hashlib.sha1(cur_piece).digest())
-            pieces = bytes(pieces_acc)
+                            if not chunk:
+                                continue
+                            pending.extend(chunk)
+                            if len(pending) >= 1024 * 1024:
+                                batch = bytes(pending)
+                                pending.clear()
+                                await asyncio.to_thread(writer.write_batch, batch)
+                if pending:
+                    batch = bytes(pending)
+                    pending.clear()
+                    await asyncio.to_thread(writer.write_batch, batch)
+                total_size, pieces = await asyncio.to_thread(writer.finish)
+            finally:
+                await asyncio.to_thread(writer.close)
 
         probe = await _ffprobe_file(part_path)
         dur = float(probe.get("duration_s") or 0.0)
@@ -1015,6 +1121,13 @@ async def _download_item(client: httpx.AsyncClient, job_item: dict) -> dict:
 
         return {"status": "ok", "media_id": media_id, "path": final_path, "size": actual_size}
 
+    except asyncio.CancelledError:
+        if os.path.exists(part_path):
+            try:
+                os.unlink(part_path)
+            except Exception:
+                pass
+        raise
     except Exception as e:
         if os.path.exists(part_path):
             try:
@@ -1043,12 +1156,35 @@ async def _worker_loop() -> None:
             exists_cnt = 0
             torbox_cnt = 0
             not_found_cnt = 0
+            failed_cnt = 0
+            low_disk_hit = False
+            low_disk_free_gb = 0.0
 
             season_stats: dict[int, dict] = {}
+            announced_seasons: set[int] = set()
+            last_s_num: int | None = None
 
             if httpx is None:
                 logger.error("offline_library: httpx não está disponível para o worker")
                 break
+
+            async def _announce_season(s_key: int, partial: bool = False) -> None:
+                if s_key in announced_seasons:
+                    return
+                s_info = season_stats.get(s_key, {})
+                s_ok = s_info.get("ok", 0)
+                s_ex = s_info.get("exist", 0)
+                s_tb = s_info.get("tb", 0)
+                s_fail = s_info.get("fail", 0)
+                if s_ok > 0:
+                    announced_seasons.add(s_key)
+                    extra_fail = f"\n• Falhas: {s_fail}" if s_fail > 0 else ""
+                    hdr = f"parcialmente salva" if partial else "pronta"
+                    await send_telegram(
+                        f"✅ *{title}* · Temporada {s_key} {hdr} no A71!\n"
+                        f"• Baixados: {s_ok} novos ({s_ex} já existiam)\n"
+                        f"• Subidos pro TorBox: {s_tb}{extra_fail}"
+                    )
 
             async with httpx.AsyncClient(timeout=60.0) as client:
                 for idx, item in enumerate(items):
@@ -1057,6 +1193,7 @@ async def _worker_loop() -> None:
 
                     s_num = item.get("season")
                     e_num = item.get("episode")
+                    last_s_num = s_num
                     label = f"T{s_num}E{e_num}" if s_num and e_num else (f"T{s_num}" if s_num else "Filme")
                     job["current_item_label"] = label
 
@@ -1066,7 +1203,7 @@ async def _worker_loop() -> None:
                     st = res.get("status")
                     if s_num is not None:
                         if s_num not in season_stats:
-                            season_stats[s_num] = {"ok": 0, "exist": 0, "tb": 0, "fail": 0}
+                            season_stats[s_num] = {"ok": 0, "exist": 0, "tb": 0, "nf": 0, "fail": 0}
 
                     if st == "ok":
                         downloaded_cnt += 1
@@ -1081,39 +1218,62 @@ async def _worker_loop() -> None:
                         exists_cnt += 1
                         if s_num is not None:
                             season_stats[s_num]["exist"] += 1
-                    else:
+                    elif st == "low_disk":
+                        low_disk_hit = True
+                        low_disk_free_gb = float(res.get("free_gb") or 0.0)
+                        break
+                    elif st == "cancelled":
+                        break
+                    elif st in ("not_found", "no_candidate"):
                         not_found_cnt += 1
+                        if s_num is not None:
+                            season_stats[s_num]["nf"] += 1
+                    else:
+                        failed_cnt += 1
                         if s_num is not None:
                             season_stats[s_num]["fail"] += 1
 
-                    # Check if next item belongs to a different season -> send season summary
                     is_last_item = (idx + 1 == len(items))
                     next_s = items[idx + 1].get("season") if not is_last_item else None
                     if s_num is not None and (is_last_item or next_s != s_num):
-                        s_info = season_stats.get(s_num, {})
-                        s_ok = s_info.get("ok", 0)
-                        s_ex = s_info.get("exist", 0)
-                        s_tb = s_info.get("tb", 0)
-                        if s_ok > 0:
-                            await send_telegram(
-                                f"✅ *{title}* · Temporada {s_num} pronta no A71!\n"
-                                f"• Baixados: {s_ok} novos ({s_ex} já existiam)\n"
-                                f"• Subidos pro TorBox: {s_tb}"
-                            )
+                        await _announce_season(s_num, partial=False)
 
                     await asyncio.sleep(2.0)
 
+            if (low_disk_hit or _CANCEL_FLAG) and last_s_num is not None:
+                await _announce_season(last_s_num, partial=True)
+
             _, free_gb = has_enough_disk_space(OFFLINE_DIR)
-            if _CANCEL_FLAG:
+            if low_disk_hit:
+                dropped_titles = [str(j.get("title") or j.get("imdb") or "item") for j in _JOB_QUEUE]
+                dropped_cnt = len(dropped_titles)
+                _JOB_QUEUE.clear()
+                dropped_line = (
+                    f"\n• Outros pedidos removidos da fila ({dropped_cnt}): {', '.join(dropped_titles[:5])}"
+                    if dropped_cnt > 0
+                    else ""
+                )
+                await send_telegram(
+                    f"⚠️ Download de *{title}* interrompido: pouco espaço livre no A71 "
+                    f"({low_disk_free_gb:.1f} GB livres; mínimo {MIN_FREE_GB:.0f} GB).\n"
+                    f"• Baixados antes de parar: {downloaded_cnt}\n"
+                    f"• Já existiam: {exists_cnt}{dropped_line}\n"
+                    "Use `/apagar <título>` para liberar espaço."
+                )
+                _CURRENT_JOB = None
+                break
+            elif _CANCEL_FLAG:
                 await send_telegram(f"⏹️ Download de *{title}* cancelado pelo usuário.")
+                _CURRENT_JOB = None
                 break
             else:
+                fail_line = f"\n• Falhas (erro/timeout/validação): {failed_cnt}" if failed_cnt > 0 else ""
                 await send_telegram(
                     f"🎉 Download concluído: *{title}*\n"
                     f"• Novos baixados: {downloaded_cnt}\n"
                     f"• Já existiam no A71: {exists_cnt}\n"
                     f"• Subidos pro TorBox: {torbox_cnt}\n"
-                    f"• Não encontrados: {not_found_cnt}\n"
+                    f"• Não encontrados: {not_found_cnt}{fail_line}\n"
                     f"• Espaço livre no A71: {free_gb:.1f} GB"
                 )
 

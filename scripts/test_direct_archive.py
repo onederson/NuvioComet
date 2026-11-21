@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -281,6 +282,89 @@ class TestDirectArchive(unittest.TestCase):
 
         cnt = asyncio.run(direct_archive._torbox_active_count(FakeClient(), "k"))
         self.assertEqual(cnt, 2)
+
+    # 11. Cooldown de 7 dias para upgrade de 480p (last_upgrade_try_at) sem re-subir 480p no TorBox
+    def test_upgrade_cooldown_480p(self):
+        now = 1_800_000_000
+        # >= 650p está sempre satisfeito
+        self.assertTrue(direct_archive._is_ep_satisfied({"height": 720, "created_at": 100}, now=now))
+        # 480p recente (< 7 dias) está no cooldown
+        self.assertTrue(direct_archive._is_ep_satisfied({"height": 480, "created_at": now - 3600}, now=now))
+        # 480p antigo (> 7 dias) mas com last_upgrade_try_at recente continua no cooldown!
+        self.assertTrue(
+            direct_archive._is_ep_satisfied(
+                {"height": 480, "created_at": now - 30 * 86400, "last_upgrade_try_at": now - 3600},
+                now=now,
+            )
+        )
+        # 480p antigo e last_upgrade_try_at > 7 dias permite tentar upgrade
+        self.assertFalse(
+            direct_archive._is_ep_satisfied(
+                {"height": 480, "created_at": now - 30 * 86400, "last_upgrade_try_at": now - 8 * 86400},
+                now=now,
+            )
+        )
+
+        # Quando tenta upgrade e o candidato ainda é 480p:
+        # 1) se _ffprobe_url_height já detecta 480p na URL, nem baixa o arquivo (_download_and_hash não chamado),
+        #    não chama _submit_file_to_torbox, atualiza last_upgrade_try_at e retorna None (para não inflar archived_count).
+        old_ts = int(time.time()) - 10 * 86400
+        state = {
+            "watched": {"tt1845307": {"name": "2 Broke Girls"}},
+            "episodes": {
+                "tt1845307:5:9": {
+                    "info_hash": "a1fe5643ee",
+                    "torrent_id": 123,
+                    "title": "2.Broke.Girls.S05E09.480p.WEB-DL.Dublado.PT-BR.mp4",
+                    "height": 480,
+                    "created_at": old_ts,
+                    "last_upgrade_try_at": old_ts,
+                }
+            },
+        }
+        direct_archive._save_state(state, self.state_file)
+        dl_calls = []
+        submit_calls = []
+
+        async def fake_url_h(url):
+            return 480
+
+        async def fake_dl(url, dest, is_hls):
+            dl_calls.append(url)
+            with open(dest, "wb") as f:
+                f.write(b"0" * 1024)
+            return 1024, b"\x00" * 20
+
+        async def fake_probe(path):
+            return {"width": 854, "height": 480, "has_audio": True, "duration_s": 1300.0}
+
+        async def fake_submit(*args, **kwargs):
+            submit_calls.append(args)
+            return {"info_hash": "new_hash", "torrent_id": 999, "size": 1024}
+
+        async def fake_active(client, key):
+            return 0
+
+        async def fake_max(client, key):
+            return 3
+
+        with patch.object(direct_archive, "_torbox_key", return_value="tb_test"), \
+             patch.object(direct_archive, "_torbox_active_count", side_effect=fake_active), \
+             patch.object(direct_archive, "_torbox_max_active", side_effect=fake_max), \
+             patch.object(direct_archive, "_ffprobe_url_height", side_effect=fake_url_h), \
+             patch.object(direct_archive, "_download_and_hash", side_effect=fake_dl), \
+             patch.object(direct_archive, "_ffprobe_file", side_effect=fake_probe), \
+             patch.object(direct_archive, "_submit_file_to_torbox", side_effect=fake_submit):
+            res = asyncio.run(direct_archive.archive_episode("tt1845307:5:9", [("http://f/509.mp4", "FenixFlix", False)]))
+
+        self.assertIsNone(res)
+        self.assertEqual(len(dl_calls), 0)
+        self.assertEqual(len(submit_calls), 0)
+        saved_ep = direct_archive._load_state(self.state_file)["episodes"]["tt1845307:5:9"]
+        self.assertEqual(saved_ep["info_hash"], "a1fe5643ee")
+        self.assertEqual(saved_ep["created_at"], old_ts)
+        self.assertGreater(saved_ep["last_upgrade_try_at"], old_ts)
+        self.assertTrue(direct_archive._is_ep_satisfied(saved_ep))
 
 
 if __name__ == "__main__":

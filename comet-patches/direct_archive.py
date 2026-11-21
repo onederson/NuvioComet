@@ -481,37 +481,76 @@ def _hash_file_pieces(filepath: str, piece_length: int = PIECE_LENGTH) -> tuple[
     return total, bytes(pieces)
 
 
+class _FilePieceWriter:
+    """Grava bytes em disco e calcula hashes SHA-1 por peça fora do event loop."""
+
+    def __init__(self, path: str, piece_length: int = PIECE_LENGTH, max_bytes: int | None = None):
+        self.path = path
+        self.piece_length = piece_length
+        self.max_bytes = max_bytes
+        self.total = 0
+        self._pieces = bytearray()
+        self._buf = bytearray()
+        self._fh = open(path, "wb")
+
+    def write_batch(self, data: bytes) -> int:
+        if not data:
+            return self.total
+        self._fh.write(data)
+        self.total += len(data)
+        if self.max_bytes is not None and self.total > self.max_bytes:
+            raise ValueError(f"File exceeds MAX_BYTES ({self.max_bytes})")
+        self._buf.extend(data)
+        pl = self.piece_length
+        while len(self._buf) >= pl:
+            self._pieces.extend(hashlib.sha1(memoryview(self._buf)[:pl]).digest())
+            del self._buf[:pl]
+        return self.total
+
+    def finish(self) -> tuple[int, bytes]:
+        try:
+            if self._buf:
+                self._pieces.extend(hashlib.sha1(self._buf).digest())
+                self._buf.clear()
+        finally:
+            self.close()
+        return self.total, bytes(self._pieces)
+
+    def close(self) -> None:
+        if self._fh and not self._fh.closed:
+            self._fh.close()
+
+
 # 4. Download, ffprobe e TorBox
 async def _download_and_hash(url: str, dest: str, is_hls: bool) -> tuple[int, bytes]:
     if not is_hls:
         if httpx is None:
             raise RuntimeError("httpx is required for HTTP download")
-        total = 0
-        pieces = bytearray()
-        buf = bytearray()
+        writer = _FilePieceWriter(dest, PIECE_LENGTH, max_bytes=MAX_BYTES)
+        pending = bytearray()
         timeout = httpx.Timeout(20.0, read=60.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as client:
-            async with client.stream("GET", url, headers={"User-Agent": PLAYER_UA}) as resp:
-                resp.raise_for_status()
-                with open(dest, "wb") as f:
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as client:
+                async with client.stream("GET", url, headers={"User-Agent": PLAYER_UA}) as resp:
+                    resp.raise_for_status()
                     async for chunk in resp.aiter_bytes(chunk_size=65536):
                         if not chunk:
                             continue
-                        f.write(chunk)
-                        total += len(chunk)
-                        if total > MAX_BYTES:
-                            raise ValueError(f"File exceeds MAX_BYTES ({MAX_BYTES})")
-                        buf.extend(chunk)
-                        while len(buf) >= PIECE_LENGTH:
-                            piece_data = buf[:PIECE_LENGTH]
-                            pieces.extend(hashlib.sha1(piece_data).digest())
-                            del buf[:PIECE_LENGTH]
-        if buf:
-            pieces.extend(hashlib.sha1(buf).digest())
-            buf.clear()
+                        pending.extend(chunk)
+                        if len(pending) >= 1024 * 1024:
+                            batch = bytes(pending)
+                            pending.clear()
+                            await asyncio.to_thread(writer.write_batch, batch)
+            if pending:
+                batch = bytes(pending)
+                pending.clear()
+                await asyncio.to_thread(writer.write_batch, batch)
+            total, pieces = await asyncio.to_thread(writer.finish)
+        finally:
+            await asyncio.to_thread(writer.close)
         if total < MIN_BYTES or total > MAX_BYTES:
             raise ValueError(f"Total size {total} not in [{MIN_BYTES}, {MAX_BYTES}]")
-        return total, bytes(pieces)
+        return total, pieces
     else:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-loglevel", "error", "-user_agent", PLAYER_UA,
@@ -520,26 +559,67 @@ async def _download_and_hash(url: str, dest: str, is_hls: bool) -> tuple[int, by
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=240.0)
-        except (asyncio.TimeoutError, TimeoutError):
-            proc.kill()
-            raise TimeoutError("ffmpeg remux timed out after 240s")
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=240.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                proc.kill()
+                raise TimeoutError("ffmpeg remux timed out after 240s")
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed with code {proc.returncode}: {stderr.decode('utf-8', errors='ignore')}")
 
-        total = 0
-        pieces = bytearray()
-        with open(dest, "rb") as f:
-            while True:
-                chunk = f.read(PIECE_LENGTH)
-                if not chunk:
-                    break
-                total += len(chunk)
-                pieces.extend(hashlib.sha1(chunk).digest())
-
+        total, pieces = await asyncio.to_thread(_hash_file_pieces, dest, PIECE_LENGTH)
         if total < MIN_BYTES or total > MAX_BYTES:
             raise ValueError(f"Total size {total} not in [{MIN_BYTES}, {MAX_BYTES}]")
-        return total, bytes(pieces)
+        return total, pieces
+
+
+async def _ffprobe_url_height(url: str) -> int:
+    """Sonda apenas a altura do vídeo direto na URL (sem baixar o arquivo inteiro)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-user_agent", PLAYER_UA,
+            "-select_streams", "v:0", "-show_entries", "stream=height",
+            "-of", "json", url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:
+        return 0
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+    except (asyncio.TimeoutError, TimeoutError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return 0
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    try:
+        data = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+        for st in data.get("streams") or []:
+            if st.get("height"):
+                return int(st["height"])
+    except Exception:
+        pass
+    return 0
 
 
 async def _ffprobe_file(path: str) -> dict:
@@ -867,6 +947,19 @@ async def upload_local_file_to_torbox(
             return rec
 
 
+UPGRADE_COOLDOWN_S = 7 * 86400
+
+
+def _is_ep_satisfied(ep_rec: dict | None, now: float | None = None) -> bool:
+    if not ep_rec or not isinstance(ep_rec, dict):
+        return False
+    if int(ep_rec.get("height") or 0) >= 650:
+        return True
+    cur_now = time.time() if now is None else now
+    last_try = int(ep_rec.get("last_upgrade_try_at") or ep_rec.get("created_at") or 0)
+    return (cur_now - last_try) < UPGRADE_COOLDOWN_S
+
+
 async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]) -> dict | None:
     lock = _get_work_lock()
     async with lock:
@@ -877,7 +970,7 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
 
         state = _load_state()
         ep_rec = state.get("episodes", {}).get(media_id)
-        if ep_rec and int(ep_rec.get("height") or 0) >= 650:
+        if _is_ep_satisfied(ep_rec):
             return ep_rec
 
         tb_key = _torbox_key()
@@ -899,6 +992,13 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
             series_name = state.get("watched", {}).get(imdb, {}).get("name") or "Series"
 
             for cand_url, source, is_hls in candidates[:2]:
+                if ep_rec:
+                    url_h = await _ffprobe_url_height(cand_url)
+                    if 0 < url_h < 650:
+                        logger.info(
+                            f"direct_archive: {media_id} URL sonda {url_h}p (<650p), pulando download de upgrade"
+                        )
+                        continue
                 os.makedirs("/tmp", exist_ok=True)
                 tmp_file = os.path.join("/tmp", f"comet_arch_{imdb}_{s}_{e}_{secrets.token_hex(4)}.mp4")
                 try:
@@ -916,6 +1016,19 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
                     if not valid:
                         logger.warning(f"direct_archive: probe inválido para {media_id} ({reason})")
                         continue
+
+                    probe_h = int(probe.get("height") or 0)
+                    if ep_rec and probe_h < 650:
+                        now_ts = int(time.time())
+                        cur_state = _load_state()
+                        cur_ep = cur_state.setdefault("episodes", {}).get(media_id) or dict(ep_rec)
+                        cur_ep["last_upgrade_try_at"] = now_ts
+                        cur_state["episodes"][media_id] = cur_ep
+                        _save_state(cur_state)
+                        logger.info(
+                            f"direct_archive: {media_id} continua em {probe_h}p (<650p), mantendo torrent atual por mais 7d"
+                        )
+                        return None
 
                     fname = make_release_filename(series_name, s, e, probe["height"])
                     tb_res = await _submit_file_to_torbox(
@@ -942,6 +1055,7 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
                             "source": source,
                             "created_at": now,
                             "last_keepalive_at": now,
+                            "last_upgrade_try_at": now,
                         }
                         cur_state = _load_state()
                         cur_state.setdefault("episodes", {})[media_id] = rec
@@ -957,6 +1071,15 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
                             os.remove(tmp_file)
                         except OSError:
                             pass
+
+        if ep_rec:
+            now_ts = int(time.time())
+            cur_state = _load_state()
+            cur_ep = cur_state.setdefault("episodes", {}).get(media_id) or dict(ep_rec)
+            cur_ep["last_upgrade_try_at"] = now_ts
+            cur_state["episodes"][media_id] = cur_ep
+            _save_state(cur_state)
+            return None
 
         _FAIL_COOLDOWN[media_id] = time.time()
         return None
@@ -1098,7 +1221,7 @@ def maybe_enqueue(media_id: str, direct_streams: list[dict], has_cached_pt_hd: b
         return False
 
     ep_rec = state.get("episodes", {}).get(media_id)
-    if ep_rec and int(ep_rec.get("height") or 0) >= 650:
+    if _is_ep_satisfied(ep_rec):
         return False
 
     if time.time() - _FAIL_COOLDOWN.get(media_id, 0) < FAIL_COOLDOWN_S:
@@ -1378,7 +1501,7 @@ async def _sweep_watched_inner(only_imdb: str | None = None) -> None:
                     continue
                 ep_id = f"{imdb}:{s}:{e}"
                 ep_rec = state.get("episodes", {}).get(ep_id)
-                if ep_rec and int(ep_rec.get("height") or 0) >= 650:
+                if _is_ep_satisfied(ep_rec):
                     continue
                 if time.time() - _FAIL_COOLDOWN.get(ep_id, 0) < FAIL_COOLDOWN_S:
                     continue

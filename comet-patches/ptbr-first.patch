@@ -2138,7 +2138,7 @@ index 0000000..e2626b4
 +"""
 +    return HTMLResponse(content=content, status_code=200)
 diff --git a/comet/api/endpoints/stream.py b/comet/api/endpoints/stream.py
-index 94f56ae..6b4e963 100644
+index 94f56ae..549333c 100644
 --- a/comet/api/endpoints/stream.py
 +++ b/comet/api/endpoints/stream.py
 @@ -1,13 +1,33 @@
@@ -3227,7 +3227,7 @@ index 94f56ae..6b4e963 100644
      return selected_info_hashes
  
  
-@@ -198,9 +1190,82 @@ async def stream(
+@@ -198,6 +1190,67 @@ async def stream(
      chilllink: bool = False,
      kodi: bool = False,
  ):
@@ -3295,22 +3295,33 @@ index 94f56ae..6b4e963 100644
      if media_type not in ["movie", "series"]:
          return _build_stream_response(request, {"streams": []}, is_empty=True)
  
-+    # 💾 Preferência total pelo arquivo local salvo no A71 (toca instantâneo; ?nolocal=1 pula para buscar fontes online)
+@@ -231,7 +1284,25 @@ async def stream(
+     stream_cache_state = "unknown"
+     stream_client = "kodi" if kodi else ("chilllink" if chilllink else "stremio")
+ 
++    _loc_stream = None
++    _inject_local = None
 +    if request.query_params.get("nolocal") != "1":
 +        try:
-+            from comet.services.offline_library import build_local_stream as _build_local_stream
++            from comet.services.offline_library import (
++                build_local_stream as _build_local_stream,
++                inject_local_into_streams as _inject_local,
++            )
 +            _loc_base = (getattr(settings, "PUBLIC_BASE_URL", None) or "").rstrip("/") or str(request.base_url).rstrip("/")
 +            _loc_stream = _build_local_stream(clean_id, b64config, _loc_base)
-+            if _loc_stream is not None:
-+                logger.info(f"💾 Servindo local no A71: {clean_id}")
-+                return _build_stream_response(request, {"streams": [_loc_stream]}, is_empty=False)
 +        except Exception as _loc_err:
 +            logger.debug(f"offline_library check: {_loc_err}")
 +
-     if "tmdb:" in media_id:
-         return _build_stream_response(request, {"streams": []}, is_empty=True)
- 
-@@ -240,12 +1305,30 @@ async def stream(
+     def _stream_response(content: dict, is_empty: bool = False):
++        if _loc_stream is not None and _inject_local is not None and isinstance(content.get("streams"), list):
++            _st = _inject_local(content["streams"], _loc_stream)
++            content = {**content, "streams": _st}
++            is_empty = False
++            logger.info(f"💾 Local no A71 em 1º (+{len(_st) - 1} online): {clean_id}")
+         result_count = len(content.get("streams", ()))
+         metrics.observe_stream(
+             media_type,
+@@ -240,309 +1311,944 @@ async def stream(
              "empty" if is_empty else "success",
              result_count,
          )
@@ -3324,49 +3335,144 @@ index 94f56ae..6b4e963 100644
 +        res.background = background_tasks
 +        return res
 +
-+    direct_task = (
-+        asyncio.create_task(fetch_direct_streams(media_type, media_id))
-+        if settings.DIRECT_ADDONS_URL or settings.MGEB_ENABLED
-+        else None
-+    )
-+
-+    async def _get_direct_streams():
-+        if not direct_task:
-+            return []
-+        try:
-+            return await asyncio.wait_for(
-+                direct_task, settings.DIRECT_ADDONS_TIMEOUT + 2
-+            )
-+        except Exception:
-+            return []
++    try:
++        direct_task = (
++            asyncio.create_task(fetch_direct_streams(media_type, media_id))
++            if settings.DIRECT_ADDONS_URL or settings.MGEB_ENABLED
++            else None
++        )
  
-     search_result = await search_media(
-         media_type,
-@@ -257,6 +1340,8 @@ async def stream(
-     stream_cache_state = search_result.cache_state
- 
-     if search_result.status is MediaSearchStatus.INVALID:
-+        if direct_task and not direct_task.done():
-+            direct_task.cancel()
-         return _stream_response({"streams": []}, is_empty=True)
- 
-     if search_result.status is MediaSearchStatus.DISABLED:
-@@ -270,53 +1355,94 @@ async def stream(
-         return _stream_response({"streams": [placeholder_stream]})
- 
-     if search_result.status is MediaSearchStatus.UNRELEASED:
--        return _stream_response(
-+        if search_result.air_date:
+-    search_result = await search_media(
+-        media_type,
+-        media_id,
+-        config,
+-        get_client_ip(request),
+-        background_tasks.add_task,
+-    )
+-    stream_cache_state = search_result.cache_state
++        async def _get_direct_streams():
++            if not direct_task:
++                return []
++            _dt_timeout = 3.0 if _loc_stream is not None else (settings.DIRECT_ADDONS_TIMEOUT + 2)
 +            try:
-+                d = datetime.date.fromisoformat(search_result.air_date).strftime("%d/%m/%Y")
-+                desc = "Episódio ainda não lançado." + chr(10) + f"Estreia em {d}."
++                return await asyncio.wait_for(
++                    direct_task, _dt_timeout
++                )
 +            except Exception:
-+                desc = "Episódio ainda não lançado." + chr(10) + f"Estreia em {search_result.air_date}."
-+        else:
-+            desc = "Ainda não lançado."
++                return []
 +
-+        notice = [
-             {
++        try:
++            _sm_coro = search_media(
++                media_type,
++                media_id,
++                config,
++                get_client_ip(request),
++                background_tasks.add_task,
++            )
++            if _loc_stream is not None:
++                _sm_task = asyncio.create_task(_sm_coro)
++                search_result = await asyncio.wait_for(asyncio.shield(_sm_task), timeout=6.0)
++            else:
++                search_result = await _sm_coro
++        except Exception as _sm_err:
++            if _loc_stream is not None:
++                logger.warning(f"💾 search_media falhou/timeout ({type(_sm_err).__name__}), servindo local: {clean_id}")
++                return _stream_response({"streams": []}, is_empty=True)
++            raise
++        stream_cache_state = search_result.cache_state
++
++        if search_result.status is MediaSearchStatus.INVALID:
++            if direct_task and not direct_task.done():
++                direct_task.cancel()
++            return _stream_response({"streams": []}, is_empty=True)
++
++        if search_result.status is MediaSearchStatus.DISABLED:
++            placeholder_stream = {
++                "name": settings.TORRENT_DISABLED_STREAM_NAME,
++                "description": settings.TORRENT_DISABLED_STREAM_DESCRIPTION,
++            }
++            if settings.TORRENT_DISABLED_STREAM_URL:
++                placeholder_stream["url"] = settings.TORRENT_DISABLED_STREAM_URL
++
++            return _stream_response({"streams": [placeholder_stream]})
++
++        if search_result.status is MediaSearchStatus.UNRELEASED:
++            if search_result.air_date:
++                try:
++                    d = datetime.date.fromisoformat(search_result.air_date).strftime("%d/%m/%Y")
++                    desc = "Episódio ainda não lançado." + chr(10) + f"Estreia em {d}."
++                except Exception:
++                    desc = "Episódio ainda não lançado." + chr(10) + f"Estreia em {search_result.air_date}."
++            else:
++                desc = "Ainda não lançado."
+ 
+-    if search_result.status is MediaSearchStatus.INVALID:
+-        return _stream_response({"streams": []}, is_empty=True)
++            notice = [
++                {
++                    "name": _stream_notice_name(
++                        kodi, "[⏳] Comet", "[UNRELEASED] Comet"
++                    ),
++                    "description": desc,
++                    "url": "https://comet.feels.legal",
++                }
++            ]
++            if not (media_type == "series" and search_result.air_date):
++                direct_streams = await _get_direct_streams()
++                if direct_streams:
++                    clean_direct = [
++                        {k: v for k, v in s.items() if k != "_is_pt"}
++                        for s in direct_streams
++                    ]
++                    return _stream_response(
++                        {"streams": notice + clean_direct},
++                        is_empty=False,
++                    )
++            else:
++                if direct_task and not direct_task.done():
++                    direct_task.cancel()
+ 
+-    if search_result.status is MediaSearchStatus.DISABLED:
+-        placeholder_stream = {
+-            "name": settings.TORRENT_DISABLED_STREAM_NAME,
+-            "description": settings.TORRENT_DISABLED_STREAM_DESCRIPTION,
+-        }
+-        if settings.TORRENT_DISABLED_STREAM_URL:
+-            placeholder_stream["url"] = settings.TORRENT_DISABLED_STREAM_URL
++            return _stream_response(
++                {"streams": notice},
++                is_empty=True,
++            )
+ 
+-        return _stream_response({"streams": [placeholder_stream]})
++        if search_result.status is MediaSearchStatus.METADATA_UNAVAILABLE:
++            notice = [
++                {
++                    "name": _stream_notice_name(
++                        kodi, "[⚠️] Comet", "[WARN] Comet"
++                    ),
++                    "description": "Unable to get metadata.",
++                    "url": "https://comet.feels.legal",
++                }
++            ]
++            direct_streams = await _get_direct_streams()
++            if direct_streams:
++                clean_direct = [
++                    {k: v for k, v in s.items() if k != "_is_pt"}
++                    for s in direct_streams
++                ]
++                return _stream_response(
++                    {"streams": notice + clean_direct},
++                    is_empty=False,
++                )
++            return _stream_response(
++                {"streams": notice},
++                is_empty=True,
++            )
+ 
+-    if search_result.status is MediaSearchStatus.UNRELEASED:
+-        return _stream_response(
+-            {
 -                "streams": [
 -                    {
 -                        "name": _stream_notice_name(
@@ -3375,14 +3481,19 @@ index 94f56ae..6b4e963 100644
 -                        "description": "Content not digitally released yet.",
 -                        "url": "https://comet.feels.legal",
 -                    }
-+                "name": _stream_notice_name(
-+                    kodi, "[⏳] Comet", "[UNRELEASED] Comet"
-+                ),
-+                "description": desc,
-+                "url": "https://comet.feels.legal",
-+            }
-+        ]
-+        if not (media_type == "series" and search_result.air_date):
++        if search_result.status is MediaSearchStatus.BUSY:
++            notice = [
++                {
++                    "name": _stream_notice_name(
++                        kodi, "[🔄] Comet", "[INFO] Comet"
++                    ),
++                    "description": (
++                        "Scraping in progress, please try again in a few "
++                        "seconds..."
++                    ),
++                    "url": "https://comet.feels.legal",
++                }
++            ]
 +            direct_streams = await _get_direct_streams()
 +            if direct_streams:
 +                clean_direct = [
@@ -3390,22 +3501,29 @@ index 94f56ae..6b4e963 100644
 +                    for s in direct_streams
                  ]
 -            },
+-            is_empty=True,
+-        )
 +                return _stream_response(
 +                    {"streams": notice + clean_direct},
 +                    is_empty=False,
 +                )
-+        else:
-+            if direct_task and not direct_task.done():
-+                direct_task.cancel()
-+
-+        return _stream_response(
-+            {"streams": notice},
-             is_empty=True,
-         )
++            return _stream_response(
++                {"streams": notice},
++                is_empty=True,
++            )
  
-     if search_result.status is MediaSearchStatus.METADATA_UNAVAILABLE:
+-    if search_result.status is MediaSearchStatus.METADATA_UNAVAILABLE:
 -        return _stream_response(
-+        notice = [
++        metadata = search_result.metadata
++        title = metadata["title"]
++        media_only_id = search_result.media_only_id
++        search_season = search_result.search_season
++        search_episode = search_result.search_episode
++        service_cache_status = search_result.service_cache_status
++        debrid_errors = search_result.debrid_errors
++        sort_mixed = search_result.sort_mixed
++        torrents = search_result.torrents
++        notice_streams = [
              {
 -                "streams": [
 -                    {
@@ -3417,276 +3535,586 @@ index 94f56ae..6b4e963 100644
 -                    }
 -                ]
 -            },
-+                "name": _stream_notice_name(
-+                    kodi, "[⚠️] Comet", "[WARN] Comet"
-+                ),
-+                "description": "Unable to get metadata.",
+-            is_empty=True,
++                "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
++                "description": error.display_message,
 +                "url": "https://comet.feels.legal",
 +            }
++            for service, error in search_result.debrid_errors.items()
 +        ]
-+        direct_streams = await _get_direct_streams()
-+        if direct_streams:
-+            clean_direct = [
-+                {k: v for k, v in s.items() if k != "_is_pt"}
-+                for s in direct_streams
-+            ]
-+            return _stream_response(
-+                {"streams": notice + clean_direct},
-+                is_empty=False,
++        cached_results = []
++        non_cached_results = []
++        debrid_stream_specs = [
++            (entry_index, entry["service"], get_debrid_extension(entry["service"]))
++            for entry_index, entry in enumerate(debrid_entries)
++        ]
++
++        if (
++            config["debridStreamProxyPassword"] != ""
++            and settings.PROXY_DEBRID_STREAM
++            and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
++        ):
++            notice_streams.append(
++                {
++                    "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
++                    "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
++                    "url": "https://comet.feels.legal",
++                }
 +            )
-+        return _stream_response(
-+            {"streams": notice},
-             is_empty=True,
++
++        result_season = _encode_playback_scope(search_season)
++        result_episode = _encode_playback_scope(search_episode)
++        quoted_media_only_id = quote(media_only_id, safe="")
++        # ID exato pedido pelo app (com temporada:episódio): a URL de play o leva para o
++        # failed_sources, porque temporada/episódio do caminho saem "n" quando o nome não é lido.
++        quoted_ep_key = quote(str(media_id or ""), safe="")
++
++        base_playback_host = (
++            settings.PUBLIC_BASE_URL
++            if settings.PUBLIC_BASE_URL
++            else f"{request.url.scheme}://{request.url.netloc}"
++        )
++        api_prefix = STREMIO_API_PREFIX
++        config_segment = f"/{b64config}" if b64config else ""
++        playback_base_url = f"{base_playback_host}{api_prefix}{config_segment}"
++        quoted_title = quote(title)
++        format_components = (
++            get_formatted_components_plain if kodi else get_formatted_components
          )
++        format_title_fn = format_title
++        torrent_extension = get_debrid_extension("torrent")
++        torrent_service = "" if kodi else torrent_extension
  
-     if search_result.status is MediaSearchStatus.BUSY:
+-    if search_result.status is MediaSearchStatus.BUSY:
 -        return _stream_response(
-+        notice = [
-             {
+-            {
 -                "streams": [
--                    {
++        if search_result.show_account_sync_trigger:
++            for entry_index, _, debrid_extension in debrid_stream_specs:
++                notice_streams.append(
+                     {
 -                        "name": _stream_notice_name(
 -                            kodi, "[🔄] Comet", "[INFO] Comet"
--                        ),
--                        "description": (
++                        "name": (
++                            f"[{debrid_extension}] Comet Sync"
++                            if kodi
++                            else f"[{debrid_extension}🔄] Comet Sync"
+                         ),
+                         "description": (
 -                            "Scraping in progress, please try again in a few "
 -                            "seconds..."
--                        ),
++                            "Sync debrid account library now.\n"
++                            "Select this stream, then retry this title in a few seconds."
+                         ),
 -                        "url": "https://comet.feels.legal",
--                    }
++                        "url": f"{playback_base_url}/debrid-sync/{entry_index}",
+                     }
 -                ]
 -            },
-+                "name": _stream_notice_name(
-+                    kodi, "[🔄] Comet", "[INFO] Comet"
-+                ),
-+                "description": (
-+                    "Scraping in progress, please try again in a few "
-+                    "seconds..."
-+                ),
-+                "url": "https://comet.feels.legal",
-+            }
-+        ]
-+        direct_streams = await _get_direct_streams()
-+        if direct_streams:
-+            clean_direct = [
-+                {k: v for k, v in s.items() if k != "_is_pt"}
-+                for s in direct_streams
-+            ]
-+            return _stream_response(
-+                {"streams": notice + clean_direct},
-+                is_empty=False,
-+            )
-+        return _stream_response(
-+            {"streams": notice},
-             is_empty=True,
-         )
+-            is_empty=True,
+-        )
++                )
  
-@@ -329,7 +1455,7 @@ async def stream(
-     debrid_errors = search_result.debrid_errors
-     sort_mixed = search_result.sort_mixed
-     torrents = search_result.torrents
+-    metadata = search_result.metadata
+-    title = metadata["title"]
+-    media_only_id = search_result.media_only_id
+-    search_season = search_result.search_season
+-    search_episode = search_result.search_episode
+-    service_cache_status = search_result.service_cache_status
+-    debrid_errors = search_result.debrid_errors
+-    sort_mixed = search_result.sort_mixed
+-    torrents = search_result.torrents
 -    cached_results = [
-+    notice_streams = [
-         {
-             "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
-             "description": error.display_message,
-@@ -337,6 +1463,7 @@ async def stream(
-         }
-         for service, error in search_result.debrid_errors.items()
-     ]
-+    cached_results = []
-     non_cached_results = []
-     debrid_stream_specs = [
-         (entry_index, entry["service"], get_debrid_extension(entry["service"]))
-@@ -348,7 +1475,7 @@ async def stream(
-         and settings.PROXY_DEBRID_STREAM
-         and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
-     ):
--        cached_results.append(
-+        notice_streams.append(
-             {
-                 "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
-                 "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
-@@ -359,6 +1486,9 @@ async def stream(
-     result_season = _encode_playback_scope(search_season)
-     result_episode = _encode_playback_scope(search_episode)
-     quoted_media_only_id = quote(media_only_id, safe="")
-+    # ID exato pedido pelo app (com temporada:episódio): a URL de play o leva para o
-+    # failed_sources, porque temporada/episódio do caminho saem "n" quando o nome não é lido.
-+    quoted_ep_key = quote(str(media_id or ""), safe="")
- 
-     base_playback_host = (
-         settings.PUBLIC_BASE_URL
-@@ -378,7 +1508,7 @@ async def stream(
- 
-     if search_result.show_account_sync_trigger:
-         for entry_index, _, debrid_extension in debrid_stream_specs:
--            cached_results.append(
-+            notice_streams.append(
-                 {
-                     "name": (
-                         f"[{debrid_extension}] Comet Sync"
-@@ -393,8 +1523,40 @@ async def stream(
-                 }
-             )
- 
-+    active_debrid_services = [
-+        service
-+        for _, service, _ in debrid_stream_specs
-+        if service not in debrid_errors
-+    ]
-+    blocked_by_service: dict[str, set[str]] = {}
-+    if (
-+        settings.HIDE_DEBRID_BLOCKED
-+        and active_debrid_services
-+        and search_result.ranked_info_hashes
-+    ):
-+        blocked_by_service = await _get_blocked_hashes_by_service(
-+            active_debrid_services,
-+            search_result.ranked_info_hashes,
-+        )
-+
-+    candidate_info_hashes = search_result.ranked_info_hashes
-+    if (
-+        blocked_by_service
-+        and active_debrid_services
-+        and not enable_torrent
-+        and not settings.P2P_FALLBACK_FOR_BLOCKED
-+    ):
-+        candidate_info_hashes = [
-+            h
-+            for h in candidate_info_hashes
-+            if not all(
-+                h.lower() in blocked_by_service.get(svc, ())
-+                for svc in active_debrid_services
-+            )
+-        {
+-            "name": (f"[ERROR] {service}" if kodi else f"[❌] {service}"),
+-            "description": error.display_message,
+-            "url": "https://comet.feels.legal",
+-        }
+-        for service, error in search_result.debrid_errors.items()
+-    ]
+-    non_cached_results = []
+-    debrid_stream_specs = [
+-        (entry_index, entry["service"], get_debrid_extension(entry["service"]))
+-        for entry_index, entry in enumerate(debrid_entries)
+-    ]
++        active_debrid_services = [
++            service
++            for _, service, _ in debrid_stream_specs
++            if service not in debrid_errors
 +        ]
++        blocked_by_service: dict[str, set[str]] = {}
++        if (
++            settings.HIDE_DEBRID_BLOCKED
++            and active_debrid_services
++            and search_result.ranked_info_hashes
++        ):
++            try:
++                blocked_by_service = await _get_blocked_hashes_by_service(
++                    active_debrid_services,
++                    search_result.ranked_info_hashes,
++                )
++            except Exception:
++                blocked_by_service = {}
 +
-     selected_info_hashes = _select_info_hashes_by_resolution(
++        candidate_info_hashes = search_result.ranked_info_hashes
++        if (
++            blocked_by_service
++            and active_debrid_services
++            and not enable_torrent
++            and not settings.P2P_FALLBACK_FOR_BLOCKED
++        ):
++            candidate_info_hashes = [
++                h
++                for h in candidate_info_hashes
++                if not all(
++                    h.lower() in blocked_by_service.get(svc, ())
++                    for svc in active_debrid_services
++                )
++            ]
+ 
+-    if (
+-        config["debridStreamProxyPassword"] != ""
+-        and settings.PROXY_DEBRID_STREAM
+-        and settings.PROXY_DEBRID_STREAM_PASSWORD != config["debridStreamProxyPassword"]
+-    ):
+-        cached_results.append(
+-            {
+-                "name": _stream_notice_name(kodi, "[⚠️] Comet", "[WARN] Comet"),
+-                "description": "Debrid Stream Proxy Password incorrect.\nStreams will not be proxied.",
+-                "url": "https://comet.feels.legal",
+-            }
++        selected_info_hashes = _select_info_hashes_by_resolution(
++            ranked_info_hashes=candidate_info_hashes,
++            torrents=torrents,
++            service_cache_status=service_cache_status,
++            max_results=config["maxResultsPerResolution"],
++            cached_only=bool(
++                config["cachedOnly"] and debrid_entries and not enable_torrent
++            ),
++            prioritize_cached=bool(debrid_entries and not sort_mixed),
++            ptbr_first=bool(settings.PTBR_FIRST),
++            demote_cam=bool(settings.DEMOTE_CAM),
+         )
+-
+-    result_season = _encode_playback_scope(search_season)
+-    result_episode = _encode_playback_scope(search_episode)
+-    quoted_media_only_id = quote(media_only_id, safe="")
+-
+-    base_playback_host = (
+-        settings.PUBLIC_BASE_URL
+-        if settings.PUBLIC_BASE_URL
+-        else f"{request.url.scheme}://{request.url.netloc}"
+-    )
+-    api_prefix = STREMIO_API_PREFIX
+-    config_segment = f"/{b64config}" if b64config else ""
+-    playback_base_url = f"{base_playback_host}{api_prefix}{config_segment}"
+-    quoted_title = quote(title)
+-    format_components = (
+-        get_formatted_components_plain if kodi else get_formatted_components
+-    )
+-    format_title_fn = format_title
+-    torrent_extension = get_debrid_extension("torrent")
+-    torrent_service = "" if kodi else torrent_extension
+-
+-    if search_result.show_account_sync_trigger:
+-        for entry_index, _, debrid_extension in debrid_stream_specs:
+-            cached_results.append(
+-                {
+-                    "name": (
+-                        f"[{debrid_extension}] Comet Sync"
+-                        if kodi
+-                        else f"[{debrid_extension}🔄] Comet Sync"
+-                    ),
+-                    "description": (
+-                        "Sync debrid account library now.\n"
+-                        "Select this stream, then retry this title in a few seconds."
+-                    ),
+-                    "url": f"{playback_base_url}/debrid-sync/{entry_index}",
+-                }
+-            )
+-
+-    selected_info_hashes = _select_info_hashes_by_resolution(
 -        ranked_info_hashes=search_result.ranked_info_hashes,
-+        ranked_info_hashes=candidate_info_hashes,
-         torrents=torrents,
-         service_cache_status=service_cache_status,
-         max_results=config["maxResultsPerResolution"],
-@@ -402,18 +1564,31 @@ async def stream(
-             config["cachedOnly"] and debrid_entries and not enable_torrent
-         ),
-         prioritize_cached=bool(debrid_entries and not sort_mixed),
-+        ptbr_first=bool(settings.PTBR_FIRST),
-+        demote_cam=bool(settings.DEMOTE_CAM),
-     )
-     ranked_info_hashes = (
-         selected_info_hashes
-         if selected_info_hashes is not None
+-        torrents=torrents,
+-        service_cache_status=service_cache_status,
+-        max_results=config["maxResultsPerResolution"],
+-        cached_only=bool(
+-            config["cachedOnly"] and debrid_entries and not enable_torrent
+-        ),
+-        prioritize_cached=bool(debrid_entries and not sort_mixed),
+-    )
+-    ranked_info_hashes = (
+-        selected_info_hashes
+-        if selected_info_hashes is not None
 -        else search_result.ranked_info_hashes
-+        else candidate_info_hashes
-     )
- 
-     added_hashes = set()
-+    p2p_fallback_hashes = set()
- 
+-    )
+-
+-    added_hashes = set()
+-
 -    for info_hash in ranked_info_hashes:
-+    for rank_idx, info_hash in enumerate(ranked_info_hashes):
-         torrent = torrents[info_hash]
-         rtn_data = torrent["parsed"]
-+        is_pt = "pt" in (getattr(rtn_data, "languages", None) or ())
-+        if is_pt:
-+            remember_pt_filename(rtn_data.raw_title)
-+        is_cam = bool(settings.DEMOTE_CAM and is_cam_release(rtn_data))
-+        res_rank = _PTBR_RESOLUTION_ORDER.get(
-+            str(getattr(rtn_data, "resolution", "")).lower(), 8
-+        )
-+        # Sem seeders conhecidos (ex.: hashes do StremThru) o RD costuma
-+        # responder "Invalid Magnet": esses vao para o fim do bloco PT-BR.
-+        seed_key = -torrent["seeders"] if torrent["seeders"] else 1
-         torrent_title = torrent["title"]
-         torrent_size = torrent["size"]
-         formatted_components = format_components(
-@@ -429,21 +1604,164 @@ async def stream(
-         info_hash_cache_status = service_cache_status.get(info_hash)
-         quoted_torrent_title = quote(torrent_title)
+-        torrent = torrents[info_hash]
+-        rtn_data = torrent["parsed"]
+-        torrent_title = torrent["title"]
+-        torrent_size = torrent["size"]
+-        formatted_components = format_components(
+-            rtn_data,
+-            torrent_title,
+-            torrent["seeders"],
+-            torrent_size,
+-            torrent["tracker"],
+-            config["resultFormat"],
++        ranked_info_hashes = (
++            selected_info_hashes
++            if selected_info_hashes is not None
++            else candidate_info_hashes
+         )
+-        formatted_title = format_title_fn(formatted_components)
+-        kodi_meta = _build_kodi_meta(rtn_data, formatted_components) if kodi else None
+-        info_hash_cache_status = service_cache_status.get(info_hash)
+-        quoted_torrent_title = quote(torrent_title)
  
 -        for entry_index, service, debrid_extension in debrid_stream_specs:
 -            if service in debrid_errors:
 -                continue
-+        chosen_spec = None
-+        chosen_is_cached = False
- 
-+        specs_by_svc = {
-+            svc: (idx, svc, ext)
-+            for idx, svc, ext in debrid_stream_specs
-+            if svc not in debrid_errors
-+        }
-+
-+        # 1-2. Em cache (⚡), na ordem de preferência: TorBox primeiro (medido em 02/11/2026: começa em
-+        # 0,5 s e entrega 130+ Mbit/s; o RD bloqueia muito dublado com 451 na hora do play).
-+        # Fora de casa (4G) o RD fica de fora: ele só aceita 1 IP por vez por conta.
-+        for _svc in _svc_order:
-+            if chosen_spec or _svc not in specs_by_svc:
-+                continue
-+            spec = specs_by_svc[_svc]
-+            is_blocked = info_hash.lower() in blocked_by_service.get(_svc, ())
-             is_cached = (
+-
+-            is_cached = (
 -                info_hash_cache_status.get(service, False)
-+                bool(info_hash_cache_status.get(_svc, False))
-                 if info_hash_cache_status
-                 else False
+-                if info_hash_cache_status
+-                else False
++        added_hashes = set()
++        p2p_fallback_hashes = set()
++
++        for rank_idx, info_hash in enumerate(ranked_info_hashes):
++            torrent = torrents[info_hash]
++            rtn_data = torrent["parsed"]
++            is_pt = "pt" in (getattr(rtn_data, "languages", None) or ())
++            if is_pt:
++                remember_pt_filename(rtn_data.raw_title)
++            is_cam = bool(settings.DEMOTE_CAM and is_cam_release(rtn_data))
++            res_rank = _PTBR_RESOLUTION_ORDER.get(
++                str(getattr(rtn_data, "resolution", "")).lower(), 8
              )
-+            if is_cached and not is_blocked:
-+                chosen_spec = spec
-+                chosen_is_cached = True
+-
+-            if config["cachedOnly"] and not is_cached:
+-                continue
+-
+-            if deduplicate_streams and info_hash in added_hashes and is_cached:
+-                continue
+-
+-            behavior_hints = {
+-                "bingeGroup": f"comet|{service}|{info_hash}",
+-                "filename": rtn_data.raw_title,
+-            }
+-            if torrent_size is not None:
+-                behavior_hints["videoSize"] = torrent_size
+-            if kodi_meta is not None:
+-                behavior_hints["cometKodiMetaV1"] = kodi_meta
+-
+-            stream_name = _build_stream_name(
+-                kodi,
+-                debrid_extension,
+-                rtn_data.resolution,
+-                icon="⚡" if is_cached else "⬇️",
+-                formatted_components=formatted_components,
+-                seeders=torrent["seeders"],
+-                status="C" if is_cached else "U",
++            # Sem seeders conhecidos (ex.: hashes do StremThru) o RD costuma
++            # responder "Invalid Magnet": esses vao para o fim do bloco PT-BR.
++            seed_key = -torrent["seeders"] if torrent["seeders"] else 1
++            torrent_title = torrent["title"]
++            torrent_size = torrent["size"]
++            formatted_components = format_components(
++                rtn_data,
++                torrent_title,
++                torrent["seeders"],
++                torrent_size,
++                torrent["tracker"],
++                config["resultFormat"],
+             )
+-
+-            the_stream = {
+-                "name": stream_name,
+-                "description": formatted_title,
+-                "behaviorHints": behavior_hints,
++            formatted_title = format_title_fn(formatted_components)
++            kodi_meta = _build_kodi_meta(rtn_data, formatted_components) if kodi else None
++            info_hash_cache_status = service_cache_status.get(info_hash)
++            quoted_torrent_title = quote(torrent_title)
 +
-+        if not chosen_spec and _is_remote_req and "realdebrid" in specs_by_svc:
-+            _rd_blocked = info_hash.lower() in blocked_by_service.get("realdebrid", ())
-+            _rd_cached = bool(info_hash_cache_status.get("realdebrid", False)) if info_hash_cache_status else False
-+            if _rd_cached and not _rd_blocked:
-+                chosen_spec = specs_by_svc["realdebrid"]
-+                chosen_is_cached = True
++            chosen_spec = None
++            chosen_is_cached = False
 +
-+        # Outro debrid em cache
-+        if not chosen_spec:
-+            for svc, spec in specs_by_svc.items():
-+                if svc in ("realdebrid", "torbox"):
++            specs_by_svc = {
++                svc: (idx, svc, ext)
++                for idx, svc, ext in debrid_stream_specs
++                if svc not in debrid_errors
+             }
+ 
+-            if chilllink:
+-                the_stream["_chilllink"] = format_chilllink(
+-                    formatted_components, is_cached
++            # 1-2. Em cache (⚡), na ordem de preferência: TorBox primeiro (medido em 02/11/2026: começa em
++            # 0,5 s e entrega 130+ Mbit/s; o RD bloqueia muito dublado com 451 na hora do play).
++            # Fora de casa (4G) o RD fica de fora: ele só aceita 1 IP por vez por conta.
++            for _svc in _svc_order:
++                if chosen_spec or _svc not in specs_by_svc:
 +                    continue
-+                is_blocked = info_hash.lower() in blocked_by_service.get(svc, ())
++                spec = specs_by_svc[_svc]
++                is_blocked = info_hash.lower() in blocked_by_service.get(_svc, ())
 +                is_cached = (
-+                    bool(info_hash_cache_status.get(svc, False))
++                    bool(info_hash_cache_status.get(_svc, False))
 +                    if info_hash_cache_status
 +                    else False
-+                )
+                 )
 +                if is_cached and not is_blocked:
 +                    chosen_spec = spec
 +                    chosen_is_cached = True
-+                    break
 +
-+        # 3. RD não cacheado (⬇️) se não estiver marcado 451; senão TorBox não cacheado
-+        if not chosen_spec and not config["cachedOnly"]:
-+            for _svc in _svc_order_dl:
-+                if chosen_spec or _svc not in specs_by_svc:
-+                    continue
-+                is_blocked = info_hash.lower() in blocked_by_service.get(_svc, ())
-+                if not is_blocked:
-+                    chosen_spec = specs_by_svc[_svc]
-+                    chosen_is_cached = False
++            if not chosen_spec and _is_remote_req and "realdebrid" in specs_by_svc:
++                _rd_blocked = info_hash.lower() in blocked_by_service.get("realdebrid", ())
++                _rd_cached = bool(info_hash_cache_status.get("realdebrid", False)) if info_hash_cache_status else False
++                if _rd_cached and not _rd_blocked:
++                    chosen_spec = specs_by_svc["realdebrid"]
++                    chosen_is_cached = True
++
++            # Outro debrid em cache
 +            if not chosen_spec:
 +                for svc, spec in specs_by_svc.items():
 +                    if svc in ("realdebrid", "torbox"):
 +                        continue
 +                    is_blocked = info_hash.lower() in blocked_by_service.get(svc, ())
-+                    if not is_blocked:
++                    is_cached = (
++                        bool(info_hash_cache_status.get(svc, False))
++                        if info_hash_cache_status
++                        else False
++                    )
++                    if is_cached and not is_blocked:
 +                        chosen_spec = spec
-+                        chosen_is_cached = False
++                        chosen_is_cached = True
 +                        break
 +
-+        if not chosen_spec:
-+            rd_is_blocked = "realdebrid" in specs_by_svc and (
-+                info_hash.lower() in blocked_by_service.get("realdebrid", ())
-+            )
-+            if (
-+                rd_is_blocked
-+                and settings.P2P_FALLBACK_FOR_BLOCKED
-+                and info_hash not in p2p_fallback_hashes
-+            ):
++            # 3. RD não cacheado (⬇️) se não estiver marcado 451; senão TorBox não cacheado
++            if not chosen_spec and not config["cachedOnly"]:
++                for _svc in _svc_order_dl:
++                    if chosen_spec or _svc not in specs_by_svc:
++                        continue
++                    is_blocked = info_hash.lower() in blocked_by_service.get(_svc, ())
++                    if not is_blocked:
++                        chosen_spec = specs_by_svc[_svc]
++                        chosen_is_cached = False
++                if not chosen_spec:
++                    for svc, spec in specs_by_svc.items():
++                        if svc in ("realdebrid", "torbox"):
++                            continue
++                        is_blocked = info_hash.lower() in blocked_by_service.get(svc, ())
++                        if not is_blocked:
++                            chosen_spec = spec
++                            chosen_is_cached = False
++                            break
++
++            if not chosen_spec:
++                rd_is_blocked = "realdebrid" in specs_by_svc and (
++                    info_hash.lower() in blocked_by_service.get("realdebrid", ())
++                )
++                if (
++                    rd_is_blocked
++                    and settings.P2P_FALLBACK_FOR_BLOCKED
++                    and info_hash not in p2p_fallback_hashes
++                ):
++                    behavior_hints = {
++                        "bingeGroup": f"comet|torrent|{info_hash}",
++                        "filename": rtn_data.raw_title,
++                    }
++                    if torrent_size is not None:
++                        behavior_hints["videoSize"] = torrent_size
++                    if kodi_meta is not None:
++                        behavior_hints["cometKodiMetaV1"] = kodi_meta
++
++                    stream_name = _build_stream_name(
++                        kodi,
++                        torrent_service,
++                        rtn_data.resolution,
++                        icon="⚠️",
++                        formatted_components=formatted_components,
++                        seeders=torrent["seeders"],
++                        status="P2P",
++                    )
++                    if is_cam:
++                        stream_name = f"🎦 CAM\n{stream_name}"
++                    if is_pt:
++                        stream_name = f"🇧🇷 PT-BR\n{stream_name}"
++
++                    the_stream = {
++                        "name": stream_name,
++                        "description": f"⚠️ P2P (bloqueado no RD)\n{formatted_title}",
++                        "behaviorHints": behavior_hints,
++                        "infoHash": info_hash,
++                    }
++                    raw_title_val = getattr(rtn_data, "raw_title", "") or torrent_title
++                    the_stream["_info"] = {
++                        "is_pt": is_pt,
++                        "is_cam": is_cam,
++                        "cached": False,
++                        "kind": "p2p",
++                        "resolution": getattr(rtn_data, "resolution", "") or "",
++                        "size": torrent_size,
++                        "audio": _extract_short_audio(rtn_data),
++                        "quality": _extract_quality(rtn_data),
++                        "group": _extract_group(rtn_data),
++                        "raw_title": raw_title_val,
++                        "dub_kind": _get_dub_kind(raw_title_val, is_pt),
++                        "service": "p2p",
++                    }
++                    if is_cam:
++                        the_stream["description"] = (
++                            f"🎦 Gravação de cinema: marca d'água e qualidade ruim\n"
++                            f"{the_stream['description']}"
++                        )
++
++                    if chilllink:
++                        the_stream["_chilllink"] = format_chilllink(
++                            formatted_components, False
++                        )
++
++                    if torrent.get("fileIndex") is not None:
++                        the_stream["fileIdx"] = torrent["fileIndex"]
++
++                    sources = torrent.get("sources") or trackers
++                    if sources:
++                        the_stream["sources"] = sources
++
++                    p2p_fallback_hashes.add(info_hash)
++                    added_hashes.add(info_hash)
++
++                    stream_entry = (
++                        the_stream,
++                        is_pt,
++                        res_rank,
++                        1,
++                        rank_idx,
++                        seed_key,
++                        is_cam,
++                    )
++                    if sort_mixed:
++                        cached_results.append(stream_entry)
++                    else:
++                        non_cached_results.append(stream_entry)
++            else:
++                entry_index, service, debrid_extension = chosen_spec
++                is_cached = chosen_is_cached
+ 
+-            file_index = torrent.get("fileIndex")
+-            file_index_str = (
+-                str(file_index) if is_cached and file_index is not None else "n"
+-            )
+-            the_stream["url"] = (
+-                f"{playback_base_url}/playback/{info_hash}/{entry_index}/{file_index_str}/{result_season}/{result_episode}"
+-                f"?torrent_name={quoted_torrent_title}&name={quoted_title}"
+-                f"&media_id={quoted_media_only_id}&media_type={media_type}"
+-            )
++                behavior_hints = {
++                    "bingeGroup": f"comet|{service}|{info_hash}",
++                    "filename": rtn_data.raw_title,
++                }
++                if torrent_size is not None:
++                    behavior_hints["videoSize"] = torrent_size
++                if kodi_meta is not None:
++                    behavior_hints["cometKodiMetaV1"] = kodi_meta
++
++                stream_name = _build_stream_name(
++                    kodi,
++                    debrid_extension,
++                    rtn_data.resolution,
++                    icon="⚡" if is_cached else "⬇️",
++                    formatted_components=formatted_components,
++                    seeders=torrent["seeders"],
++                    status="C" if is_cached else "U",
++                )
++                if is_cam:
++                    stream_name = f"🎦 CAM\n{stream_name}"
++                if is_pt:
++                    stream_name = f"🇧🇷 PT-BR\n{stream_name}"
++
++                the_stream = {
++                    "name": stream_name,
++                    "description": formatted_title,
++                    "behaviorHints": behavior_hints,
++                }
++                file_index = torrent.get("fileIndex")
++                file_index_str = (
++                    str(file_index) if is_cached and file_index is not None else "n"
++                )
++                raw_title_val = getattr(rtn_data, "raw_title", "") or torrent_title
++                the_stream["_info"] = {
++                    "is_pt": is_pt,
++                    "languages": [l.lower() for l in (getattr(rtn_data, "languages", None) or [])],
++                    "is_cam": is_cam,
++                    "cached": bool(is_cached),
++                    "kind": "rd",
++                    "resolution": getattr(rtn_data, "resolution", "") or "",
++                    "size": torrent_size,
++                    "audio": _extract_short_audio(rtn_data),
++                    "quality": _extract_quality(rtn_data),
++                    "group": _extract_group(rtn_data),
++                    "raw_title": raw_title_val,
++                    "dub_kind": _get_dub_kind(raw_title_val, is_pt),
++                    "service": debrid_extension,
++                    "debrid_service": service,
++                    "info_hash": info_hash,
++                    "file_index": file_index_str,
++                    "title": title,
++                    "torrent_title": torrent_title,
++                    "season": result_season,
++                    "episode": result_episode,
++                    "sources": torrent.get("sources"),
++                    "entry_index": entry_index,
++                }
++                if is_cam:
++                    the_stream["description"] = (
++                        f"🎦 Gravação de cinema: marca d'água e qualidade ruim\n"
++                        f"{the_stream['description']}"
++                    )
++
++                if chilllink:
++                    the_stream["_chilllink"] = format_chilllink(
++                        formatted_components, is_cached
++                    )
++
++                res_param = quote(str(getattr(rtn_data, "resolution", "") or ""))
++                the_stream["url"] = (
++                    f"{playback_base_url}/playback/{info_hash}/{entry_index}/{file_index_str}/{result_season}/{result_episode}"
++                    f"?torrent_name={quoted_torrent_title}&name={quoted_title}"
++                    f"&media_id={quoted_media_only_id}&media_type={media_type}&resolution={res_param}"
++                    f"&ep_key={quoted_ep_key}"
++                )
+ 
+-            if is_cached:
+                 added_hashes.add(info_hash)
+ 
+-            if sort_mixed or is_cached:
+-                cached_results.append(the_stream)
+-            else:
+-                non_cached_results.append(the_stream)
++                stream_entry = (
++                    the_stream,
++                    is_pt,
++                    res_rank,
++                    0 if is_cached else 1,
++                    rank_idx,
++                    seed_key,
++                    is_cam,
++                )
++                if sort_mixed or is_cached:
++                    cached_results.append(stream_entry)
++                else:
++                    non_cached_results.append(stream_entry)
++
++            if enable_torrent:
++                if info_hash in added_hashes:
++                    continue
++                if info_hash in p2p_fallback_hashes:
++                    continue
++
 +                behavior_hints = {
 +                    "bingeGroup": f"comet|torrent|{info_hash}",
 +                    "filename": rtn_data.raw_title,
@@ -3700,7 +4128,7 @@ index 94f56ae..6b4e963 100644
 +                    kodi,
 +                    torrent_service,
 +                    rtn_data.resolution,
-+                    icon="⚠️",
++                    icon="🧲",
 +                    formatted_components=formatted_components,
 +                    seeders=torrent["seeders"],
 +                    status="P2P",
@@ -3712,13 +4140,14 @@ index 94f56ae..6b4e963 100644
 +
 +                the_stream = {
 +                    "name": stream_name,
-+                    "description": f"⚠️ P2P (bloqueado no RD)\n{formatted_title}",
++                    "description": formatted_title,
 +                    "behaviorHints": behavior_hints,
 +                    "infoHash": info_hash,
 +                }
 +                raw_title_val = getattr(rtn_data, "raw_title", "") or torrent_title
 +                the_stream["_info"] = {
 +                    "is_pt": is_pt,
++                    "languages": [l.lower() for l in (getattr(rtn_data, "languages", None) or [])],
 +                    "is_cam": is_cam,
 +                    "cached": False,
 +                    "kind": "p2p",
@@ -3737,480 +4166,359 @@ index 94f56ae..6b4e963 100644
 +                        f"{the_stream['description']}"
 +                    )
  
--            if config["cachedOnly"] and not is_cached:
+-        if enable_torrent:
+-            if deduplicate_streams and info_hash in added_hashes:
 -                continue
 +                if chilllink:
-+                    the_stream["_chilllink"] = format_chilllink(
-+                        formatted_components, False
-+                    )
++                    the_stream["_chilllink"] = format_chilllink(formatted_components, False)
  
--            if deduplicate_streams and info_hash in added_hashes and is_cached:
--                continue
+-            behavior_hints = {
+-                "bingeGroup": f"comet|torrent|{info_hash}",
+-                "filename": rtn_data.raw_title,
+-            }
+-            if torrent_size is not None:
+-                behavior_hints["videoSize"] = torrent_size
+-            if kodi_meta is not None:
+-                behavior_hints["cometKodiMetaV1"] = kodi_meta
+-
+-            stream_name = _build_stream_name(
+-                kodi,
+-                torrent_service,
+-                rtn_data.resolution,
+-                icon="🧲",
+-                formatted_components=formatted_components,
+-                seeders=torrent["seeders"],
+-                status="P2P",
+-            )
 +                if torrent.get("fileIndex") is not None:
 +                    the_stream["fileIdx"] = torrent["fileIndex"]
-+
+ 
+-            the_stream = {
+-                "name": stream_name,
+-                "description": formatted_title,
+-                "behaviorHints": behavior_hints,
+-                "infoHash": info_hash,
+-            }
 +                sources = torrent.get("sources") or trackers
 +                if sources:
 +                    the_stream["sources"] = sources
-+
-+                p2p_fallback_hashes.add(info_hash)
-+                added_hashes.add(info_hash)
-+
-+                stream_entry = (
-+                    the_stream,
-+                    is_pt,
-+                    res_rank,
-+                    1,
-+                    rank_idx,
-+                    seed_key,
-+                    is_cam,
+ 
+-            if chilllink:
+-                the_stream["_chilllink"] = format_chilllink(formatted_components, False)
++                cached_results.append(
++                    (the_stream, is_pt, res_rank, 1, rank_idx, seed_key, is_cam)
 +                )
-+                if sort_mixed:
-+                    cached_results.append(stream_entry)
-+                else:
-+                    non_cached_results.append(stream_entry)
+ 
+-            if torrent.get("fileIndex") is not None:
+-                the_stream["fileIdx"] = torrent["fileIndex"]
++        ordered_entries = (
++            cached_results if sort_mixed else cached_results + non_cached_results
++        )
+ 
+-            sources = torrent.get("sources") or trackers
+-            if sources:
+-                the_stream["sources"] = sources
++        if getattr(settings, "AUDIO_PROBE", True):
++            try:
++                from comet.services.audio_probe import get_probe_results_batch, format_audio_langs
++                probe_keys = []
++                for entry in ordered_entries:
++                    info = entry[0].get("_info")
++                    if info and info.get("info_hash"):
++                        f_idx = info.get("file_index", "n")
++                        f_name = info.get("title", "")
++                        f_key = str(f_idx) if f_idx and str(f_idx) != "n" else str(f_name or "")
++                        probe_keys.append((info["info_hash"], f_key))
++                probe_map = await get_probe_results_batch(probe_keys) if probe_keys else {}
++                try:
++                    from comet.services.media_info import get_media_batch
++                    media_map = await get_media_batch([k[0] for k in probe_keys])
++                except Exception:
++                    media_map = {}
++                new_ordered = []
++                for entry in ordered_entries:
++                    s_dict, e_is_pt, e_res_rank, e_cached, e_rank_idx, e_seed, e_cam = entry
++                    info = s_dict.get("_info")
++                    if info and info.get("info_hash"):
++                        f_idx = info.get("file_index", "n")
++                        f_name = info.get("title", "")
++                        f_key = str(f_idx) if f_idx and str(f_idx) != "n" else str(f_name or "")
++                        p_res = probe_map.get((info["info_hash"].lower(), f_key))
++                        if not p_res and f_key != "n":
++                            p_res = probe_map.get((info["info_hash"].lower(), "n"))
++                        if not p_res and f_name:
++                            p_res = probe_map.get((info["info_hash"].lower(), str(f_name)))
++                        _mi = media_map.get((info["info_hash"].lower(), f_key)) or media_map.get((info["info_hash"].lower(), "n"))
++                        if _mi:
++                            # O Nuvio escolhe a faixa em PT sozinho (idioma da TV): sem aviso de faixa.
++                            if _mi.get("pt_audio") and not _mi.get("pt_is_default"):
++                                _mi = {**_mi, "pt_is_default": True, "_pt_auto": True}
++                            info["_media"] = _mi
++                        if p_res:
++                            has_pt_val = p_res.get("has_pt")
++                            langs_val = p_res.get("langs") or []
++                            info["has_pt"] = has_pt_val
++                            info["_audio_langs_str"] = format_audio_langs(langs_val)
++                            if has_pt_val == 0:
++                                if e_is_pt:
++                                    info["claimed_pt_false"] = True
++                                    e_is_pt = False
++                                    info["is_pt"] = False
++                                    info["dub_kind"] = None
++                            elif has_pt_val == 1:
++                                e_is_pt = True
++                                info["is_pt"] = True
++                    new_ordered.append((s_dict, e_is_pt, e_res_rank, e_cached, e_rank_idx, e_seed, e_cam))
++                ordered_entries = new_ordered
++            except Exception as probe_err:
++                logger.debug(f"audio_probe batch lookup error: {probe_err}")
++        direct_streams = await _get_direct_streams()
++        direct_pt = [
++            {**s, "_is_direct_pt": True}
++            for s in direct_streams
++            if s.get("_is_pt")
++        ]
++        direct_other = [
++            {**s, "_is_direct_pt": False}
++            for s in direct_streams
++            if not s.get("_is_pt")
++        ]
++
++        if media_type == "series" and direct_pt:
++            try:
++                from comet.services.direct_archive import maybe_enqueue as _arch_enqueue
++                _has_pt_hd = any(
++                    entry[1] and not entry[6] and entry[2] <= 2 and entry[3] == 0 and "url" in entry[0]
++                    for entry in ordered_entries
++                )
++                _arch_enqueue(media_id, direct_streams, has_cached_pt_hd=_has_pt_hd)
++            except Exception as _arch_err:
++                logger.debug(f"direct_archive enqueue: {_arch_err}")
++
++        if settings.DEMOTE_CAM:
++            if settings.PTBR_FIRST:
++                pt_good = [entry for entry in ordered_entries if entry[1] and not entry[6]]
++                other_good = [entry for entry in ordered_entries if not entry[1] and not entry[6]]
++                pt_cam = [entry for entry in ordered_entries if entry[1] and entry[6]]
++                other_cam = [entry for entry in ordered_entries if not entry[1] and entry[6]]
++                pt_good.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
++                pt_cam.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
++                pt_good_rd = [entry[0] for entry in pt_good if "url" in entry[0] and entry[3] == 0]
++                pt_good_p2p = [entry[0] for entry in pt_good if not ("url" in entry[0] and entry[3] == 0)]
++                final_streams = (
++                    notice_streams
++                    + pt_good_rd
++                    + direct_pt
++                    + pt_good_p2p
++                    + [entry[0] for entry in other_good]
++                    + direct_other
++                    + [entry[0] for entry in pt_cam]
++                    + [entry[0] for entry in other_cam]
++                )
++            else:
++                good_entries = [entry for entry in ordered_entries if not entry[6]]
++                cam_entries = [entry for entry in ordered_entries if entry[6]]
++                final_streams = (
++                    notice_streams
++                    + direct_pt
++                    + [entry[0] for entry in good_entries]
++                    + direct_other
++                    + [entry[0] for entry in cam_entries]
++                )
++        elif settings.PTBR_FIRST:
++            pt_entries = [entry for entry in ordered_entries if entry[1]]
++            other_entries = [entry for entry in ordered_entries if not entry[1]]
++            pt_entries.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
++            pt_rd = [entry[0] for entry in pt_entries if "url" in entry[0] and entry[3] == 0]
++            pt_p2p = [entry[0] for entry in pt_entries if not ("url" in entry[0] and entry[3] == 0)]
++            final_streams = (
++                notice_streams
++                + pt_rd
++                + direct_pt
++                + pt_p2p
++                + [entry[0] for entry in other_entries]
++                + direct_other
++            )
 +        else:
-+            entry_index, service, debrid_extension = chosen_spec
-+            is_cached = chosen_is_cached
- 
-             behavior_hints = {
-                 "bingeGroup": f"comet|{service}|{info_hash}",
-@@ -463,38 +1781,84 @@ async def stream(
-                 seeders=torrent["seeders"],
-                 status="C" if is_cached else "U",
-             )
-+            if is_cam:
-+                stream_name = f"🎦 CAM\n{stream_name}"
-+            if is_pt:
-+                stream_name = f"🇧🇷 PT-BR\n{stream_name}"
- 
-             the_stream = {
-                 "name": stream_name,
-                 "description": formatted_title,
-                 "behaviorHints": behavior_hints,
-             }
-+            file_index = torrent.get("fileIndex")
-+            file_index_str = (
-+                str(file_index) if is_cached and file_index is not None else "n"
++            final_streams = (
++                notice_streams
++                + direct_pt
++                + [entry[0] for entry in ordered_entries]
++                + direct_other
 +            )
-+            raw_title_val = getattr(rtn_data, "raw_title", "") or torrent_title
-+            the_stream["_info"] = {
-+                "is_pt": is_pt,
-+                "languages": [l.lower() for l in (getattr(rtn_data, "languages", None) or [])],
-+                "is_cam": is_cam,
-+                "cached": bool(is_cached),
-+                "kind": "rd",
-+                "resolution": getattr(rtn_data, "resolution", "") or "",
-+                "size": torrent_size,
-+                "audio": _extract_short_audio(rtn_data),
-+                "quality": _extract_quality(rtn_data),
-+                "group": _extract_group(rtn_data),
-+                "raw_title": raw_title_val,
-+                "dub_kind": _get_dub_kind(raw_title_val, is_pt),
-+                "service": debrid_extension,
-+                "debrid_service": service,
-+                "info_hash": info_hash,
-+                "file_index": file_index_str,
-+                "title": title,
-+                "torrent_title": torrent_title,
-+                "season": result_season,
-+                "episode": result_episode,
-+                "sources": torrent.get("sources"),
-+                "entry_index": entry_index,
-+            }
-+            if is_cam:
-+                the_stream["description"] = (
-+                    f"🎦 Gravação de cinema: marca d'água e qualidade ruim\n"
-+                    f"{the_stream['description']}"
-+                )
- 
-             if chilllink:
-                 the_stream["_chilllink"] = format_chilllink(
-                     formatted_components, is_cached
-                 )
- 
--            file_index = torrent.get("fileIndex")
--            file_index_str = (
--                str(file_index) if is_cached and file_index is not None else "n"
--            )
-+            res_param = quote(str(getattr(rtn_data, "resolution", "") or ""))
-             the_stream["url"] = (
-                 f"{playback_base_url}/playback/{info_hash}/{entry_index}/{file_index_str}/{result_season}/{result_episode}"
-                 f"?torrent_name={quoted_torrent_title}&name={quoted_title}"
--                f"&media_id={quoted_media_only_id}&media_type={media_type}"
-+                f"&media_id={quoted_media_only_id}&media_type={media_type}&resolution={res_param}"
-+                f"&ep_key={quoted_ep_key}"
-             )
- 
--            if is_cached:
--                added_hashes.add(info_hash)
-+            added_hashes.add(info_hash)
- 
-+            stream_entry = (
-+                the_stream,
-+                is_pt,
-+                res_rank,
-+                0 if is_cached else 1,
-+                rank_idx,
-+                seed_key,
-+                is_cam,
-+            )
-             if sort_mixed or is_cached:
--                cached_results.append(the_stream)
-+                cached_results.append(stream_entry)
-             else:
--                non_cached_results.append(the_stream)
-+                non_cached_results.append(stream_entry)
- 
-         if enable_torrent:
--            if deduplicate_streams and info_hash in added_hashes:
-+            if info_hash in added_hashes:
-+                continue
-+            if info_hash in p2p_fallback_hashes:
-                 continue
- 
-             behavior_hints = {
-@@ -515,6 +1879,10 @@ async def stream(
-                 seeders=torrent["seeders"],
-                 status="P2P",
-             )
-+            if is_cam:
-+                stream_name = f"🎦 CAM\n{stream_name}"
-+            if is_pt:
-+                stream_name = f"🇧🇷 PT-BR\n{stream_name}"
- 
-             the_stream = {
-                 "name": stream_name,
-@@ -522,6 +1890,27 @@ async def stream(
-                 "behaviorHints": behavior_hints,
-                 "infoHash": info_hash,
-             }
-+            raw_title_val = getattr(rtn_data, "raw_title", "") or torrent_title
-+            the_stream["_info"] = {
-+                "is_pt": is_pt,
-+                "languages": [l.lower() for l in (getattr(rtn_data, "languages", None) or [])],
-+                "is_cam": is_cam,
-+                "cached": False,
-+                "kind": "p2p",
-+                "resolution": getattr(rtn_data, "resolution", "") or "",
-+                "size": torrent_size,
-+                "audio": _extract_short_audio(rtn_data),
-+                "quality": _extract_quality(rtn_data),
-+                "group": _extract_group(rtn_data),
-+                "raw_title": raw_title_val,
-+                "dub_kind": _get_dub_kind(raw_title_val, is_pt),
-+                "service": "p2p",
-+            }
-+            if is_cam:
-+                the_stream["description"] = (
-+                    f"🎦 Gravação de cinema: marca d'água e qualidade ruim\n"
-+                    f"{the_stream['description']}"
-+                )
- 
-             if chilllink:
-                 the_stream["_chilllink"] = format_chilllink(formatted_components, False)
-@@ -533,12 +1922,293 @@ async def stream(
-             if sources:
-                 the_stream["sources"] = sources
  
 -            cached_results.append(the_stream)
-+            cached_results.append(
-+                (the_stream, is_pt, res_rank, 1, rank_idx, seed_key, is_cam)
-+            )
++        all_blocked = set()
++        for b_set in blocked_by_service.values():
++            all_blocked.update(b_set)
 +
-+    ordered_entries = (
-+        cached_results if sort_mixed else cached_results + non_cached_results
-+    )
-+
-+    if getattr(settings, "AUDIO_PROBE", True):
++        chosen_assistir = None
++        next_pt_candidates = []
 +        try:
-+            from comet.services.audio_probe import get_probe_results_batch, format_audio_langs
-+            probe_keys = []
-+            for entry in ordered_entries:
-+                info = entry[0].get("_info")
-+                if info and info.get("info_hash"):
-+                    f_idx = info.get("file_index", "n")
-+                    f_name = info.get("title", "")
-+                    f_key = str(f_idx) if f_idx and str(f_idx) != "n" else str(f_name or "")
-+                    probe_keys.append((info["info_hash"], f_key))
-+            probe_map = await get_probe_results_batch(probe_keys) if probe_keys else {}
-+            try:
-+                from comet.services.media_info import get_media_batch
-+                media_map = await get_media_batch([k[0] for k in probe_keys])
-+            except Exception:
-+                media_map = {}
-+            new_ordered = []
-+            for entry in ordered_entries:
-+                s_dict, e_is_pt, e_res_rank, e_cached, e_rank_idx, e_seed, e_cam = entry
-+                info = s_dict.get("_info")
-+                if info and info.get("info_hash"):
-+                    f_idx = info.get("file_index", "n")
-+                    f_name = info.get("title", "")
-+                    f_key = str(f_idx) if f_idx and str(f_idx) != "n" else str(f_name or "")
-+                    p_res = probe_map.get((info["info_hash"].lower(), f_key))
-+                    if not p_res and f_key != "n":
-+                        p_res = probe_map.get((info["info_hash"].lower(), "n"))
-+                    if not p_res and f_name:
-+                        p_res = probe_map.get((info["info_hash"].lower(), str(f_name)))
-+                    _mi = media_map.get((info["info_hash"].lower(), f_key)) or media_map.get((info["info_hash"].lower(), "n"))
-+                    if _mi:
-+                        # O Nuvio escolhe a faixa em PT sozinho (idioma da TV): sem aviso de faixa.
-+                        if _mi.get("pt_audio") and not _mi.get("pt_is_default"):
-+                            _mi = {**_mi, "pt_is_default": True, "_pt_auto": True}
-+                        info["_media"] = _mi
-+                    if p_res:
-+                        has_pt_val = p_res.get("has_pt")
-+                        langs_val = p_res.get("langs") or []
-+                        info["has_pt"] = has_pt_val
-+                        info["_audio_langs_str"] = format_audio_langs(langs_val)
-+                        if has_pt_val == 0:
-+                            if e_is_pt:
-+                                info["claimed_pt_false"] = True
-+                                e_is_pt = False
-+                                info["is_pt"] = False
-+                                info["dub_kind"] = None
-+                        elif has_pt_val == 1:
-+                            e_is_pt = True
-+                            info["is_pt"] = True
-+                new_ordered.append((s_dict, e_is_pt, e_res_rank, e_cached, e_rank_idx, e_seed, e_cam))
-+            ordered_entries = new_ordered
-+        except Exception as probe_err:
-+            logger.debug(f"audio_probe batch lookup error: {probe_err}")
-+    direct_streams = await _get_direct_streams()
-+    direct_pt = [
-+        {**s, "_is_direct_pt": True}
-+        for s in direct_streams
-+        if s.get("_is_pt")
-+    ]
-+    direct_other = [
-+        {**s, "_is_direct_pt": False}
-+        for s in direct_streams
-+        if not s.get("_is_pt")
-+    ]
++            from comet.services.taste import taste_scores as _ts
++            global _TASTE_NOW
++            _TASTE_NOW = await _ts()
++        except Exception:
++            pass
++        if getattr(settings, "STREAM_LAYOUT", "clean") == "clean":
++            _xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
++            _remote = False
++            if _xff:
++                try:
++                    import ipaddress as _ipa
++                    _remote = not (_ipa.ip_address(_xff).is_private or _ipa.ip_address(_xff).is_loopback)
++                except ValueError:
++                    _remote = False
++            if _remote:
++                logger.info("📶 fora de casa: ▶ Assistir prefere versão leve")
++            _ep_rt = None
++            if media_type == "series" and media_id.startswith("tt") and media_id.count(":") == 2:
++                try:
++                    from comet.services.direct_addons import _tmdb_episode_runtime
++                    _imdb, _s, _e = media_id.split(":")
++                    _ep_rt = await asyncio.wait_for(_tmdb_episode_runtime(_imdb, int(_s), int(_e)), 2.5)
++                except Exception:
++                    _ep_rt = None
++            final_streams, chosen_assistir, next_pt_candidates = _apply_clean_layout(
++                final_streams, len(notice_streams), blocked_hashes=all_blocked, remote=_remote,
++                is_episode=(media_type == "series"), media_key=media_id, ep_runtime=_ep_rt,
++            )
  
 -    if sort_mixed:
 -        final_streams = cached_results
-+    if media_type == "series" and direct_pt:
-+        try:
-+            from comet.services.direct_archive import maybe_enqueue as _arch_enqueue
-+            _has_pt_hd = any(
-+                entry[1] and not entry[6] and entry[2] <= 2 and entry[3] == 0 and "url" in entry[0]
-+                for entry in ordered_entries
-+            )
-+            _arch_enqueue(media_id, direct_streams, has_cached_pt_hd=_has_pt_hd)
-+        except Exception as _arch_err:
-+            logger.debug(f"direct_archive enqueue: {_arch_err}")
-+
-+    if settings.DEMOTE_CAM:
-+        if settings.PTBR_FIRST:
-+            pt_good = [entry for entry in ordered_entries if entry[1] and not entry[6]]
-+            other_good = [entry for entry in ordered_entries if not entry[1] and not entry[6]]
-+            pt_cam = [entry for entry in ordered_entries if entry[1] and entry[6]]
-+            other_cam = [entry for entry in ordered_entries if not entry[1] and entry[6]]
-+            pt_good.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
-+            pt_cam.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
-+            pt_good_rd = [entry[0] for entry in pt_good if "url" in entry[0] and entry[3] == 0]
-+            pt_good_p2p = [entry[0] for entry in pt_good if not ("url" in entry[0] and entry[3] == 0)]
-+            final_streams = (
-+                notice_streams
-+                + pt_good_rd
-+                + direct_pt
-+                + pt_good_p2p
-+                + [entry[0] for entry in other_good]
-+                + direct_other
-+                + [entry[0] for entry in pt_cam]
-+                + [entry[0] for entry in other_cam]
-+            )
-+        else:
-+            good_entries = [entry for entry in ordered_entries if not entry[6]]
-+            cam_entries = [entry for entry in ordered_entries if entry[6]]
-+            final_streams = (
-+                notice_streams
-+                + direct_pt
-+                + [entry[0] for entry in good_entries]
-+                + direct_other
-+                + [entry[0] for entry in cam_entries]
-+            )
-+    elif settings.PTBR_FIRST:
-+        pt_entries = [entry for entry in ordered_entries if entry[1]]
-+        other_entries = [entry for entry in ordered_entries if not entry[1]]
-+        pt_entries.sort(key=lambda entry: (entry[2], entry[3], entry[5], entry[4]))
-+        pt_rd = [entry[0] for entry in pt_entries if "url" in entry[0] and entry[3] == 0]
-+        pt_p2p = [entry[0] for entry in pt_entries if not ("url" in entry[0] and entry[3] == 0)]
-+        final_streams = (
-+            notice_streams
-+            + pt_rd
-+            + direct_pt
-+            + pt_p2p
-+            + [entry[0] for entry in other_entries]
-+            + direct_other
-+        )
-     else:
+-    else:
 -        final_streams = cached_results + non_cached_results
-+        final_streams = (
-+            notice_streams
-+            + direct_pt
-+            + [entry[0] for entry in ordered_entries]
-+            + direct_other
-+        )
-+
-+    all_blocked = set()
-+    for b_set in blocked_by_service.values():
-+        all_blocked.update(b_set)
-+
-+    chosen_assistir = None
-+    next_pt_candidates = []
-+    try:
-+        from comet.services.taste import taste_scores as _ts
-+        global _TASTE_NOW
-+        _TASTE_NOW = await _ts()
-+    except Exception:
-+        pass
-+    if getattr(settings, "STREAM_LAYOUT", "clean") == "clean":
-+        _xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-+        _remote = False
-+        if _xff:
-+            try:
-+                import ipaddress as _ipa
-+                _remote = not (_ipa.ip_address(_xff).is_private or _ipa.ip_address(_xff).is_loopback)
-+            except ValueError:
-+                _remote = False
-+        if _remote:
-+            logger.info("📶 fora de casa: ▶ Assistir prefere versão leve")
-+        _ep_rt = None
-+        if media_type == "series" and media_id.startswith("tt") and media_id.count(":") == 2:
-+            try:
-+                from comet.services.direct_addons import _tmdb_episode_runtime
-+                _imdb, _s, _e = media_id.split(":")
-+                _ep_rt = await asyncio.wait_for(_tmdb_episode_runtime(_imdb, int(_s), int(_e)), 2.5)
-+            except Exception:
-+                _ep_rt = None
-+        final_streams, chosen_assistir, next_pt_candidates = _apply_clean_layout(
-+            final_streams, len(notice_streams), blocked_hashes=all_blocked, remote=_remote,
-+            is_episode=(media_type == "series"), media_key=media_id, ep_runtime=_ep_rt,
-+        )
-+
-+    if chosen_assistir and chosen_assistir.get("_info"):
-+        c_info = chosen_assistir["_info"]
-+        if c_info.get("kind") == "rd" and c_info.get("cached"):
++        if chosen_assistir and chosen_assistir.get("_info"):
++            c_info = chosen_assistir["_info"]
++            if c_info.get("kind") == "rd" and c_info.get("cached"):
++                _spawn_preresolve(
++                    _preresolve_assistir_task,
++                    debrid_entries,
++                    c_info.get("entry_index", 0),
++                    c_info.get("info_hash"),
++                    c_info.get("file_index", "n"),
++                    c_info.get("title", ""),
++                    c_info.get("torrent_title", ""),
++                    c_info.get("season"),
++                    c_info.get("episode"),
++                    c_info.get("sources"),
++                    None,
++                    media_only_id,
++                    media_type,
++                    get_client_ip(request),
++                    next_pt_candidates,
++                )
++        elif next_pt_candidates:
++            first_c = next_pt_candidates[0]
 +            _spawn_preresolve(
 +                _preresolve_assistir_task,
 +                debrid_entries,
-+                c_info.get("entry_index", 0),
-+                c_info.get("info_hash"),
-+                c_info.get("file_index", "n"),
-+                c_info.get("title", ""),
-+                c_info.get("torrent_title", ""),
-+                c_info.get("season"),
-+                c_info.get("episode"),
-+                c_info.get("sources"),
++                first_c.get("entry_index", 0),
++                first_c.get("info_hash"),
++                first_c.get("file_index", "n"),
++                first_c.get("title", ""),
++                first_c.get("torrent_title", ""),
++                first_c.get("season"),
++                first_c.get("episode"),
++                first_c.get("sources"),
 +                None,
 +                media_only_id,
 +                media_type,
 +                get_client_ip(request),
-+                next_pt_candidates,
++                next_pt_candidates[1:],
 +            )
-+    elif next_pt_candidates:
-+        first_c = next_pt_candidates[0]
-+        _spawn_preresolve(
-+            _preresolve_assistir_task,
-+            debrid_entries,
-+            first_c.get("entry_index", 0),
-+            first_c.get("info_hash"),
-+            first_c.get("file_index", "n"),
-+            first_c.get("title", ""),
-+            first_c.get("torrent_title", ""),
-+            first_c.get("season"),
-+            first_c.get("episode"),
-+            first_c.get("sources"),
-+            None,
-+            media_only_id,
-+            media_type,
-+            get_client_ip(request),
-+            next_pt_candidates[1:],
+ 
+-    has_results = len(final_streams) > 0
++        for s in final_streams:
++            s.pop("_info", None)
++            s.pop("_is_pt", None)
++            s.pop("_is_direct_pt", None)
++            s.pop("_res", None)
++
++        if settings.DEBRID_PRECHECK and not debrid_errors:
++            rd_tokens = [
++                entry.get("token")
++                for entry in debrid_entries
++                if entry.get("service") == "realdebrid" and entry.get("token")
++            ]
++            if rd_tokens and search_result.ranked_info_hashes:
++                precheck_candidates = []
++                for h in search_result.ranked_info_hashes:
++                    t = torrents.get(h)
++                    if not t:
++                        continue
++                    parsed = t.get("parsed")
++                    if settings.DEMOTE_CAM and is_cam_release(parsed):
++                        continue
++                    t_is_pt = "pt" in (getattr(parsed, "languages", None) or ())
++                    if not t_is_pt:
++                        continue
++                    rd_cached = (service_cache_status.get(h, {}) or {}).get("realdebrid", False)
++                    if rd_cached:
++                        continue
++                    if h.lower() in blocked_by_service.get("realdebrid", ()):
++                        continue
++                    precheck_candidates.append(
++                        {
++                            "info_hash": h,
++                            "title": t.get("title", ""),
++                            "sources": t.get("sources"),
++                        }
++                    )
++                    if len(precheck_candidates) >= 3:
++                        break
++
++                if precheck_candidates:
++                    background_tasks.add_task(
++                        run_debrid_precheck,
++                        rd_tokens[0],
++                        get_client_ip(request),
++                        precheck_candidates,
++                    )
++
++        # Teto da lista: a TV precisa ler e desenhar tudo (Interestelar chegava com 1.489 fontes / 878 KB).
++        # Mantém ▶ Assistir e avisos, até 80 dubladas e as melhores das demais, na ordem atual.
++        _cap = int(getattr(settings, "STREAM_LIST_CAP", 120) or 0)
++        if _cap and len(final_streams) > _cap:
++            _kept, _pt_n, _other_n = [], 0, 0
++            _pt_max = min(80, _cap)
++            for _s in final_streams:
++                _nm = str(_s.get("name") or "")
++                _special = _nm.startswith("▶") or not (_s.get("url") or _s.get("infoHash") or _s.get("externalUrl"))
++                _is_pt = "🇧🇷" in _nm
++                if _special:
++                    _kept.append(_s)
++                elif _is_pt and _pt_n < _pt_max:
++                    _kept.append(_s)
++                    _pt_n += 1
++                elif not _is_pt and _other_n < _cap - _pt_n:
++                    _kept.append(_s)
++                    _other_n += 1
++            logger.debug(f"Lista enxugada: {len(final_streams)} -> {len(_kept)} fontes")
++            final_streams = _kept
++
++        # 🎬 imagem melhor de uma fonte + áudio PT de outra (só depois de medir que encaixam)
++        try:
++            from comet.services import av_mux as _avm
++            final_streams = _avm.augment(final_streams, str(media_id or ""), b64config, request)
++        except Exception as _avx:
++            logger.debug(f"av_mux: {_avx}")
++
++        has_results = len(final_streams) > 0
+ 
+-    return _stream_response(
+-        {"streams": final_streams},
+-        is_empty=not has_results,
+-    )
++        return _stream_response(
++            {"streams": final_streams},
++            is_empty=not has_results,
 +        )
-+
-+    for s in final_streams:
-+        s.pop("_info", None)
-+        s.pop("_is_pt", None)
-+        s.pop("_is_direct_pt", None)
-+        s.pop("_res", None)
-+
-+    if settings.DEBRID_PRECHECK and not debrid_errors:
-+        rd_tokens = [
-+            entry.get("token")
-+            for entry in debrid_entries
-+            if entry.get("service") == "realdebrid" and entry.get("token")
-+        ]
-+        if rd_tokens and search_result.ranked_info_hashes:
-+            precheck_candidates = []
-+            for h in search_result.ranked_info_hashes:
-+                t = torrents.get(h)
-+                if not t:
-+                    continue
-+                parsed = t.get("parsed")
-+                if settings.DEMOTE_CAM and is_cam_release(parsed):
-+                    continue
-+                t_is_pt = "pt" in (getattr(parsed, "languages", None) or ())
-+                if not t_is_pt:
-+                    continue
-+                rd_cached = (service_cache_status.get(h, {}) or {}).get("realdebrid", False)
-+                if rd_cached:
-+                    continue
-+                if h.lower() in blocked_by_service.get("realdebrid", ()):
-+                    continue
-+                precheck_candidates.append(
-+                    {
-+                        "info_hash": h,
-+                        "title": t.get("title", ""),
-+                        "sources": t.get("sources"),
-+                    }
-+                )
-+                if len(precheck_candidates) >= 3:
-+                    break
-+
-+            if precheck_candidates:
-+                background_tasks.add_task(
-+                    run_debrid_precheck,
-+                    rd_tokens[0],
-+                    get_client_ip(request),
-+                    precheck_candidates,
-+                )
-+
-+    # Teto da lista: a TV precisa ler e desenhar tudo (Interestelar chegava com 1.489 fontes / 878 KB).
-+    # Mantém ▶ Assistir e avisos, até 80 dubladas e as melhores das demais, na ordem atual.
-+    _cap = int(getattr(settings, "STREAM_LIST_CAP", 120) or 0)
-+    if _cap and len(final_streams) > _cap:
-+        _kept, _pt_n, _other_n = [], 0, 0
-+        _pt_max = min(80, _cap)
-+        for _s in final_streams:
-+            _nm = str(_s.get("name") or "")
-+            _special = _nm.startswith("▶") or not (_s.get("url") or _s.get("infoHash") or _s.get("externalUrl"))
-+            _is_pt = "🇧🇷" in _nm
-+            if _special:
-+                _kept.append(_s)
-+            elif _is_pt and _pt_n < _pt_max:
-+                _kept.append(_s)
-+                _pt_n += 1
-+            elif not _is_pt and _other_n < _cap - _pt_n:
-+                _kept.append(_s)
-+                _other_n += 1
-+        logger.debug(f"Lista enxugada: {len(final_streams)} -> {len(_kept)} fontes")
-+        final_streams = _kept
-+
-+    # 🎬 imagem melhor de uma fonte + áudio PT de outra (só depois de medir que encaixam)
-+    try:
-+        from comet.services import av_mux as _avm
-+        final_streams = _avm.augment(final_streams, str(media_id or ""), b64config, request)
-+    except Exception as _avx:
-+        logger.debug(f"av_mux: {_avx}")
- 
-     has_results = len(final_streams) > 0
- 
-@@ -546,3 +2216,12 @@ async def stream(
-         {"streams": final_streams},
-         is_empty=not has_results,
-     )
++    except Exception as _online_err:
++        if _loc_stream is not None:
++            logger.warning(f"💾 pós-processamento online falhou ({type(_online_err).__name__}), servindo local: {clean_id}")
++            return _stream_response({"streams": []}, is_empty=True)
++        raise
 +
 +
 +@streams.get("/{b64config}/kids/bedtime.mp4", include_in_schema=False)
@@ -16685,10 +16993,10 @@ index 0000000..9c6108d
 +        return []
 diff --git a/comet/services/direct_archive.py b/comet/services/direct_archive.py
 new file mode 100644
-index 0000000..292d600
+index 0000000..f51ccba
 --- /dev/null
 +++ b/comet/services/direct_archive.py
-@@ -0,0 +1,1583 @@
+@@ -0,0 +1,1706 @@
 +"""Módulo de arquivamento direto no TorBox (direct_archive).
 +
 +Monitora séries prioritárias (ex.: 2 Broke Girls), identifica episódios
@@ -17172,37 +17480,76 @@ index 0000000..292d600
 +    return total, bytes(pieces)
 +
 +
++class _FilePieceWriter:
++    """Grava bytes em disco e calcula hashes SHA-1 por peça fora do event loop."""
++
++    def __init__(self, path: str, piece_length: int = PIECE_LENGTH, max_bytes: int | None = None):
++        self.path = path
++        self.piece_length = piece_length
++        self.max_bytes = max_bytes
++        self.total = 0
++        self._pieces = bytearray()
++        self._buf = bytearray()
++        self._fh = open(path, "wb")
++
++    def write_batch(self, data: bytes) -> int:
++        if not data:
++            return self.total
++        self._fh.write(data)
++        self.total += len(data)
++        if self.max_bytes is not None and self.total > self.max_bytes:
++            raise ValueError(f"File exceeds MAX_BYTES ({self.max_bytes})")
++        self._buf.extend(data)
++        pl = self.piece_length
++        while len(self._buf) >= pl:
++            self._pieces.extend(hashlib.sha1(memoryview(self._buf)[:pl]).digest())
++            del self._buf[:pl]
++        return self.total
++
++    def finish(self) -> tuple[int, bytes]:
++        try:
++            if self._buf:
++                self._pieces.extend(hashlib.sha1(self._buf).digest())
++                self._buf.clear()
++        finally:
++            self.close()
++        return self.total, bytes(self._pieces)
++
++    def close(self) -> None:
++        if self._fh and not self._fh.closed:
++            self._fh.close()
++
++
 +# 4. Download, ffprobe e TorBox
 +async def _download_and_hash(url: str, dest: str, is_hls: bool) -> tuple[int, bytes]:
 +    if not is_hls:
 +        if httpx is None:
 +            raise RuntimeError("httpx is required for HTTP download")
-+        total = 0
-+        pieces = bytearray()
-+        buf = bytearray()
++        writer = _FilePieceWriter(dest, PIECE_LENGTH, max_bytes=MAX_BYTES)
++        pending = bytearray()
 +        timeout = httpx.Timeout(20.0, read=60.0)
-+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as client:
-+            async with client.stream("GET", url, headers={"User-Agent": PLAYER_UA}) as resp:
-+                resp.raise_for_status()
-+                with open(dest, "wb") as f:
++        try:
++            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as client:
++                async with client.stream("GET", url, headers={"User-Agent": PLAYER_UA}) as resp:
++                    resp.raise_for_status()
 +                    async for chunk in resp.aiter_bytes(chunk_size=65536):
 +                        if not chunk:
 +                            continue
-+                        f.write(chunk)
-+                        total += len(chunk)
-+                        if total > MAX_BYTES:
-+                            raise ValueError(f"File exceeds MAX_BYTES ({MAX_BYTES})")
-+                        buf.extend(chunk)
-+                        while len(buf) >= PIECE_LENGTH:
-+                            piece_data = buf[:PIECE_LENGTH]
-+                            pieces.extend(hashlib.sha1(piece_data).digest())
-+                            del buf[:PIECE_LENGTH]
-+        if buf:
-+            pieces.extend(hashlib.sha1(buf).digest())
-+            buf.clear()
++                        pending.extend(chunk)
++                        if len(pending) >= 1024 * 1024:
++                            batch = bytes(pending)
++                            pending.clear()
++                            await asyncio.to_thread(writer.write_batch, batch)
++            if pending:
++                batch = bytes(pending)
++                pending.clear()
++                await asyncio.to_thread(writer.write_batch, batch)
++            total, pieces = await asyncio.to_thread(writer.finish)
++        finally:
++            await asyncio.to_thread(writer.close)
 +        if total < MIN_BYTES or total > MAX_BYTES:
 +            raise ValueError(f"Total size {total} not in [{MIN_BYTES}, {MAX_BYTES}]")
-+        return total, bytes(pieces)
++        return total, pieces
 +    else:
 +        proc = await asyncio.create_subprocess_exec(
 +            "ffmpeg", "-y", "-loglevel", "error", "-user_agent", PLAYER_UA,
@@ -17211,26 +17558,67 @@ index 0000000..292d600
 +            stderr=asyncio.subprocess.PIPE,
 +        )
 +        try:
-+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=240.0)
-+        except (asyncio.TimeoutError, TimeoutError):
-+            proc.kill()
-+            raise TimeoutError("ffmpeg remux timed out after 240s")
++            try:
++                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=240.0)
++            except (asyncio.TimeoutError, TimeoutError):
++                proc.kill()
++                raise TimeoutError("ffmpeg remux timed out after 240s")
++        finally:
++            if proc.returncode is None:
++                try:
++                    proc.terminate()
++                except Exception:
++                    pass
++                try:
++                    await asyncio.wait_for(proc.wait(), timeout=3.0)
++                except Exception:
++                    try:
++                        proc.kill()
++                    except Exception:
++                        pass
 +        if proc.returncode != 0:
 +            raise RuntimeError(f"ffmpeg failed with code {proc.returncode}: {stderr.decode('utf-8', errors='ignore')}")
 +
-+        total = 0
-+        pieces = bytearray()
-+        with open(dest, "rb") as f:
-+            while True:
-+                chunk = f.read(PIECE_LENGTH)
-+                if not chunk:
-+                    break
-+                total += len(chunk)
-+                pieces.extend(hashlib.sha1(chunk).digest())
-+
++        total, pieces = await asyncio.to_thread(_hash_file_pieces, dest, PIECE_LENGTH)
 +        if total < MIN_BYTES or total > MAX_BYTES:
 +            raise ValueError(f"Total size {total} not in [{MIN_BYTES}, {MAX_BYTES}]")
-+        return total, bytes(pieces)
++        return total, pieces
++
++
++async def _ffprobe_url_height(url: str) -> int:
++    """Sonda apenas a altura do vídeo direto na URL (sem baixar o arquivo inteiro)."""
++    try:
++        proc = await asyncio.create_subprocess_exec(
++            "ffprobe", "-v", "error", "-user_agent", PLAYER_UA,
++            "-select_streams", "v:0", "-show_entries", "stream=height",
++            "-of", "json", url,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.DEVNULL,
++        )
++    except Exception:
++        return 0
++    try:
++        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12.0)
++    except (asyncio.TimeoutError, TimeoutError):
++        try:
++            proc.kill()
++        except Exception:
++            pass
++        return 0
++    finally:
++        if proc.returncode is None:
++            try:
++                proc.kill()
++            except Exception:
++                pass
++    try:
++        data = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
++        for st in data.get("streams") or []:
++            if st.get("height"):
++                return int(st["height"])
++    except Exception:
++        pass
++    return 0
 +
 +
 +async def _ffprobe_file(path: str) -> dict:
@@ -17558,6 +17946,19 @@ index 0000000..292d600
 +            return rec
 +
 +
++UPGRADE_COOLDOWN_S = 7 * 86400
++
++
++def _is_ep_satisfied(ep_rec: dict | None, now: float | None = None) -> bool:
++    if not ep_rec or not isinstance(ep_rec, dict):
++        return False
++    if int(ep_rec.get("height") or 0) >= 650:
++        return True
++    cur_now = time.time() if now is None else now
++    last_try = int(ep_rec.get("last_upgrade_try_at") or ep_rec.get("created_at") or 0)
++    return (cur_now - last_try) < UPGRADE_COOLDOWN_S
++
++
 +async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]) -> dict | None:
 +    lock = _get_work_lock()
 +    async with lock:
@@ -17568,7 +17969,7 @@ index 0000000..292d600
 +
 +        state = _load_state()
 +        ep_rec = state.get("episodes", {}).get(media_id)
-+        if ep_rec and int(ep_rec.get("height") or 0) >= 650:
++        if _is_ep_satisfied(ep_rec):
 +            return ep_rec
 +
 +        tb_key = _torbox_key()
@@ -17590,6 +17991,13 @@ index 0000000..292d600
 +            series_name = state.get("watched", {}).get(imdb, {}).get("name") or "Series"
 +
 +            for cand_url, source, is_hls in candidates[:2]:
++                if ep_rec:
++                    url_h = await _ffprobe_url_height(cand_url)
++                    if 0 < url_h < 650:
++                        logger.info(
++                            f"direct_archive: {media_id} URL sonda {url_h}p (<650p), pulando download de upgrade"
++                        )
++                        continue
 +                os.makedirs("/tmp", exist_ok=True)
 +                tmp_file = os.path.join("/tmp", f"comet_arch_{imdb}_{s}_{e}_{secrets.token_hex(4)}.mp4")
 +                try:
@@ -17607,6 +18015,19 @@ index 0000000..292d600
 +                    if not valid:
 +                        logger.warning(f"direct_archive: probe inválido para {media_id} ({reason})")
 +                        continue
++
++                    probe_h = int(probe.get("height") or 0)
++                    if ep_rec and probe_h < 650:
++                        now_ts = int(time.time())
++                        cur_state = _load_state()
++                        cur_ep = cur_state.setdefault("episodes", {}).get(media_id) or dict(ep_rec)
++                        cur_ep["last_upgrade_try_at"] = now_ts
++                        cur_state["episodes"][media_id] = cur_ep
++                        _save_state(cur_state)
++                        logger.info(
++                            f"direct_archive: {media_id} continua em {probe_h}p (<650p), mantendo torrent atual por mais 7d"
++                        )
++                        return None
 +
 +                    fname = make_release_filename(series_name, s, e, probe["height"])
 +                    tb_res = await _submit_file_to_torbox(
@@ -17633,6 +18054,7 @@ index 0000000..292d600
 +                            "source": source,
 +                            "created_at": now,
 +                            "last_keepalive_at": now,
++                            "last_upgrade_try_at": now,
 +                        }
 +                        cur_state = _load_state()
 +                        cur_state.setdefault("episodes", {})[media_id] = rec
@@ -17648,6 +18070,15 @@ index 0000000..292d600
 +                            os.remove(tmp_file)
 +                        except OSError:
 +                            pass
++
++        if ep_rec:
++            now_ts = int(time.time())
++            cur_state = _load_state()
++            cur_ep = cur_state.setdefault("episodes", {}).get(media_id) or dict(ep_rec)
++            cur_ep["last_upgrade_try_at"] = now_ts
++            cur_state["episodes"][media_id] = cur_ep
++            _save_state(cur_state)
++            return None
 +
 +        _FAIL_COOLDOWN[media_id] = time.time()
 +        return None
@@ -17789,7 +18220,7 @@ index 0000000..292d600
 +        return False
 +
 +    ep_rec = state.get("episodes", {}).get(media_id)
-+    if ep_rec and int(ep_rec.get("height") or 0) >= 650:
++    if _is_ep_satisfied(ep_rec):
 +        return False
 +
 +    if time.time() - _FAIL_COOLDOWN.get(media_id, 0) < FAIL_COOLDOWN_S:
@@ -18069,7 +18500,7 @@ index 0000000..292d600
 +                    continue
 +                ep_id = f"{imdb}:{s}:{e}"
 +                ep_rec = state.get("episodes", {}).get(ep_id)
-+                if ep_rec and int(ep_rec.get("height") or 0) >= 650:
++                if _is_ep_satisfied(ep_rec):
 +                    continue
 +                if time.time() - _FAIL_COOLDOWN.get(ep_id, 0) < FAIL_COOLDOWN_S:
 +                    continue
@@ -27360,10 +27791,10 @@ index 0000000..ac2aa7a
 +_TASKS: set = set()
 diff --git a/comet/services/offline_library.py b/comet/services/offline_library.py
 new file mode 100644
-index 0000000..ad5d519
+index 0000000..8ccdcf3
 --- /dev/null
 +++ b/comet/services/offline_library.py
-@@ -0,0 +1,1521 @@
+@@ -0,0 +1,1681 @@
 +"""Módulo de biblioteca local offline no Galaxy A71 + bot Telegram (/baixar).
 +
 +Permite baixar filmes e séries localmente no A71 para reprodução sem buffering,
@@ -28038,7 +28469,9 @@ index 0000000..ad5d519
 +    if not entry:
 +        return None
 +
-+    token = b64config or "local"
++    token = (b64config or "").strip() or _get_internal_token(fallback=None)
++    if not token:
++        return None
 +    filename = entry.get("filename") or os.path.basename(entry.get("path", ""))
 +    url = f"{base_url.rstrip('/')}/offline/{token}/{media_id}/{filename}"
 +
@@ -28086,6 +28519,25 @@ index 0000000..ad5d519
 +    }
 +
 +
++def inject_local_into_streams(streams: list[dict], local_stream: dict | None) -> list[dict]:
++    """Insere o stream local em 1º (após avisos) e remove apenas o prefixo '▶ Assistir' das fontes online."""
++    if local_stream is None:
++        return list(streams)
++    out = [dict(s) for s in streams]
++    ins = 0
++    while ins < len(out) and not (
++        out[ins].get("url") or out[ins].get("infoHash") or out[ins].get("externalUrl")
++    ):
++        ins += 1
++    for i in range(ins, len(out)):
++        nm = str(out[i].get("name") or "")
++        if nm.startswith("▶"):
++            demoted = re.sub(r"^▶\s*Assistir\s*\n?", "", nm).strip()
++            out[i] = {**out[i], "name": f"☁️ {demoted}" if demoted else "☁️ Online"}
++    out.insert(ins, local_stream)
++    return out
++
++
 +def has_enough_disk_space(path: str, min_free_gb: float = MIN_FREE_GB) -> tuple[bool, float]:
 +    p = Path(path).resolve()
 +    while not p.exists() and p.parent != p:
@@ -28113,7 +28565,7 @@ index 0000000..ad5d519
 +        return FileResponse(filepath, media_type=mime, filename=entry.get("filename", filename))
 +
 +
-+def _get_internal_token() -> str:
++def _get_internal_token(fallback: str | None = "local") -> str | None:
 +    for name in ("NUVIO_LINK_TOKEN", "PERSONAL_LINK_TOKEN"):
 +        val = getattr(settings, name, None) if settings is not None else None
 +        if not val:
@@ -28139,7 +28591,87 @@ index 0000000..ad5d519
 +        for name in ("NUVIO_LINK_TOKEN", "PERSONAL_LINK_TOKEN"):
 +            if name in found:
 +                return found[name]
-+    return "local"
++    return fallback
++
++
++class _ChunkedFileHasher:
++    """Grava arquivo em disco e calcula hashes SHA-1 por peça fora do event loop."""
++
++    def __init__(self, path: str, piece_length: int = PIECE_LENGTH):
++        self.path = path
++        self.piece_length = piece_length
++        self.total = 0
++        self._pieces = bytearray()
++        self._buf = bytearray()
++        self._fh = open(path, "wb")
++
++    def write_batch(self, data: bytes) -> int:
++        if not data:
++            return self.total
++        self._fh.write(data)
++        self.total += len(data)
++        self._buf.extend(data)
++        pl = self.piece_length
++        while len(self._buf) >= pl:
++            self._pieces.extend(hashlib.sha1(memoryview(self._buf)[:pl]).digest())
++            del self._buf[:pl]
++        return self.total
++
++    def finish(self) -> tuple[int, bytes]:
++        try:
++            if self._buf:
++                self._pieces.extend(hashlib.sha1(self._buf).digest())
++                self._buf.clear()
++        finally:
++            self.close()
++        return self.total, bytes(self._pieces)
++
++    def close(self) -> None:
++        if self._fh and not self._fh.closed:
++            self._fh.close()
++
++
++def _hls_timeout_seconds(media_type: str, expected_runtime_min: int | None) -> float:
++    if media_type == "movie":
++        return max(2400.0, float(expected_runtime_min or 150) * 18.0)
++    return max(900.0, float(expected_runtime_min or 45) * 18.0)
++
++
++async def _terminate_proc(proc: Any, term_wait_s: float = 5.0) -> None:
++    if getattr(proc, "returncode", None) is not None:
++        return
++    try:
++        proc.terminate()
++    except Exception:
++        pass
++    try:
++        await asyncio.wait_for(proc.wait(), timeout=term_wait_s)
++    except (asyncio.TimeoutError, TimeoutError):
++        try:
++            proc.kill()
++            await asyncio.wait_for(proc.wait(), timeout=3.0)
++        except Exception:
++            pass
++    except Exception:
++        pass
++
++
++async def _wait_hls_proc(proc: Any, timeout_s: float, poll_s: float = 2.0, term_wait_s: float = 5.0) -> str:
++    """Aguarda ffmpeg em laço curto, respeitando _CANCEL_FLAG e timeout proporcional."""
++    deadline = time.monotonic() + timeout_s
++    while proc.returncode is None:
++        if _CANCEL_FLAG:
++            await _terminate_proc(proc, term_wait_s=term_wait_s)
++            return "cancelled"
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            await _terminate_proc(proc, term_wait_s=term_wait_s)
++            return "timeout"
++        try:
++            await asyncio.wait_for(proc.wait(), timeout=min(poll_s, remaining))
++        except (asyncio.TimeoutError, TimeoutError):
++            continue
++    return "ok" if proc.returncode == 0 else "ffmpeg_failed"
 +
 +
 +def _is_episode_covered(covered_set: set[tuple[int, int]], season: int | None, episode: int | None) -> bool:
@@ -28248,47 +28780,52 @@ index 0000000..ad5d519
 +                part_path,
 +            )
 +            try:
-+                await asyncio.wait_for(proc.wait(), timeout=600.0)
-+            except (asyncio.TimeoutError, TimeoutError):
-+                proc.kill()
++                hls_timeout = _hls_timeout_seconds(media_type, expected_runtime_min)
++                hls_status = await _wait_hls_proc(proc, hls_timeout)
++            finally:
++                await _terminate_proc(proc)
++            if hls_status != "ok":
 +                if os.path.exists(part_path):
 +                    os.unlink(part_path)
-+                return {"status": "timeout", "media_id": media_id}
++                return {"status": hls_status, "media_id": media_id}
 +
-+            if proc.returncode != 0 or not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
++            if not os.path.isfile(part_path) or os.path.getsize(part_path) == 0:
 +                if os.path.exists(part_path):
 +                    os.unlink(part_path)
 +                return {"status": "ffmpeg_failed", "media_id": media_id}
 +
-+            total_size, pieces = _hash_file_pieces(part_path)
++            total_size, pieces = await asyncio.to_thread(_hash_file_pieces, part_path, PIECE_LENGTH)
 +        else:
-+            pieces_acc = bytearray()
-+            cur_piece = bytearray()
++            writer = _ChunkedFileHasher(part_path, PIECE_LENGTH)
++            pending = bytearray()
 +            headers = {"User-Agent": PLAYER_UA}
 +            dl_timeout = httpx.Timeout(20.0, read=90.0)
-+            async with httpx.AsyncClient(timeout=dl_timeout, follow_redirects=True, verify=False) as dl_client:
-+                async with dl_client.stream("GET", cand_url, headers=headers) as resp:
-+                    resp.raise_for_status()
-+                    final_resp_url = str(resp.url)
-+                    resp_ct = str(resp.headers.get("content-type") or "").lower()
-+                    with open(part_path, "wb") as f:
++            try:
++                async with httpx.AsyncClient(timeout=dl_timeout, follow_redirects=True, verify=False) as dl_client:
++                    async with dl_client.stream("GET", cand_url, headers=headers) as resp:
++                        resp.raise_for_status()
++                        final_resp_url = str(resp.url)
++                        resp_ct = str(resp.headers.get("content-type") or "").lower()
 +                        async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
 +                            if _CANCEL_FLAG:
-+                                f.close()
++                                await asyncio.to_thread(writer.close)
 +                                if os.path.exists(part_path):
 +                                    os.unlink(part_path)
 +                                return {"status": "cancelled", "media_id": media_id}
-+                            f.write(chunk)
-+                            total_size += len(chunk)
-+                            cur_piece.extend(chunk)
-+                            while len(cur_piece) >= PIECE_LENGTH:
-+                                p_slice = cur_piece[:PIECE_LENGTH]
-+                                pieces_acc.extend(hashlib.sha1(p_slice).digest())
-+                                del cur_piece[:PIECE_LENGTH]
-+
-+            if cur_piece:
-+                pieces_acc.extend(hashlib.sha1(cur_piece).digest())
-+            pieces = bytes(pieces_acc)
++                            if not chunk:
++                                continue
++                            pending.extend(chunk)
++                            if len(pending) >= 1024 * 1024:
++                                batch = bytes(pending)
++                                pending.clear()
++                                await asyncio.to_thread(writer.write_batch, batch)
++                if pending:
++                    batch = bytes(pending)
++                    pending.clear()
++                    await asyncio.to_thread(writer.write_batch, batch)
++                total_size, pieces = await asyncio.to_thread(writer.finish)
++            finally:
++                await asyncio.to_thread(writer.close)
 +
 +        probe = await _ffprobe_file(part_path)
 +        dur = float(probe.get("duration_s") or 0.0)
@@ -28381,6 +28918,13 @@ index 0000000..ad5d519
 +
 +        return {"status": "ok", "media_id": media_id, "path": final_path, "size": actual_size}
 +
++    except asyncio.CancelledError:
++        if os.path.exists(part_path):
++            try:
++                os.unlink(part_path)
++            except Exception:
++                pass
++        raise
 +    except Exception as e:
 +        if os.path.exists(part_path):
 +            try:
@@ -28409,12 +28953,35 @@ index 0000000..ad5d519
 +            exists_cnt = 0
 +            torbox_cnt = 0
 +            not_found_cnt = 0
++            failed_cnt = 0
++            low_disk_hit = False
++            low_disk_free_gb = 0.0
 +
 +            season_stats: dict[int, dict] = {}
++            announced_seasons: set[int] = set()
++            last_s_num: int | None = None
 +
 +            if httpx is None:
 +                logger.error("offline_library: httpx não está disponível para o worker")
 +                break
++
++            async def _announce_season(s_key: int, partial: bool = False) -> None:
++                if s_key in announced_seasons:
++                    return
++                s_info = season_stats.get(s_key, {})
++                s_ok = s_info.get("ok", 0)
++                s_ex = s_info.get("exist", 0)
++                s_tb = s_info.get("tb", 0)
++                s_fail = s_info.get("fail", 0)
++                if s_ok > 0:
++                    announced_seasons.add(s_key)
++                    extra_fail = f"\n• Falhas: {s_fail}" if s_fail > 0 else ""
++                    hdr = f"parcialmente salva" if partial else "pronta"
++                    await send_telegram(
++                        f"✅ *{title}* · Temporada {s_key} {hdr} no A71!\n"
++                        f"• Baixados: {s_ok} novos ({s_ex} já existiam)\n"
++                        f"• Subidos pro TorBox: {s_tb}{extra_fail}"
++                    )
 +
 +            async with httpx.AsyncClient(timeout=60.0) as client:
 +                for idx, item in enumerate(items):
@@ -28423,6 +28990,7 @@ index 0000000..ad5d519
 +
 +                    s_num = item.get("season")
 +                    e_num = item.get("episode")
++                    last_s_num = s_num
 +                    label = f"T{s_num}E{e_num}" if s_num and e_num else (f"T{s_num}" if s_num else "Filme")
 +                    job["current_item_label"] = label
 +
@@ -28432,7 +29000,7 @@ index 0000000..ad5d519
 +                    st = res.get("status")
 +                    if s_num is not None:
 +                        if s_num not in season_stats:
-+                            season_stats[s_num] = {"ok": 0, "exist": 0, "tb": 0, "fail": 0}
++                            season_stats[s_num] = {"ok": 0, "exist": 0, "tb": 0, "nf": 0, "fail": 0}
 +
 +                    if st == "ok":
 +                        downloaded_cnt += 1
@@ -28447,39 +29015,62 @@ index 0000000..ad5d519
 +                        exists_cnt += 1
 +                        if s_num is not None:
 +                            season_stats[s_num]["exist"] += 1
-+                    else:
++                    elif st == "low_disk":
++                        low_disk_hit = True
++                        low_disk_free_gb = float(res.get("free_gb") or 0.0)
++                        break
++                    elif st == "cancelled":
++                        break
++                    elif st in ("not_found", "no_candidate"):
 +                        not_found_cnt += 1
++                        if s_num is not None:
++                            season_stats[s_num]["nf"] += 1
++                    else:
++                        failed_cnt += 1
 +                        if s_num is not None:
 +                            season_stats[s_num]["fail"] += 1
 +
-+                    # Check if next item belongs to a different season -> send season summary
 +                    is_last_item = (idx + 1 == len(items))
 +                    next_s = items[idx + 1].get("season") if not is_last_item else None
 +                    if s_num is not None and (is_last_item or next_s != s_num):
-+                        s_info = season_stats.get(s_num, {})
-+                        s_ok = s_info.get("ok", 0)
-+                        s_ex = s_info.get("exist", 0)
-+                        s_tb = s_info.get("tb", 0)
-+                        if s_ok > 0:
-+                            await send_telegram(
-+                                f"✅ *{title}* · Temporada {s_num} pronta no A71!\n"
-+                                f"• Baixados: {s_ok} novos ({s_ex} já existiam)\n"
-+                                f"• Subidos pro TorBox: {s_tb}"
-+                            )
++                        await _announce_season(s_num, partial=False)
 +
 +                    await asyncio.sleep(2.0)
 +
++            if (low_disk_hit or _CANCEL_FLAG) and last_s_num is not None:
++                await _announce_season(last_s_num, partial=True)
++
 +            _, free_gb = has_enough_disk_space(OFFLINE_DIR)
-+            if _CANCEL_FLAG:
++            if low_disk_hit:
++                dropped_titles = [str(j.get("title") or j.get("imdb") or "item") for j in _JOB_QUEUE]
++                dropped_cnt = len(dropped_titles)
++                _JOB_QUEUE.clear()
++                dropped_line = (
++                    f"\n• Outros pedidos removidos da fila ({dropped_cnt}): {', '.join(dropped_titles[:5])}"
++                    if dropped_cnt > 0
++                    else ""
++                )
++                await send_telegram(
++                    f"⚠️ Download de *{title}* interrompido: pouco espaço livre no A71 "
++                    f"({low_disk_free_gb:.1f} GB livres; mínimo {MIN_FREE_GB:.0f} GB).\n"
++                    f"• Baixados antes de parar: {downloaded_cnt}\n"
++                    f"• Já existiam: {exists_cnt}{dropped_line}\n"
++                    "Use `/apagar <título>` para liberar espaço."
++                )
++                _CURRENT_JOB = None
++                break
++            elif _CANCEL_FLAG:
 +                await send_telegram(f"⏹️ Download de *{title}* cancelado pelo usuário.")
++                _CURRENT_JOB = None
 +                break
 +            else:
++                fail_line = f"\n• Falhas (erro/timeout/validação): {failed_cnt}" if failed_cnt > 0 else ""
 +                await send_telegram(
 +                    f"🎉 Download concluído: *{title}*\n"
 +                    f"• Novos baixados: {downloaded_cnt}\n"
 +                    f"• Já existiam no A71: {exists_cnt}\n"
 +                    f"• Subidos pro TorBox: {torbox_cnt}\n"
-+                    f"• Não encontrados: {not_found_cnt}\n"
++                    f"• Não encontrados: {not_found_cnt}{fail_line}\n"
 +                    f"• Espaço livre no A71: {free_gb:.1f} GB"
 +                )
 +

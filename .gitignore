@@ -3,4 +3,6 @@ config/.env
 config/duckdns.token
 __pycache__/
 Área de Transferência.md
+Área de Transferência*.png
+Embed/
 backups/
