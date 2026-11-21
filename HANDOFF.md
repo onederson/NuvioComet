@@ -1,6 +1,6 @@
 # HANDOFF: NuvioComet (Comet do A71 para o app Nuvio)
 
-*Última atualização: 18/11/2026 (horário de Brasília)*
+*Última atualização: 20/11/2026 (horário de Brasília)*
 
 Este é o documento de passagem: regras, estado verificado e próximos passos.
 - O histórico completo da fase Stremio (itens 1 a 35, medições, decisões) está em `docs/historico/HANDOFF-stremio.md`. Consulte quando precisar de detalhe antigo.
@@ -48,7 +48,8 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
   - O Nuvio não troca addon de mesmo id: remova o antigo antes de instalar outro.
   - Para ver um manifesto novo, feche e abra o app. O botão "Atualizar addons" não basta.
 - **Debrid:** TorBox ⚡ → RD ⚡ → baixar (`DEBRID_PRIMARY=torbox`).
-- **Fontes:** Torrentio, MediaFusion (limite de 10 s), 2× Comet, Zilean, StremThru, Peerflix, SeaDex, Nyaa, Prowlarr, BRSites, addons (BeTor, BestCine) e link direto FenixFlix.
+- **Fontes:** Torrentio, MediaFusion (limite de 10 s), 2× Comet, Zilean, StremThru, Peerflix, SeaDex, Nyaa, Prowlarr, BRSites, addons (BeTor, BestCine), link direto FenixFlix e **MegaEmbed**.
+- **MegaEmbed (19/11, `direct_addons._fetch_mgeb`):** lê a página `https://mgeb.space/embed/<imdb|tmdb>[/T/E]` (reservas: .lat, .casa, .quest) e tira os vídeos de `var sources = [...]`: MP4 de IPTV (720p, faixa PT medida com ffprobe) e HLS do site (480p). Entra como link direto dublado, com validação, memória e corte de episódio do `direct_addons`. MP4 vem antes do HLS. Desliga com `MGEB_ENABLED=false`; domínios em `MGEB_DOMAINS`. Especificação em `Embed/`. Leva ~8–9 s (página ~5 s + ffprobe).
 
 ---
 
@@ -64,6 +65,8 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 - **▶ Assistir** no topo da lista. O Nuvio está configurado para tocar sozinho a fonte cujo nome tem "Assistir" (regex, espera de 3 s), então o play abre direto.
   - **Ordem:** 4K PT > 1080p PT > 720p PT > link direto PT > melhor original (4K primeiro). Limite de 30 GB.
   - **Fora de casa:** a versão leve vem primeiro, pelo bitrate (`REMOTE_MAX_MBPS`, padrão 12).
+  - **Legenda PT embutida (19/11, `pt_subs.py`, tarefa D):** sem áudio PT, o ▶ Assistir prefere uma versão com legenda PT-BR **dentro do arquivo** (sincronizada) antes da resolução: 1080p Disney+ com PT ganha da 4K B-Global sem PT. Lê até 3 outras versões em 2º plano e lembra por série quais grupo/serviço trazem PT (`data/pt_sub_groups.json`). Se o arquivo tem PT embutido, o servidor de legendas não manda externa. Motivo: a externa de outra versão desliza (+10 s → +40 s no Bleach 3x1) e nenhum atraso manual acerta.
+    - **Nuvio:** se a última legenda escolhida na série era externa e a lista vem vazia, ele não liga a embutida ("Nenhuma"). Escolher a embutida uma vez na série resolve.
   - **Novo (09/11):** um torrent SD/480p dublado só vira ▶ Assistir se não houver nada pronto em HD. Costuma ser outra versão da obra (Hunter x Hunter 1999 × 2011). Ele continua na lista.
   - **Fonte que falhou perde a vez (09/11, `failed_sources.py`):** se você dá play numa fonte e, em até 60 s, em outra do mesmo título, a 1ª fica marcada para aquele título por 30 dias (`data/failed_sources.json`). O ▶ Assistir pula a marcada enquanto houver alternativa dublada, inclusive link direto. Tocar de novo a fonte marcada tira a marca. A URL de play leva `&ep_key=` (ID exato com temporada:episódio).
 - **Busca progressiva (09/11, `orchestration._scrape_progressive`):** na 1ª busca de um título, a resposta sai com o que chegou em 6 s, se já houver resultado em PT. Sem PT, espera todas as fontes, como antes. O que chega depois (Prowlarr, que leva de 5 a 25 s, e MediaFusion) é filtrado à parte e vai para o cache, então a próxima abertura já vem completa. Para ajustar: `PROGRESSIVE_SOFT_S` (0 desliga) e `PROGRESSIVE_MIN_RESULTS`, como variáveis de ambiente do processo. 1ª busca medida: de 12 a 15 s (antes até 30 s), dos quais uns 4 s são a consulta ao TorBox/RD.
@@ -104,6 +107,7 @@ Este é o documento de passagem: regras, estado verificado e próximos passos.
 - **Rádio e TV ao vivo tocam direto (10/11):** a 1ª opção de todo `cometlive:` (Pluto, rádio, Minha TV) ganha "▶ Assistir" no nome (`stream.py`), para casar com o regex do Nuvio, como nos filmes.
 - **Animes dublados (10/11):** a lista de animes com torrent PT no banco (análise de ~42 mil nomes, ~13 s no A71) fica guardada 1 h (`catalogs._anime_pt_series`). A análise começa 20 s depois de ligar (`warmup._warm_anime_pt`) e continua mesmo se um pedido estourar os 15 s. Antes a fileira vinha vazia a cada reinício.
 - **Fileiras:** 47 catálogos (42 na tela inicial), agrupadas (`row_groups.py`). Inclui:
+  - **Grupos com nome do dia (20/11):** na tela inicial o Nuvio não mostra o filtro do grupo, que sorteia um membro por dia. Por isso o nome traz o membro de hoje: "Gêneros · Para a família", "Para cada clima · Mais bem avaliados" (`row_groups.day_label`, aplicado em `catalog_manifest`). O Nuvio só relê o nome quando o app abre.
   - fileiras pessoais;
   - Sua semana, Minha TV, futebol e retrospectiva;
   - datas comemorativas na época;
@@ -175,6 +179,17 @@ Mudanças de 09/11:
 ### 18/11/2026 (revisão geral)
 22. **Conferido ao vivo:** `REGRESS OK` (52 pass, 1 warn: "Minha lista · filmes" vazia porque a lista do Trakt só tem uma série). Patch do PC idêntico ao do A71. Smoke OK de hora em hora. Play real com o episódio e o dublado certos: Apotecária 2x1/2x12/2x24 e 2 Broke Girls 4x21/4x22/2x5, vídeo em até 2,8 s. NuvioTV 1.1.0 é a última versão estável (1.2.0 ainda beta).
     - Pequenos, em aberto: na 1ª abertura a linha 🔊 pode sair incompleta até a sondagem terminar; a busca falha em 2 de 32 frases ("anime de ninja", "filme de dinossauro").
+23. **Episódio errado em pacote de temporada (`playback.py`):** desde 02/11, play com `media_type=series` e `media_id` só da série (o que o nosso link sempre manda) virava "filme" e zerava temporada/episódio. O link guardado ficava sem episódio e todo episódio do mesmo pacote abria o primeiro que foi tocado (4x21 e 4x22 do 2 Broke Girls davam o mesmo arquivo). Agora só vira filme quando o `ep_key` não tem `T:E` (Sagas). Conferido: 4x20/4x21/4x22 abrem arquivos diferentes, `exact_episode`. `REGRESS OK` (52 pass, 1 warn).
+24. **Teste "vídeo de uma fonte + áudio PT de outra" (só medição, nada no Comet):** juntar sem recodificar é rápido no A71 (11× o tempo real). A sincronia é o problema: Heartland (0,02 s) e Wish Dragon (−1,86 s constante) encaixam; On the Waterfront, 2 Broke Girls 3x10 e Apotecária 2x12 (BD × CR) não encaixam; 2 Broke Girls 4x21 encaixa, mas o atraso cresce nos intervalos comerciais (2,7 → 6,2 s). Medição por correlação do áudio (faixa no mesmo idioma ou envelope de volume da faixa PT). Nos filmes populares o 4K dublado já existe.
+25. **🎬 Imagem de uma fonte + áudio PT de outra (`av_mux.py`, `docs/tarefas/C.md`): pronto no servidor e DESLIGADO** (`AV_MUX`, padrão falso). Escolhe o par, mede a sincronia em 2º plano, oferece "🎬 4K + 🇧🇷 áudio" e entrega HLS fMP4 com a sincronia conferida (erro 0,000 s). Na Fire TV o Nuvio congela no 1º quadro, inclusive com o HLS padrão do ffmpeg: falta descobrir se é HEVC em HLS nesse player. Numpy em `/opt/avsync`. Pendência #6.
+26. **Memória dos links diretos dublados (`direct_addons.py`):** o FenixFlix passou a noite de 18/11 respondendo vazio de forma intermitente (2 Broke Girls 5x01 tocou dublado às 13:26 e sumiu à noite; 4x22 e Apotecária iam e voltavam). Todo link direto PT que passa na validação fica guardado por episódio, 7 dias, em `data/direct_memory.json` (até 6 por episódio). Quando a fonte vem sem dublado, os guardados são revalidados e os que abrem voltam com "♻️ Link guardado". Conferido com a fonte forçada vazia (4x22 volta dublado). `REGRESS OK` (52 pass, 1 warn).
+    - Em aberto: projetor (192.168.3.64, Hisilicon armv7, 2 GB, Wi-Fi 2,4 GHz) com o player reabrindo o link 5 a 8 vezes em segundos em 2 Broke Girls 5x01 e Apotecária 3x01. O TorBox entrega 26 MB/s no A71; falta medir no projetor (estava desligado). TV Bro instalado nele.
+
+### 20/11/2026 (`docs/tarefas/E.md` e `docs/tarefas/F.md`)
+27. **Arquivamento automático no TorBox (`direct_archive.py`):** vigia séries prioritárias (inicia com *2 Broke Girls* `tt1845307`, configurável via `/arquivar` e `/desarquivar` no Telegram). Quando falta torrent PT-BR HD em cache no TorBox, baixa do link direto (FenixFlix > MegaEmbed MP4 > HLS), valida com `ffprobe`, monta `.torrent` BEP-19 (`url-list`) e sobe no TorBox (`seed=3`, contando apenas `active == True` contra o limite real do plano). Quando o TorBox não acessa o link direto (ou porta `:7443`), abre sob demanda um túnel `cloudflared` (ARM64 em `/usr/local/bin/cloudflared`, porta 443 `trycloudflare.com`) servindo `/archive-seed/<token>/<arquivo>` e encerra após 3 min ocioso; sincroniza em `torrents` + `debrid_availability` e faz keepalive a cada 18 dias.
+28. **Biblioteca offline no A71 + `/baixar` no Telegram (`offline_library.py`):** aceita `/baixar <filme ou série> [T5 | T5E01 | original]` ou texto natural (`"Baixar todas as temporadas de 2 broke girls dublado"`), `/baixados`, `/cancelar` e `/apagar`. Busca pelas próprias fontes do Comet (`?nolocal=1`: TorBox ⚡ > RD ⚡ > FenixFlix > MegaEmbed), baixa para `/opt/comet/data/offline/` preservando `OFFLINE_MIN_FREE_GB=15` GB livres, valida com `ffprobe`, e sobe também no TorBox se ainda não houver cópia PT-BR HD em cache lá. Em `stream.py`, qualquer título salvo localmente responde em ~22 ms com **`▶ Assistir · 💾 Local`** no topo (`/offline/{token}/{media_id}/{filename}`, HTTP 206 `Range` nativo).
+    - Conferido ao vivo no *2 Broke Girls* T5E01: download local (251 MB, 720p dublado) + subida no TorBox (`1f6a1619d7`) em 87,9 s; `/stream/.../tt1845307:5:1.json` em 22 ms (`▶ Assistir · 💾 720p`, Range 206 OK); `?nolocal=1` já retorna `▶ Assistir · ⚡ 720p` no TorBox. T5E04 e T5E12 também arquivados automaticamente no TorBox.
+    - `REGRESS OK` (**54 pass, 1 warn**; novos: `unit_direct_archive` e `unit_offline_library`; 0 erros no log). `smoke.disable` removido. Patch regerado em LF.
 
 ---
 
@@ -187,6 +202,7 @@ Mudanças de 09/11:
 | 3 | Ideias sem dono: pedido por foto | — |
 | 4 | Top 10 real dos outros streamings (só a Netflix publica). Fonte possível: API paga do FlixPatrol | usuário decide |
 | 5 | Perfis na TV: criar o perfil de convidado no Nuvio e instalar nele o link de convidado | usuário |
+| 6 | 🎬 vídeo + áudio PT de fontes diferentes: o Nuvio na Fire TV congela no HLS (ver `docs/tarefas/C.md`, "Para continuar") | Claude |
 
 ---
 

@@ -504,6 +504,44 @@ def t_unit_fonte_falhou() -> tuple[str, str]:
     return "PASS", "troca em <1 min marca, depois de 1 min não, replay tira a marca"
 
 
+def t_unit_direct_archive() -> tuple[str, str]:
+    """20/11/2026: arquivamento de episódios diretos no TorBox (BEP-19 webseed)."""
+    from comet.services import direct_archive as da
+
+    t1, h1 = da.build_torrent_bytes("2.Broke.Girls.S05E01.720p.WEB-DL.Dublado.PT-BR.mp4", 1048576, b"\x00" * 20, ["http://a/v.mp4"])
+    t2, h2 = da.build_torrent_bytes("2.Broke.Girls.S05E01.720p.WEB-DL.Dublado.PT-BR.mp4", 1048576, b"\x00" * 20, [])
+    assert h1 == h2 and len(h1) == 40 and b"url-list" in t1 and b"url-list" not in t2
+    assert da.make_release_filename("2 Broke Girls", 5, 1, 720) == "2.Broke.Girls.S05E01.720p.WEB-DL.Dublado.PT-BR.mp4"
+    cands = da.pick_archive_candidates([
+        {"name": "🌐 480p\n🇧🇷 PT-BR", "description": "MegaEmbed (HLS)", "url": "https://m/a.m3u8", "_is_pt": True},
+        {"name": "🌐 1080p\n🇧🇷 PT-BR", "description": "FenixFlix", "url": "http://f/1.mp4", "_is_pt": True},
+        {"name": "⚠️ 720p\nPT-BR · outro corte", "description": "FenixFlix", "url": "http://f/cut.mp4", "behaviorHints": {"filename": "FenixFlix.direct.CUT"}, "_is_pt": False},
+    ])
+    assert len(cands) == 2 and cands[0] == ("http://f/1.mp4", "FenixFlix", False) and cands[1][2] is True
+    assert da.is_valid_probe({"width": 1280, "height": 720, "has_audio": True, "duration_s": 1300}, 22)[0] is True
+    assert da.is_valid_probe({"width": 1280, "height": 720, "has_audio": True, "duration_s": 2400}, 120)[0] is False
+    return "PASS", "bencode/info_hash, prioridade FenixFlix>HLS, corte e probe OK"
+
+
+def t_unit_offline_library() -> tuple[str, str]:
+    """20/11/2026: biblioteca offline local no A71 + /baixar no Telegram."""
+    from comet.services import offline_library as ol
+
+    p1 = ol.parse_download_command("Baixar todas as temporadas de 2 broke girls dublado")
+    assert p1 and p1["action"] == "download" and p1["query"] == "2 broke girls" and p1["season"] is None and p1["prefer_dub"] is True
+    p2 = ol.parse_download_command("/baixar 2 broke girls T5E01")
+    assert p2 and p2["season"] == 5 and p2["episode"] == 1
+    p3 = ol.parse_download_command("/apagar 2 broke girls T1")
+    assert p3 and p3["action"] == "delete" and p3["season"] == 1
+    assert ol.parse_size_bytes("2,4 GB") == int(2.4 * 1024**3)
+    cand = ol.pick_download_candidate([
+        {"name": "🌐 480p\n🇧🇷 PT-BR", "description": "MegaEmbed (HLS)", "url": "https://m/a.m3u8"},
+        {"name": "⚡ 720p\n🇧🇷 PT-BR", "description": "TB⚡ · 450 MB", "url": "http://127.0.0.1:8000/playback/h/0/1/n/n"},
+    ], prefer_dub=True)
+    assert cand and cand["is_torbox"] is True and cand["is_pt"] is True
+    return "PASS", "parse /baixar natural, prioridade TB>direto e caminhos offline OK"
+
+
 def t_unit_streamings() -> tuple[str, str]:
     """09/11/2026: coleção "Streamings" do Nuvio (estilo Disney+), abas por serviço, fora da home."""
     import datetime as _dt
@@ -1906,6 +1944,8 @@ def main():
         ("unit_fileiras_homonimos", t_unit_fileiras_homonimos),
         ("unit_homonimos_arquivo", t_unit_homonimos_arquivo),
         ("unit_fonte_falhou", t_unit_fonte_falhou),
+        ("unit_direct_archive", t_unit_direct_archive),
+        ("unit_offline_library", t_unit_offline_library),
         ("unit_streamings", t_unit_streamings),
         ("unit_pt_text", t_unit_pt_text),
         ("unit_novidades_1108", t_unit_novidades_1108),

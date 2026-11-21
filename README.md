@@ -8,11 +8,12 @@
 
 Um servidor **Comet** (addon no protocolo do Stremio) rodando 24 h num **Galaxy A71** com root, dentro de um Debian em chroot. O cliente é o app **NuvioTV** numa Fire TV 4K.
 
-Ele faz cinco coisas:
-- junta torrents de várias fontes;
-- entrega pelo **TorBox** (principal) e pelo **Real-Debrid** (reserva);
-- põe o **dublado PT-BR em primeiro lugar**;
-- monta a tela inicial: fileiras pessoais, sagas, TV e rádio ao vivo, futebol e Minha TV;
+Ele faz seis coisas:
+- junta torrents de várias fontes (e links diretos como FenixFlix e MegaEmbed);
+- entrega pelo **TorBox** (principal) e pelo **Real-Debrid** (reserva), com arquivamento automático no TorBox para séries vigiadas (`/arquivar`);
+- baixa filmes e séries **localmente no A71** pelo Telegram (`/baixar`) e sobe cópia no TorBox, dando preferência absoluta ao arquivo local na hora de assistir;
+- põe o **dublado PT-BR em primeiro lugar** (e legenda PT embutida quando não há dublado);
+- monta a tela inicial: Streamings estilo Disney+/Netflix, fileiras pessoais, sagas, TV e rádio ao vivo, podcasts, filmes dos games, futebol e Minha TV;
 - avisa e atende pedidos pelo Telegram.
 
 O que o Nuvio já faz sozinho fica com ele: TMDB, elenco, trailers, pular abertura, autoplay, faixa de áudio PT e Trakt. Veja o `HANDOFF.md`, Seção 3.
@@ -31,7 +32,7 @@ Os tokens ficam no `config/.env` e nunca vão para o git.
 ```powershell
 .\scripts\a71.ps1 '<cmd>'            # comando como root no Android
 .\scripts\a71.ps1 -Chroot '<cmd>'    # comando dentro do Debian
-.\scripts\regress.ps1                # suíte completa (~50 testes); -Only nome1,nome2 roda só alguns
+.\scripts\regress.ps1                # suíte completa (54 testes); -Only nome1,nome2 roda só alguns
 .\scripts\smoke.ps1                  # teste rápido (pula se existir data/smoke.disable)
 .\scripts\deploy_patches.ps1         # reaplica o patch do Comet + smoke + regress
 .\scripts\update_comet.ps1 -Check    # há versão nova do Comet original?
