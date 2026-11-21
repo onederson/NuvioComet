@@ -4,11 +4,11 @@ Pedido: "levando em consideração essa ideia, quero que no bot do telegram eu c
 
 ## Diagnóstico e solução
 - O Galaxy A71 tem **100 GB livres** em `/data`.
-- Medição ao vivo revelou que o TorBox bloqueia WebSeeds em porta não-padrão (`:7443`), mas **aceita imediatamente (3–6 s)** via túnel HTTPS porta 443 (`cloudflared tunnel --url http://127.0.0.1:8000` → `https://<hash>.trycloudflare.com/archive-seed/<token>/<arquivo>`), sem limite de tamanho e sem depender de servidor terceiro.
+- Medição ao vivo revelou que o TorBox bloqueia WebSeeds em porta não-padrão (`:7443`), mas **aceita imediatamente (3–6 s)** via túnel HTTPS porta 443 (`cloudflared tunnel --url http://127.0.0.1:8788`, servidor mínimo só com o webseed → `https://<hash>.trycloudflare.com/archive-seed/<token>/<arquivo>`), sem limite de tamanho e sem depender de servidor terceiro.
 - Unificamos `direct_archive.py` (arquivamento automático no TorBox) + `offline_library.py` (biblioteca local no A71 pedida pelo Telegram):
   1. **`comet/services/direct_archive.py`**:
      - Túnel `cloudflared` sob demanda (reaproveitado na fila e fechado após ociosidade) para servir arquivos do A71 ao TorBox na porta 443.
-     - Função pública `upload_local_file_to_torbox(...)` para filmes e séries (tenta FenixFlix direto → `cloudflared` porta 443 → Catbox se <= 195 MB), gravando no SQLite (`torrents` + `debrid_availability`) e mantendo keepalive a cada 18 dias.
+     - Função pública `upload_local_file_to_torbox(...)` para filmes e séries (tenta FenixFlix direto → `cloudflared` porta 443; sem envio a hosts públicos), gravando no SQLite (`torrents` + `debrid_availability`) e mantendo keepalive a cada 18 dias.
   2. **`comet/services/offline_library.py`** (implementado via Maestro):
      - Salva vídeos em `/opt/comet/data/offline/{movies|series}/...` com índice em `data/offline_library.json` e proteção de disco (`OFFLINE_MIN_FREE_GB=15`).
      - Busca fontes usando o próprio Comet A71 (`GET http://127.0.0.1:8000/{token}/stream/{type}/{id}.json?nolocal=1`), aproveitando todos os scrapers, filtros de homônimos/trailer/outro corte, TorBox, RD, FenixFlix e MegaEmbed.

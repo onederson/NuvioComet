@@ -672,7 +672,10 @@ def build_local_stream(
     if not entry:
         return None
 
-    token = (b64config or "").strip() or _get_internal_token(fallback=None)
+    # A rota /offline só aceita *_LINK_TOKEN; uma config base64 comum daria 403 no play.
+    token = (b64config or "").strip()
+    if not token or not _is_valid_token(token):
+        token = _get_internal_token(fallback=None)
     if not token:
         return None
     filename = entry.get("filename") or os.path.basename(entry.get("path", ""))

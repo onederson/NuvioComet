@@ -16993,10 +16993,10 @@ index 0000000..9c6108d
 +        return []
 diff --git a/comet/services/direct_archive.py b/comet/services/direct_archive.py
 new file mode 100644
-index 0000000..3912201
+index 0000000..58f9211
 --- /dev/null
 +++ b/comet/services/direct_archive.py
-@@ -0,0 +1,1747 @@
+@@ -0,0 +1,1860 @@
 +"""Módulo de arquivamento direto no TorBox (direct_archive).
 +
 +Monitora séries prioritárias (ex.: 2 Broke Girls), identifica episódios
@@ -17047,13 +17047,11 @@ index 0000000..3912201
 +    orjson = None  # type: ignore
 +
 +try:
-+    from fastapi import APIRouter, Response
-+    from fastapi.responses import FileResponse
++    from fastapi import APIRouter
++    # Router vazio mantido porque o main.py do Comet o inclui; o webseed não fica mais no Comet.
 +    router: APIRouter | None = APIRouter()
 +except ImportError:
 +    router = None
-+    Response = None  # type: ignore
-+    FileResponse = None  # type: ignore
 +
 +# 1. Constantes
 +STATE_PATH = "data/direct_archive.json"
@@ -17085,7 +17083,12 @@ index 0000000..3912201
 +_CF_TUNNEL_LOCK: asyncio.Lock | None = None
 +_CF_IDLE_TASK: asyncio.Task | None = None
 +_CF_IDLE_TTL_S = 180.0
-+_CATBOX_MAX_BYTES = 195 * 1024 * 1024
++# O túnel cloudflared aponta só para este servidor mínimo (não para o Comet em :8000),
++# então o endereço trycloudflare.com expõe apenas /archive-seed/<token>/<arquivo>.
++SEED_HOST = "127.0.0.1"
++SEED_PORT = int(os.environ.get("ARCHIVE_SEED_PORT", "8788"))
++_SEED_SERVER: asyncio.AbstractServer | None = None
++_SEED_CHUNK = 1024 * 1024
 +
 +
 +def _get_work_lock() -> asyncio.Lock:
@@ -17322,23 +17325,152 @@ index 0000000..3912201
 +    return True, "ok"
 +
 +
-+# 3. Rota FastAPI de WebSeed temporário
-+if router is not None:
-+    @router.api_route("/archive-seed/{token}/{filename}", methods=["GET", "HEAD"], tags=["Archive"])
-+    async def archive_seed_endpoint(token: str, filename: str):
-+        now = time.time()
-+        expired = [t for t, (_, exp) in _ACTIVE_SEEDS.items() if now > exp]
-+        for t in expired:
-+            _ACTIVE_SEEDS.pop(t, None)
++# 3. WebSeed temporário: servidor HTTP mínimo em 127.0.0.1:SEED_PORT, exposto só pelo túnel
++_SEED_PATH_RE = re.compile(r"^/archive-seed/([A-Za-z0-9_-]{16,64})/([^/?#]+)$")
 +
-+        entry = _ACTIVE_SEEDS.get(token)
-+        if not entry:
-+            return Response(status_code=404)
-+        filepath, exp = entry
-+        if now > exp or not os.path.isfile(filepath):
-+            _ACTIVE_SEEDS.pop(token, None)
-+            return Response(status_code=404)
-+        return FileResponse(filepath, media_type="video/mp4", filename=filename)
++
++def _resolve_seed(token: str) -> str | None:
++    now = time.time()
++    for t in [t for t, (_, exp) in _ACTIVE_SEEDS.items() if now > exp]:
++        _ACTIVE_SEEDS.pop(t, None)
++    entry = _ACTIVE_SEEDS.get(token)
++    if not entry:
++        return None
++    filepath, exp = entry
++    if now > exp or not os.path.isfile(filepath):
++        _ACTIVE_SEEDS.pop(token, None)
++        return None
++    return filepath
++
++
++def _parse_range(value: str, size: int) -> tuple[int, int] | None:
++    """Aceita um único intervalo `bytes=a-b`, `bytes=a-` ou `bytes=-n`. None = inválido."""
++    m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", value or "")
++    if not m or (not m.group(1) and not m.group(2)) or size <= 0:
++        return None
++    if m.group(1):
++        start = int(m.group(1))
++        end = int(m.group(2)) if m.group(2) else size - 1
++    else:
++        n = int(m.group(2))
++        if n <= 0:
++            return None
++        start, end = max(0, size - n), size - 1
++    end = min(end, size - 1)
++    if start > end:
++        return None
++    return start, end
++
++
++async def _seed_send_status(writer: asyncio.StreamWriter, code: int, reason: str, extra: str = "") -> None:
++    writer.write(f"HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n{extra}Connection: close\r\n\r\n".encode())
++    await writer.drain()
++
++
++async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++    global _CF_TUNNEL_LAST_USE
++    fh = None
++    try:
++        try:
++            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=15.0)
++        except (asyncio.TimeoutError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
++            return
++        lines = head.decode("latin-1", errors="ignore").split("\r\n")
++        parts = lines[0].split(" ")
++        if len(parts) != 3:
++            await _seed_send_status(writer, 400, "Bad Request")
++            return
++        method, target, _ver = parts
++        if method not in ("GET", "HEAD"):
++            await _seed_send_status(writer, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n")
++            return
++        m = _SEED_PATH_RE.match(target.split("?", 1)[0])
++        filepath = _resolve_seed(m.group(1)) if m else None
++        if not filepath:
++            await _seed_send_status(writer, 404, "Not Found")
++            return
++        _CF_TUNNEL_LAST_USE = time.time()
++        headers = {}
++        for ln in lines[1:]:
++            if ":" in ln:
++                k, v = ln.split(":", 1)
++                headers[k.strip().lower()] = v.strip()
++        size = os.path.getsize(filepath)
++        start, end, code, reason = 0, size - 1, 200, "OK"
++        extra = ""
++        if "range" in headers:
++            rng = _parse_range(headers["range"], size)
++            if rng is None:
++                await _seed_send_status(writer, 416, "Range Not Satisfiable", f"Content-Range: bytes */{size}\r\n")
++                return
++            start, end = rng
++            code, reason = 206, "Partial Content"
++            extra = f"Content-Range: bytes {start}-{end}/{size}\r\n"
++        length = max(0, end - start + 1)
++        writer.write(
++            (
++                f"HTTP/1.1 {code} {reason}\r\n"
++                "Content-Type: video/mp4\r\n"
++                f"Content-Length: {length}\r\n"
++                "Accept-Ranges: bytes\r\n"
++                f"{extra}"
++                "Connection: close\r\n\r\n"
++            ).encode()
++        )
++        await writer.drain()
++        if method == "HEAD" or length == 0:
++            return
++        fh = await asyncio.to_thread(open, filepath, "rb")
++        await asyncio.to_thread(fh.seek, start)
++        remaining = length
++        while remaining > 0:
++            chunk = await asyncio.to_thread(fh.read, min(_SEED_CHUNK, remaining))
++            if not chunk:
++                break
++            writer.write(chunk)
++            await writer.drain()
++            remaining -= len(chunk)
++            _CF_TUNNEL_LAST_USE = time.time()
++    except (ConnectionError, asyncio.CancelledError):
++        pass
++    except Exception as e:
++        logger.debug(f"direct_archive: erro no webseed: {e}")
++    finally:
++        if fh is not None:
++            try:
++                await asyncio.to_thread(fh.close)
++            except Exception:
++                pass
++        try:
++            writer.close()
++        except Exception:
++            pass
++
++
++async def _ensure_seed_server() -> bool:
++    global _SEED_SERVER
++    if _SEED_SERVER is not None and _SEED_SERVER.is_serving():
++        return True
++    try:
++        _SEED_SERVER = await asyncio.start_server(_seed_handle, SEED_HOST, SEED_PORT)
++        logger.info(f"direct_archive: webseed local em http://{SEED_HOST}:{SEED_PORT}")
++        return True
++    except Exception as e:
++        _SEED_SERVER = None
++        logger.warning(f"direct_archive: falha ao abrir webseed em {SEED_HOST}:{SEED_PORT}: {e}")
++        return False
++
++
++async def _stop_seed_server() -> None:
++    global _SEED_SERVER
++    srv = _SEED_SERVER
++    _SEED_SERVER = None
++    if srv is not None:
++        try:
++            srv.close()
++            await asyncio.wait_for(srv.wait_closed(), timeout=5.0)
++        except Exception:
++            pass
 +
 +
 +def _register_seed(filepath: str, filename: str, ttl: float = 600.0, base_url: str | None = None) -> tuple[str, str] | None:
@@ -17372,6 +17504,7 @@ index 0000000..3912201
 +                proc.kill()
 +            except Exception:
 +                pass
++    await _stop_seed_server()
 +
 +
 +async def _cf_idle_watcher() -> None:
@@ -17401,14 +17534,17 @@ index 0000000..3912201
 +        if _CF_TUNNEL_PROC is not None and _CF_TUNNEL_PROC.returncode is None and _CF_TUNNEL_URL:
 +            return _CF_TUNNEL_URL
 +        await _stop_cf_tunnel()
++        if not await _ensure_seed_server():
++            return None
 +        try:
 +            proc = await asyncio.create_subprocess_exec(
-+                cf_bin, "tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:8000",
++                cf_bin, "tunnel", "--no-autoupdate", "--url", f"http://{SEED_HOST}:{SEED_PORT}",
 +                stdout=asyncio.subprocess.PIPE,
 +                stderr=asyncio.subprocess.STDOUT,
 +            )
 +        except Exception as e:
 +            logger.warning(f"direct_archive: falha ao iniciar cloudflared: {e}")
++            await _stop_seed_server()
 +            return None
 +
 +        url: str | None = None
@@ -17432,6 +17568,7 @@ index 0000000..3912201
 +            except Exception:
 +                pass
 +            logger.warning("direct_archive: cloudflared não retornou URL trycloudflare em 25s")
++            await _stop_seed_server()
 +            return None
 +
 +        _CF_TUNNEL_PROC = proc
@@ -17446,25 +17583,6 @@ index 0000000..3912201
 +        except RuntimeError:
 +            pass
 +        return url
-+
-+
-+async def _upload_catbox_fallback(client: httpx.AsyncClient, filepath: str, filename: str) -> str | None:
-+    try:
-+        if os.path.getsize(filepath) > _CATBOX_MAX_BYTES:
-+            return None
-+        with open(filepath, "rb") as fh:
-+            resp = await client.post(
-+                "https://catbox.moe/user/api.php",
-+                headers={"User-Agent": USER_AGENT},
-+                data={"reqtype": "fileupload"},
-+                files={"fileToUpload": (filename, fh, "video/mp4")},
-+                timeout=180.0,
-+            )
-+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-+            return resp.text.strip()
-+    except Exception as e:
-+        logger.warning(f"direct_archive: fallback catbox falhou: {e}")
-+    return None
 +
 +
 +def _hash_file_pieces(filepath: str, piece_length: int = PIECE_LENGTH) -> tuple[int, bytes]:
@@ -17866,11 +17984,6 @@ index 0000000..3912201
 +                    )
 +                finally:
 +                    _ACTIVE_SEEDS.pop(reg_token, None)
-+
-+    if not tb_res and total <= _CATBOX_MAX_BYTES:
-+        cb_url = await _upload_catbox_fallback(client, filepath, fname)
-+        if cb_url:
-+            tb_res = await _torbox_submit_and_wait(client, tb_key, fname, total, pieces, cb_url, poll_timeout=120.0)
 +
 +    return tb_res
 +
@@ -27832,10 +27945,10 @@ index 0000000..ac2aa7a
 +_TASKS: set = set()
 diff --git a/comet/services/offline_library.py b/comet/services/offline_library.py
 new file mode 100644
-index 0000000..8ccdcf3
+index 0000000..9d91d39
 --- /dev/null
 +++ b/comet/services/offline_library.py
-@@ -0,0 +1,1681 @@
+@@ -0,0 +1,1684 @@
 +"""Módulo de biblioteca local offline no Galaxy A71 + bot Telegram (/baixar).
 +
 +Permite baixar filmes e séries localmente no A71 para reprodução sem buffering,
@@ -28510,7 +28623,10 @@ index 0000000..8ccdcf3
 +    if not entry:
 +        return None
 +
-+    token = (b64config or "").strip() or _get_internal_token(fallback=None)
++    # A rota /offline só aceita *_LINK_TOKEN; uma config base64 comum daria 403 no play.
++    token = (b64config or "").strip()
++    if not token or not _is_valid_token(token):
++        token = _get_internal_token(fallback=None)
 +    if not token:
 +        return None
 +    filename = entry.get("filename") or os.path.basename(entry.get("path", ""))

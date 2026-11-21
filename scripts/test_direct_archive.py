@@ -502,6 +502,80 @@ class TestDirectArchive(unittest.TestCase):
         self.assertEqual(res_del_fail["info_hash"], "new_hash")
         self.assertEqual(removed_db_hashes, ["a1fe5643ee"])
 
+    # 12. Webseed isolado: só /archive-seed/<token>/<arquivo>, com Range e HEAD
+    def test_seed_server_isolated(self):
+        video = os.path.join(self.temp_dir.name, "ep.mp4")
+        data = bytes(range(256)) * 40  # 10240 bytes
+        with open(video, "wb") as f:
+            f.write(data)
+
+        async def req(raw: bytes) -> tuple[str, bytes]:
+            r, w = await asyncio.open_connection(direct_archive.SEED_HOST, direct_archive.SEED_PORT)
+            w.write(raw)
+            await w.drain()
+            resp = await r.read()
+            w.close()
+            head, _, body = resp.partition(b"\r\n\r\n")
+            return head.decode(), body
+
+        async def run():
+            self.assertTrue(await direct_archive._ensure_seed_server())
+            try:
+                tok, url = direct_archive._register_seed(video, "ep.mp4", ttl=60, base_url="https://x.trycloudflare.com")
+                self.assertEqual(url, f"https://x.trycloudflare.com/archive-seed/{tok}/ep.mp4")
+                path = f"/archive-seed/{tok}/ep.mp4"
+
+                h, b = await req(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+                self.assertTrue(h.startswith("HTTP/1.1 200"))
+                self.assertEqual(b, data)
+
+                h, b = await req(f"GET {path} HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n".encode())
+                self.assertTrue(h.startswith("HTTP/1.1 206"))
+                self.assertIn("Content-Range: bytes 100-199/10240", h)
+                self.assertEqual(b, data[100:200])
+
+                h, b = await req(f"GET {path} HTTP/1.1\r\nRange: bytes=-10\r\n\r\n".encode())
+                self.assertEqual(b, data[-10:])
+
+                h, b = await req(f"GET {path} HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".encode())
+                self.assertTrue(h.startswith("HTTP/1.1 416"))
+
+                h, b = await req(f"HEAD {path} HTTP/1.1\r\n\r\n".encode())
+                self.assertIn("Content-Length: 10240", h)
+                self.assertEqual(b, b"")
+
+                # Nada além do webseed: token errado, outras rotas do Comet e POST
+                for raw in (
+                    b"GET /archive-seed/tokeninvalido1234567/ep.mp4 HTTP/1.1\r\n\r\n",
+                    b"GET /manifest.json HTTP/1.1\r\n\r\n",
+                    b"GET /admin HTTP/1.1\r\n\r\n",
+                ):
+                    h, _ = await req(raw)
+                    self.assertTrue(h.startswith("HTTP/1.1 404"), h)
+                h, _ = await req(f"POST {path} HTTP/1.1\r\n\r\n".encode())
+                self.assertTrue(h.startswith("HTTP/1.1 405"))
+
+                direct_archive._ACTIVE_SEEDS.pop(tok, None)
+                h, _ = await req(f"GET {path} HTTP/1.1\r\n\r\n".encode())
+                self.assertTrue(h.startswith("HTTP/1.1 404"))
+            finally:
+                await direct_archive._stop_seed_server()
+            self.assertIsNone(direct_archive._SEED_SERVER)
+
+        orig_port = direct_archive.SEED_PORT
+        direct_archive.SEED_PORT = 18788
+        try:
+            asyncio.run(run())
+        finally:
+            direct_archive.SEED_PORT = orig_port
+            direct_archive._ACTIVE_SEEDS.clear()
+
+    # 13. Sem fallback para hosts públicos (catbox etc.)
+    def test_no_public_upload_fallback(self):
+        src = Path(direct_archive.__file__).read_text(encoding="utf-8").lower()
+        self.assertNotIn("catbox", src)
+        self.assertNotIn("127.0.0.1:8000", src)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -297,12 +297,13 @@ class TestOfflineLibrary(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry["title"], "2 Broke Girls")
 
-        stream = offline_library.build_local_stream(
-            "tt1845307:5:1",
-            "mytoken",
-            "http://127.0.0.1:8000",
-            self.index_path,
-        )
+        with patch.object(offline_library, "_get_valid_tokens", return_value={"mytoken"}):
+            stream = offline_library.build_local_stream(
+                "tt1845307:5:1",
+                "mytoken",
+                "http://127.0.0.1:8000",
+                self.index_path,
+            )
         self.assertIsNotNone(stream)
         self.assertEqual(stream["name"], "▶ Assistir\n💾 720p")
         self.assertIn("💾 Local no A71", stream["description"])
@@ -446,6 +447,14 @@ class TestOfflineLibrary(unittest.TestCase):
             st = offline_library.build_local_stream("tt0133093", None, "https://x.test", self.index_path)
             self.assertIsNotNone(st)
             self.assertIn("/offline/real_tok/tt0133093/movie.mp4", st["url"])
+        # Config base64 comum (não é *_LINK_TOKEN) cai no token interno em vez de gerar 403
+        with patch.object(offline_library, "_get_valid_tokens", return_value={"real_tok"}), \
+                patch.object(offline_library, "_get_internal_token", return_value="real_tok"):
+            st = offline_library.build_local_stream("tt0133093", "eyJjb25maWciOjF9", "https://x.test", self.index_path)
+            self.assertIn("/offline/real_tok/tt0133093/movie.mp4", st["url"])
+        with patch.object(offline_library, "_get_valid_tokens", return_value={"real_tok"}), \
+                patch.object(offline_library, "_get_internal_token", return_value=None):
+            self.assertIsNone(offline_library.build_local_stream("tt0133093", "eyJjb25maWciOjF9", "https://x.test", self.index_path))
 
     # 10. _worker_loop para imediatamente em low_disk e separa falhas de não encontrados
     def test_worker_low_disk_and_failure_counts(self):
