@@ -510,7 +510,7 @@ class TestDirectArchive(unittest.TestCase):
             f.write(data)
 
         async def req(raw: bytes) -> tuple[str, bytes]:
-            r, w = await asyncio.open_connection(direct_archive.SEED_HOST, direct_archive.SEED_PORT)
+            r, w = await asyncio.open_connection(direct_archive.SEED_HOST, direct_archive._SEED_BOUND_PORT)
             w.write(raw)
             await w.drain()
             resp = await r.read()
@@ -540,6 +540,23 @@ class TestDirectArchive(unittest.TestCase):
                 h, b = await req(f"GET {path} HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".encode())
                 self.assertTrue(h.startswith("HTTP/1.1 416"))
 
+                # Vários intervalos ou Range malformado: arquivo inteiro (200), nunca 416
+                for bad in ("bytes=0-9,20-29", "bytes=abc", "items=0-9", "bytes=-"):
+                    h, b = await req(f"GET {path} HTTP/1.1\r\nRange: {bad}\r\n\r\n".encode())
+                    self.assertTrue(h.startswith("HTTP/1.1 200"), (bad, h))
+                    self.assertEqual(b, data)
+
+                # Limite de conexões cheio: 503 imediato
+                sem = direct_archive._SEED_CONN_SEM
+                for _ in range(direct_archive._SEED_MAX_CONN):
+                    await sem.acquire()
+                try:
+                    h, _ = await req(f"GET {path} HTTP/1.1\r\n\r\n".encode())
+                    self.assertTrue(h.startswith("HTTP/1.1 503"), h)
+                finally:
+                    for _ in range(direct_archive._SEED_MAX_CONN):
+                        sem.release()
+
                 h, b = await req(f"HEAD {path} HTTP/1.1\r\n\r\n".encode())
                 self.assertIn("Content-Length: 10240", h)
                 self.assertEqual(b, b"")
@@ -563,7 +580,7 @@ class TestDirectArchive(unittest.TestCase):
             self.assertIsNone(direct_archive._SEED_SERVER)
 
         orig_port = direct_archive.SEED_PORT
-        direct_archive.SEED_PORT = 18788
+        direct_archive.SEED_PORT = 0  # o sistema escolhe uma porta livre
         try:
             asyncio.run(run())
         finally:

@@ -90,6 +90,11 @@ SEED_HOST = "127.0.0.1"
 SEED_PORT = int(os.environ.get("ARCHIVE_SEED_PORT", "8788"))
 _SEED_SERVER: asyncio.AbstractServer | None = None
 _SEED_CHUNK = 1024 * 1024
+_SEED_MAX_CONN = 6  # conexões simultâneas no webseed; acima disso responde 503
+_SEED_CONN_SEM: asyncio.Semaphore | None = None
+_SEED_BOUND_PORT: int = SEED_PORT  # porta real aberta (SEED_PORT=0 deixa o sistema escolher)
+_SEED_WRITE_STALL_S = 60.0  # cliente que não lê por 60 s é desconectado
+_SEED_CONN_MAX_S = 1800.0  # nenhuma conexão dura mais que 30 min
 
 
 def _get_work_lock() -> asyncio.Lock:
@@ -365,10 +370,43 @@ def _parse_range(value: str, size: int) -> tuple[int, int] | None:
 
 async def _seed_send_status(writer: asyncio.StreamWriter, code: int, reason: str, extra: str = "") -> None:
     writer.write(f"HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n{extra}Connection: close\r\n\r\n".encode())
-    await writer.drain()
+    await _seed_drain(writer)
+
+
+async def _seed_drain(writer: asyncio.StreamWriter) -> None:
+    await asyncio.wait_for(writer.drain(), timeout=_SEED_WRITE_STALL_S)
+
+
+_RANGE_SINGLE_RE = re.compile(r"\s*bytes=\d*-\d*\s*")
 
 
 async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    sem = _SEED_CONN_SEM
+    if sem is not None and sem.locked():
+        try:
+            await _seed_send_status(writer, 503, "Service Unavailable", "Retry-After: 5\r\n")
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        return
+    if sem is None:
+        await _seed_serve(reader, writer)
+        return
+    async with sem:
+        try:
+            await asyncio.wait_for(_seed_serve(reader, writer), timeout=_SEED_CONN_MAX_S)
+        except (asyncio.TimeoutError, TimeoutError):
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def _seed_serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     global _CF_TUNNEL_LAST_USE
     fh = None
     try:
@@ -399,8 +437,10 @@ async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         size = os.path.getsize(filepath)
         start, end, code, reason = 0, size - 1, 200, "OK"
         extra = ""
-        if "range" in headers:
-            rng = _parse_range(headers["range"], size)
+        range_h = headers.get("range", "")
+        # Vários intervalos ou Range malformado: a RFC 9110 permite ignorar e mandar o arquivo inteiro.
+        if range_h and _RANGE_SINGLE_RE.fullmatch(range_h) and range_h.strip() != "bytes=-":
+            rng = _parse_range(range_h, size)
             if rng is None:
                 await _seed_send_status(writer, 416, "Range Not Satisfiable", f"Content-Range: bytes */{size}\r\n")
                 return
@@ -418,7 +458,8 @@ async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 "Connection: close\r\n\r\n"
             ).encode()
         )
-        await writer.drain()
+        await _seed_drain(writer)
+        logger.debug(f"direct_archive: webseed {method} range={range_h or '-'} -> {code} ({length} bytes)")
         if method == "HEAD" or length == 0:
             return
         fh = await asyncio.to_thread(open, filepath, "rb")
@@ -429,10 +470,10 @@ async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             if not chunk:
                 break
             writer.write(chunk)
-            await writer.drain()
+            await _seed_drain(writer)
             remaining -= len(chunk)
             _CF_TUNNEL_LAST_USE = time.time()
-    except (ConnectionError, asyncio.CancelledError):
+    except (ConnectionError, asyncio.TimeoutError, TimeoutError):
         pass
     except Exception as e:
         logger.debug(f"direct_archive: erro no webseed: {e}")
@@ -449,12 +490,14 @@ async def _seed_handle(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 async def _ensure_seed_server() -> bool:
-    global _SEED_SERVER
+    global _SEED_SERVER, _SEED_CONN_SEM, _SEED_BOUND_PORT
     if _SEED_SERVER is not None and _SEED_SERVER.is_serving():
         return True
     try:
+        _SEED_CONN_SEM = asyncio.Semaphore(_SEED_MAX_CONN)
         _SEED_SERVER = await asyncio.start_server(_seed_handle, SEED_HOST, SEED_PORT)
-        logger.info(f"direct_archive: webseed local em http://{SEED_HOST}:{SEED_PORT}")
+        _SEED_BOUND_PORT = int(_SEED_SERVER.sockets[0].getsockname()[1])
+        logger.info(f"direct_archive: webseed local em http://{SEED_HOST}:{_SEED_BOUND_PORT}")
         return True
     except Exception as e:
         _SEED_SERVER = None
@@ -539,7 +582,7 @@ async def _ensure_cf_tunnel_url() -> str | None:
             return None
         try:
             proc = await asyncio.create_subprocess_exec(
-                cf_bin, "tunnel", "--no-autoupdate", "--url", f"http://{SEED_HOST}:{SEED_PORT}",
+                cf_bin, "tunnel", "--no-autoupdate", "--url", f"http://{SEED_HOST}:{_SEED_BOUND_PORT}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

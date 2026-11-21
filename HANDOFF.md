@@ -197,6 +197,12 @@ Mudanças de 09/11:
       - `build_local_stream` só usa o token recebido se `_is_valid_token` aceitar. Uma config base64 comum cai no `_get_internal_token()` (ou não gera stream), o que evita 403 no play de `/offline`.
       - **Nota sobre `remove_hash_from_db`:** apaga todas as linhas de `torrents` (e de `debrid_availability`) com o `info_hash` antigo. Se algum scraper tivesse indexado o mesmo hash, a linha dele também sairia, mas na prática o hash é exclusivo do `.torrent` single-file gerado pelo `direct_archive`.
       - 24 testes unitários OK (2 novos: webseed isolado e ausência de host público). `REGRESS OK` (54 pass, 1 warn). Play local do 2 Broke Girls 5x01 com 206. Patch regerado em LF.
+      - **Ressalvas da 3ª revisão (commit seguinte):**
+        - O webseed agora aceita no máximo 6 conexões simultâneas (as demais recebem 503). Cada conexão tem prazo de 60 s para envio travado e de 30 min no total.
+        - Pedido com vários intervalos ou Range malformado recebe o arquivo inteiro (200) em vez de 416.
+        - Os testes usam porta escolhida pelo sistema.
+        - Corrigido o comentário do `include_router` em `comet/api/app.py`.
+        - **Teste real ponta a ponta:** um vídeo de teste único de 16 MB subiu pelo túnel e foi apagado em seguida. O TorBox fez um único `GET Range: bytes=0-<fim>` (206) e concluiu em 23 s.
 
 ---
 
