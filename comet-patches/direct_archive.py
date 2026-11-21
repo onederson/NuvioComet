@@ -1019,16 +1019,10 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
 
                     probe_h = int(probe.get("height") or 0)
                     if ep_rec and probe_h < 650:
-                        now_ts = int(time.time())
-                        cur_state = _load_state()
-                        cur_ep = cur_state.setdefault("episodes", {}).get(media_id) or dict(ep_rec)
-                        cur_ep["last_upgrade_try_at"] = now_ts
-                        cur_state["episodes"][media_id] = cur_ep
-                        _save_state(cur_state)
                         logger.info(
-                            f"direct_archive: {media_id} continua em {probe_h}p (<650p), mantendo torrent atual por mais 7d"
+                            f"direct_archive: {media_id} candidato baixado em {probe_h}p (<650p), tentando próximo"
                         )
-                        return None
+                        continue
 
                     fname = make_release_filename(series_name, s, e, probe["height"])
                     tb_res = await _submit_file_to_torbox(
@@ -1043,6 +1037,18 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
                     )
 
                     if tb_res:
+                        old_tid = ep_rec.get("torrent_id") if isinstance(ep_rec, dict) else None
+                        if old_tid and old_tid != tb_res["torrent_id"]:
+                            try:
+                                await client.post(
+                                    f"{TORBOX_API}/torrents/controltorrent",
+                                    headers=_torbox_headers(tb_key),
+                                    json={"torrent_id": old_tid, "operation": "delete"},
+                                    timeout=15.0,
+                                )
+                                logger.info(f"direct_archive: torrent 480p antigo ({old_tid}) removido do TorBox após upgrade")
+                            except Exception as del_err:
+                                logger.debug(f"direct_archive: falha ao remover torrent antigo {old_tid}: {del_err}")
                         now = int(time.time())
                         rec = {
                             "info_hash": tb_res["info_hash"],
