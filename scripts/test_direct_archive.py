@@ -367,12 +367,15 @@ class TestDirectArchive(unittest.TestCase):
         self.assertTrue(direct_archive._is_ep_satisfied(saved_ep))
 
         # 2) Se _ffprobe_url_height devolve 0 (ex.: HLS) e o 1º candidato baixado sai 480p,
-        #    continua para o 2º candidato (1080p), faz upgrade no TorBox e apaga o torrent_id antigo (123)!
+        #    continua para o 2º candidato (1080p), faz upgrade no TorBox, apaga o torrent_id antigo (123)
+        #    e remove o info_hash antigo ("a1fe5643ee") do SQLite!
         state["episodes"]["tt1845307:5:9"]["last_upgrade_try_at"] = old_ts
         direct_archive._save_state(state, self.state_file)
         dl_calls.clear()
         submit_calls.clear()
         deleted_tids = []
+        removed_db_hashes = []
+        delete_should_succeed = True
 
         async def fake_url_h_zero(url):
             return 0
@@ -385,7 +388,8 @@ class TestDirectArchive(unittest.TestCase):
         async def fake_probe_seq(path):
             return next(probes)
 
-        orig_post = direct_archive.httpx.AsyncClient.post if direct_archive.httpx else None
+        async def fake_remove_db(h):
+            removed_db_hashes.append(h)
 
         async def fake_client_post(self_client, url, **kwargs):
             if "controltorrent" in url:
@@ -393,9 +397,9 @@ class TestDirectArchive(unittest.TestCase):
                 if body.get("operation") == "delete":
                     deleted_tids.append(body.get("torrent_id"))
             class DummyResp:
-                status_code = 200
+                status_code = 200 if delete_should_succeed else 400
                 def raise_for_status(self): pass
-                def json(self): return {"success": True}
+                def json(self): return {"success": delete_should_succeed}
             return DummyResp()
 
         with patch.object(direct_archive, "_torbox_key", return_value="tb_test"), \
@@ -405,6 +409,7 @@ class TestDirectArchive(unittest.TestCase):
              patch.object(direct_archive, "_download_and_hash", side_effect=fake_dl), \
              patch.object(direct_archive, "_ffprobe_file", side_effect=fake_probe_seq), \
              patch.object(direct_archive, "_submit_file_to_torbox", side_effect=fake_submit), \
+             patch.object(direct_archive, "remove_hash_from_db", side_effect=fake_remove_db), \
              patch.object(direct_archive.httpx.AsyncClient, "post", new=fake_client_post):
             res_up = asyncio.run(
                 direct_archive.archive_episode(
@@ -422,6 +427,80 @@ class TestDirectArchive(unittest.TestCase):
         self.assertEqual(res_up["info_hash"], "new_hash")
         self.assertEqual(res_up["height"], 1080)
         self.assertEqual(deleted_tids, [123])
+        self.assertEqual(removed_db_hashes, ["a1fe5643ee"])
+
+        # 3) Se _ffprobe_url_height devolve 0 e AMBOS os candidatos baixados saem <650p (480p),
+        #    tenta os 2 downloads, não envia nada ao TorBox, atualiza last_upgrade_try_at no fim do laço e retorna None.
+        state["episodes"]["tt1845307:5:9"] = {
+            "info_hash": "a1fe5643ee",
+            "torrent_id": 123,
+            "title": "2.Broke.Girls.S05E09.480p.WEB-DL.Dublado.PT-BR.mp4",
+            "height": 480,
+            "created_at": old_ts,
+            "last_upgrade_try_at": old_ts,
+        }
+        direct_archive._save_state(state, self.state_file)
+        dl_calls.clear()
+        submit_calls.clear()
+        probes_both_sd = iter([
+            {"width": 854, "height": 480, "has_audio": True, "duration_s": 1300.0},
+            {"width": 640, "height": 360, "has_audio": True, "duration_s": 1300.0},
+        ])
+
+        async def fake_probe_both_sd(path):
+            return next(probes_both_sd)
+
+        with patch.object(direct_archive, "_torbox_key", return_value="tb_test"), \
+             patch.object(direct_archive, "_torbox_active_count", side_effect=fake_active), \
+             patch.object(direct_archive, "_torbox_max_active", side_effect=fake_max), \
+             patch.object(direct_archive, "_ffprobe_url_height", side_effect=fake_url_h_zero), \
+             patch.object(direct_archive, "_download_and_hash", side_effect=fake_dl), \
+             patch.object(direct_archive, "_ffprobe_file", side_effect=fake_probe_both_sd), \
+             patch.object(direct_archive, "_submit_file_to_torbox", side_effect=fake_submit):
+            res_both_sd = asyncio.run(
+                direct_archive.archive_episode(
+                    "tt1845307:5:9",
+                    [
+                        ("http://m/509_sd1.m3u8", "MegaEmbed", True),
+                        ("http://m/509_sd2.m3u8", "MegaEmbed", True),
+                    ],
+                )
+            )
+
+        self.assertIsNone(res_both_sd)
+        self.assertEqual(len(dl_calls), 2)
+        self.assertEqual(len(submit_calls), 0)
+        saved_after_both = direct_archive._load_state(self.state_file)["episodes"]["tt1845307:5:9"]
+        self.assertGreater(saved_after_both["last_upgrade_try_at"], old_ts)
+
+        # 4) Se controltorrent delete falhar (success=False / HTTP 400), o upgrade 1080p ainda é salvo e o DB é limpo.
+        state["episodes"]["tt1845307:5:9"]["last_upgrade_try_at"] = old_ts
+        direct_archive._save_state(state, self.state_file)
+        dl_calls.clear()
+        submit_calls.clear()
+        deleted_tids.clear()
+        removed_db_hashes.clear()
+        delete_should_succeed = False
+
+        async def fake_probe_1080(path):
+            return {"width": 1920, "height": 1080, "has_audio": True, "duration_s": 1300.0}
+
+        with patch.object(direct_archive, "_torbox_key", return_value="tb_test"), \
+             patch.object(direct_archive, "_torbox_active_count", side_effect=fake_active), \
+             patch.object(direct_archive, "_torbox_max_active", side_effect=fake_max), \
+             patch.object(direct_archive, "_ffprobe_url_height", side_effect=fake_url_h_zero), \
+             patch.object(direct_archive, "_download_and_hash", side_effect=fake_dl), \
+             patch.object(direct_archive, "_ffprobe_file", side_effect=fake_probe_1080), \
+             patch.object(direct_archive, "_submit_file_to_torbox", side_effect=fake_submit), \
+             patch.object(direct_archive, "remove_hash_from_db", side_effect=fake_remove_db), \
+             patch.object(direct_archive.httpx.AsyncClient, "post", new=fake_client_post):
+            res_del_fail = asyncio.run(
+                direct_archive.archive_episode("tt1845307:5:9", [("http://f/509_fhd.mp4", "FenixFlix", False)])
+            )
+
+        self.assertIsNotNone(res_del_fail)
+        self.assertEqual(res_del_fail["info_hash"], "new_hash")
+        self.assertEqual(removed_db_hashes, ["a1fe5643ee"])
 
 
 if __name__ == "__main__":

@@ -1038,17 +1038,31 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
 
                     if tb_res:
                         old_tid = ep_rec.get("torrent_id") if isinstance(ep_rec, dict) else None
+                        old_hash = str(ep_rec.get("info_hash") or "").lower() if isinstance(ep_rec, dict) else ""
                         if old_tid and old_tid != tb_res["torrent_id"]:
                             try:
-                                await client.post(
+                                del_resp = await client.post(
                                     f"{TORBOX_API}/torrents/controltorrent",
                                     headers=_torbox_headers(tb_key),
                                     json={"torrent_id": old_tid, "operation": "delete"},
                                     timeout=15.0,
                                 )
-                                logger.info(f"direct_archive: torrent 480p antigo ({old_tid}) removido do TorBox após upgrade")
+                                del_ok = del_resp.status_code == 200 and bool((del_resp.json() or {}).get("success"))
+                                if del_ok:
+                                    logger.info(
+                                        f"direct_archive: torrent 480p antigo ({old_tid}) removido do TorBox após upgrade"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"direct_archive: TorBox recusou remover torrent antigo ({old_tid}): {del_resp.status_code}"
+                                    )
                             except Exception as del_err:
                                 logger.debug(f"direct_archive: falha ao remover torrent antigo {old_tid}: {del_err}")
+                        if old_hash and old_hash != str(tb_res["info_hash"]).lower():
+                            try:
+                                await remove_hash_from_db(old_hash)
+                            except Exception as db_del_err:
+                                logger.debug(f"direct_archive: falha ao limpar hash antigo {old_hash} do DB: {db_del_err}")
                         now = int(time.time())
                         rec = {
                             "info_hash": tb_res["info_hash"],
@@ -1092,6 +1106,22 @@ async def archive_episode(media_id: str, candidates: list[tuple[str, str, bool]]
 
 
 # 5. Sincronia com o banco SQLite do Comet
+async def remove_hash_from_db(info_hash: str) -> None:
+    h = str(info_hash or "").strip().lower()
+    if not h:
+        return
+    try:
+        from comet.core.database import database
+    except ImportError:
+        database = None
+    if database is not None:
+        await database.execute("DELETE FROM torrents WHERE info_hash = :info_hash", {"info_hash": h})
+        await database.execute(
+            "DELETE FROM debrid_availability WHERE debrid_service = 'torbox' AND info_hash = :info_hash",
+            {"info_hash": h},
+        )
+
+
 async def sync_episode_to_db(media_id: str, rec: dict) -> None:
     parsed_ep = parse_series_ep(media_id)
     if parsed_ep:
@@ -1315,6 +1345,11 @@ async def _keepalive_and_verify() -> None:
                 if not is_cached:
                     logger.info(f"direct_archive: {media_id} ({h}) não está mais em cache no TorBox, removendo")
                     episodes.pop(media_id, None)
+                    if h:
+                        try:
+                            await remove_hash_from_db(h)
+                        except Exception:
+                            pass
                     state_changed = True
                     continue
 
